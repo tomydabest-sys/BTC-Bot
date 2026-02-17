@@ -4,7 +4,7 @@ import pytest
 
 from polybot.strategies.mean_reversion import MeanReversionStrategy
 from polybot.strategies.momentum import MomentumStrategy
-from polybot.data.models import Direction
+from polybot.data.models import Direction, PriceLevel
 
 
 @pytest.mark.asyncio
@@ -41,6 +41,8 @@ async def test_momentum_generates_signal_on_strong_move(sample_snapshot):
     """Signal generated on strong price movement."""
     # Create strong upward movement
     sample_snapshot.price_history = [0.40 + i * 0.005 for i in range(20)]
+    # Make orderbook asymmetric so book_imbalance > 0.1 (volume confirmation)
+    sample_snapshot.orderbook.bids[0] = PriceLevel(0.55, 5000)
     strategy = MomentumStrategy(price_change_threshold=0.05)
     signal = await strategy.evaluate(sample_snapshot)
     assert signal is not None
