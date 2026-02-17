@@ -23,8 +23,8 @@ env/
 *.swp
 *.swo
 
-# Data
-data/
+# Data (runtime data dir at project root)
+/data/
 *.db
 *.sqlite
 
