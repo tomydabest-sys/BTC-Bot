@@ -35,6 +35,7 @@ polybot = "polybot.main:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
 
 [tool.ruff]
 target-version = "py312"
