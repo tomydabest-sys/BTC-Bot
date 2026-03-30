@@ -19,6 +19,8 @@ dependencies = [
     "prometheus-client>=0.20",
     "httpx>=0.27",
     "py-clob-client>=0.15",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +34,7 @@ dev = [
 
 [project.scripts]
 polybot = "polybot.main:cli"
+polybot-dashboard = "polybot.dashboard.launcher:run_dashboard"
 
 [tool.setuptools.packages.find]
 where = ["src"]

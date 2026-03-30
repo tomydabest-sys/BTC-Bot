@@ -10,6 +10,7 @@ import structlog
 
 from polybot.config import load_config, Config
 from polybot.data.client import PolymarketClient
+from polybot.data.exchange_feed import ExchangePriceFeed
 from polybot.data.pipeline import DataPipeline
 from polybot.data.storage import Storage
 from polybot.data.websocket import WebSocketManager
@@ -24,6 +25,12 @@ from polybot.strategies.aggregator import StrategyAggregator
 from polybot.strategies.base import BaseStrategy
 from polybot.strategies.mean_reversion import MeanReversionStrategy
 from polybot.strategies.momentum import MomentumStrategy
+from polybot.strategies.latency_arb import LatencyArbStrategy
+from polybot.strategies.momentum_lag import MomentumLagStrategy
+from polybot.strategies.volatility_breakout import VolatilityBreakoutStrategy
+from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
+from polybot.strategies.market_maker import MarketMakerStrategy
+from polybot.strategies.monte_carlo import MonteCarloStrategy
 from polybot.data.models import Order, OrderType, Side
 
 logger = structlog.get_logger()
@@ -31,6 +38,12 @@ logger = structlog.get_logger()
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "mean_reversion": MeanReversionStrategy,
     "momentum": MomentumStrategy,
+    "latency_arb": LatencyArbStrategy,
+    "momentum_lag": MomentumLagStrategy,
+    "volatility_breakout": VolatilityBreakoutStrategy,
+    "dual_direction_arb": DualDirectionArbStrategy,
+    "market_maker": MarketMakerStrategy,
+    "monte_carlo": MonteCarloStrategy,
 }
 
 
@@ -47,6 +60,10 @@ class Bot:
         self._client = PolymarketClient(api_key="")  # Set in start()
         self._ws_manager = WebSocketManager(self._event_bus)
         self._data_pipeline = DataPipeline()
+        self._exchange_feed = ExchangePriceFeed(
+            symbols=["BTC", "ETH", "SOL", "XRP"],
+            poll_interval=0.5,
+        )
 
         # Trading components
         self._scanner = MarketScanner(self._client, config.scanner, self._event_bus)
@@ -69,6 +86,50 @@ class Bot:
             conflict_resolution=config.strategies.aggregation.conflict_resolution,
         )
 
+    @property
+    def config(self) -> Config:
+        return self._config
+
+    @property
+    def position_manager(self) -> PositionManager:
+        return self._position_manager
+
+    @property
+    def circuit_breaker(self) -> CircuitBreaker:
+        return self._circuit_breaker
+
+    @property
+    def risk_manager(self) -> RiskManager:
+        return self._risk_manager
+
+    @property
+    def execution_engine(self) -> ExecutionEngine:
+        return self._execution_engine
+
+    @property
+    def scanner(self) -> MarketScanner:
+        return self._scanner
+
+    @property
+    def exchange_feed(self) -> ExchangePriceFeed:
+        return self._exchange_feed
+
+    @property
+    def strategies(self) -> list[BaseStrategy]:
+        return self._strategies
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def data_pipeline(self) -> DataPipeline:
+        return self._data_pipeline
+
+    @property
+    def storage(self) -> Storage:
+        return self._storage
+
     async def start(self) -> None:
         """Initialize all components and start the trading loop."""
         logger.info(
@@ -80,12 +141,21 @@ class Bot:
         # Initialize
         await self._storage.initialize()
         await self._client.start()
+        await self._exchange_feed.start()
 
         # Load strategies
         for strat_config in self._config.strategies.enabled:
             cls = STRATEGY_REGISTRY.get(strat_config.name)
             if cls:
-                self._strategies.append(cls(**strat_config.params))
+                strategy = cls(**strat_config.params)
+                # Wire exchange feed into strategies that need it
+                if hasattr(strategy, "set_exchange_feed"):
+                    # Default to BTC feed; can be configured per-strategy
+                    symbol = strat_config.params.get("exchange_symbol", "BTC")
+                    feed = self._exchange_feed.get_feed(symbol)
+                    if feed:
+                        strategy.set_exchange_feed(feed)
+                self._strategies.append(strategy)
                 logger.info("strategy_loaded", name=strat_config.name)
             else:
                 logger.warning("strategy_unknown", name=strat_config.name)
@@ -110,6 +180,7 @@ class Bot:
         await self._execution_engine.cancel_all()
         await self._scanner.stop()
         await self._ws_manager.stop()
+        await self._exchange_feed.stop()
         await self._client.close()
         await self._storage.close()
         logger.info("bot_stopped")

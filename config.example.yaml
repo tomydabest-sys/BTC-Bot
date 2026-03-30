@@ -37,6 +37,64 @@ strategies:
         take_profit: 0.03
         trailing_stop: 0.02
 
+    - name: "latency_arb"
+      weight: 1.0
+      params:
+        min_gap_pct: 0.03
+        max_gap_pct: 0.15
+        min_exchange_move_pct: 0.02
+        fee_buffer_pct: 0.01
+        size_pct: 0.08
+        exchange_symbol: "BTC"
+
+    - name: "momentum_lag"
+      weight: 1.0
+      params:
+        min_move_30s_pct: 0.015
+        min_move_60s_pct: 0.025
+        min_gap_pct: 0.03
+        thin_book_threshold: 0.04
+        size_pct: 0.07
+        exchange_symbol: "BTC"
+
+    - name: "volatility_breakout"
+      weight: 0.8
+      params:
+        compression_ratio: 0.4
+        breakout_threshold_pct: 0.02
+        lookback_compress_seconds: 120
+        lookback_baseline_seconds: 600
+        min_spread: 0.03
+        size_pct: 0.06
+        exchange_symbol: "BTC"
+
+    - name: "dual_direction_arb"
+      weight: 1.0
+      params:
+        min_profit_pct: 0.01
+        max_total_cost: 0.99
+        min_liquidity_each_side: 50.0
+        size_pct: 0.10
+
+    - name: "market_maker"
+      weight: 0.5
+      params:
+        min_spread: 0.03
+        target_spread: 0.04
+        max_inventory_pct: 0.15
+        skew_factor: 0.5
+        size_pct: 0.04
+
+    - name: "monte_carlo"
+      weight: 0.8
+      params:
+        num_simulations: 5000
+        min_edge_pct: 0.05
+        time_window_minutes: 15
+        vol_lookback_seconds: 300
+        size_pct: 0.05
+        exchange_symbol: "BTC"
+
   aggregation:
     min_confidence: 0.5
     conflict_resolution: "skip"
