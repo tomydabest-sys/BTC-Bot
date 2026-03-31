@@ -112,11 +112,19 @@ class PolymarketClient:
         offset: int = 0,
     ) -> list[Market]:
         """Fetch active markets from the Gamma API."""
-        # Gamma API is the public market metadata endpoint
+        import json as _json
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
                 f"{GAMMA_BASE_URL}/markets",
-                params={"active": active, "limit": limit, "offset": offset},
+                params={
+                    "active": str(active).lower(),
+                    "closed": "false",
+                    "limit": limit,
+                    "offset": offset,
+                    "order": "volume24hr",
+                    "ascending": "false",
+                },
             )
             resp.raise_for_status()
             data = resp.json()
@@ -124,35 +132,92 @@ class PolymarketClient:
         items = data if isinstance(data, list) else data.get("data", [])
         markets = []
         for item in items:
+            # Parse token IDs — Gamma returns clobTokenIds as a JSON string
             token_ids = []
-            tokens = item.get("tokens", [])
-            if isinstance(tokens, list):
-                for t in tokens:
-                    if isinstance(t, dict):
-                        token_ids.append(t.get("token_id", ""))
-                    else:
-                        token_ids.append(str(t))
+            raw_tokens = item.get("clobTokenIds")
+            if isinstance(raw_tokens, str):
+                try:
+                    token_ids = _json.loads(raw_tokens)
+                except (ValueError, TypeError):
+                    token_ids = []
+            elif isinstance(raw_tokens, list):
+                token_ids = raw_tokens
 
-            end_date_raw = item.get("end_date_iso", "")
+            # Fallback to tokens field if clobTokenIds is missing
+            if not token_ids:
+                tokens = item.get("tokens", [])
+                if isinstance(tokens, list):
+                    for t in tokens:
+                        if isinstance(t, dict):
+                            token_ids.append(t.get("token_id", ""))
+                        else:
+                            token_ids.append(str(t))
+
+            # Parse outcomes — may also be a JSON string
+            raw_outcomes = item.get("outcomes")
+            if isinstance(raw_outcomes, str):
+                try:
+                    outcomes = _json.loads(raw_outcomes)
+                except (ValueError, TypeError):
+                    outcomes = ["Yes", "No"]
+            elif isinstance(raw_outcomes, list):
+                outcomes = raw_outcomes
+            else:
+                outcomes = ["Yes", "No"]
+
+            # Parse end date — try multiple field names
+            end_date_raw = (
+                item.get("end_date_iso")
+                or item.get("endDate")
+                or item.get("end_date")
+                or ""
+            )
             try:
-                end_date = datetime.fromisoformat(end_date_raw) if end_date_raw else datetime.utcnow()
+                end_date = datetime.fromisoformat(end_date_raw.replace("Z", "+00:00")) if end_date_raw else datetime.utcnow()
             except (ValueError, TypeError):
                 end_date = datetime.utcnow()
 
+            # Condition ID — try both camelCase and snake_case
+            condition_id = (
+                item.get("conditionId")
+                or item.get("condition_id")
+                or item.get("id", "")
+            )
+
+            # Volume/liquidity — try multiple field names
+            volume_24h = float(
+                item.get("volume24hr")
+                or item.get("volume_num_24hr")
+                or item.get("volume", 0)
+            )
+            liquidity = float(
+                item.get("liquidity")
+                or item.get("liquidity_num", 0)
+            )
+
+            if not condition_id:
+                continue
+
             markets.append(
                 Market(
-                    id=item.get("condition_id", item.get("id", "")),
+                    id=condition_id,
                     question=item.get("question", ""),
-                    slug=item.get("slug", ""),
-                    outcomes=item.get("outcomes", ["Yes", "No"]),
+                    slug=item.get("slug", item.get("market_slug", "")),
+                    outcomes=outcomes,
                     token_ids=token_ids,
                     end_date=end_date,
                     category=item.get("category", ""),
                     active=item.get("active", True),
-                    volume_24h=float(item.get("volume_num_24hr", 0)),
-                    liquidity=float(item.get("liquidity_num", 0)),
+                    volume_24h=volume_24h,
+                    liquidity=liquidity,
                 )
             )
+
+        logger.info(
+            "markets_fetched",
+            raw_count=len(items),
+            parsed_count=len(markets),
+        )
         return markets
 
     async def get_orderbook(self, token_id: str) -> OrderBook:

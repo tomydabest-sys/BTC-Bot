@@ -51,9 +51,30 @@ class MarketScanner:
 
     async def _scan(self) -> None:
         logger.info("scanning_markets")
-        all_markets = await self._client.get_markets(active=True)
-        filtered = [m for m in all_markets if self._passes_filters(m)]
+
+        # Fetch multiple pages to get more markets
+        all_markets: list[Market] = []
+        for offset in range(0, 300, 100):
+            batch = await self._client.get_markets(active=True, limit=100, offset=offset)
+            all_markets.extend(batch)
+            if len(batch) < 100:
+                break
+
+        logger.info("markets_raw_fetched", count=len(all_markets))
+
+        filtered = []
+        filter_reasons: dict[str, int] = {}
+        for m in all_markets:
+            passes, reason = self._passes_filters_with_reason(m)
+            if passes:
+                filtered.append(m)
+            else:
+                filter_reasons[reason] = filter_reasons.get(reason, 0) + 1
+
         filtered.sort(key=lambda m: m.volume_24h, reverse=True)
+
+        if filter_reasons:
+            logger.info("markets_filtered_out", reasons=filter_reasons)
 
         new_markets = {m.id: m for m in filtered}
         added = set(new_markets) - set(self._active_markets)
@@ -67,27 +88,42 @@ class MarketScanner:
         self._active_markets = new_markets
         logger.info("scan_complete", total=len(filtered), added=len(added), removed=len(removed))
 
-    def _passes_filters(self, market: Market) -> bool:
+    def _passes_filters_with_reason(self, market: Market) -> tuple[bool, str]:
+        """Check if market passes all filters. Returns (passes, reason_if_not)."""
         if not market.active:
-            return False
-        if market.volume_24h < self._config.min_volume_24h:
-            return False
-        if market.liquidity < self._config.min_liquidity:
-            return False
+            return False, "inactive"
 
-        # Resolution window filter
+        if market.volume_24h < self._config.min_volume_24h:
+            return False, "low_volume"
+
+        if market.liquidity < self._config.min_liquidity:
+            return False, "low_liquidity"
+
+        # Resolution window filter — skip for markets without a meaningful end date
         now = datetime.utcnow()
         min_days, max_days = self._config.resolution_window_days
-        if market.end_date < now + timedelta(days=min_days):
-            return False
-        if market.end_date > now + timedelta(days=max_days):
-            return False
+
+        # Markets that already expired
+        if market.end_date < now:
+            return False, "expired"
+
+        # Only apply max_days filter if configured (> 0)
+        if max_days > 0 and market.end_date > now + timedelta(days=max_days):
+            return False, "too_far_out"
 
         # Category filters
         if self._config.categories_allowlist:
             if market.category not in self._config.categories_allowlist:
-                return False
+                return False, "category_not_allowed"
         if market.category in self._config.categories_blocklist:
-            return False
+            return False, "category_blocked"
 
-        return True
+        # Must have token IDs to be tradeable
+        if not market.token_ids:
+            return False, "no_token_ids"
+
+        return True, ""
+
+    def _passes_filters(self, market: Market) -> bool:
+        passes, _ = self._passes_filters_with_reason(market)
+        return passes

@@ -9,13 +9,13 @@ wallet:
   api_key_env: "POLYMARKET_API_KEY"
 
 scanner:
-  interval_seconds: 300
-  min_volume_24h: 10000
-  min_liquidity: 5000
-  max_spread_pct: 5.0
+  interval_seconds: 120
+  min_volume_24h: 1000
+  min_liquidity: 500
+  max_spread_pct: 10.0
   categories_allowlist: []
   categories_blocklist: []
-  resolution_window_days: [1, 30]
+  resolution_window_days: [0, 90]
 
 strategies:
   enabled:

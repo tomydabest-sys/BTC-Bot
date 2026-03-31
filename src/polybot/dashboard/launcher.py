@@ -49,7 +49,6 @@ def run_dashboard() -> None:
     set_bot(bot)
 
     async def run_all() -> None:
-        # Start uvicorn in the background
         uvi_config = uvicorn.Config(
             app,
             host=args.host,
@@ -58,10 +57,28 @@ def run_dashboard() -> None:
         )
         server = uvicorn.Server(uvi_config)
 
-        tasks = [asyncio.create_task(server.serve())]
+        shutdown_event = asyncio.Event()
+
+        async def bot_runner() -> None:
+            try:
+                await bot.start()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                shutdown_event.set()
+
+        async def server_runner() -> None:
+            try:
+                await server.serve()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                shutdown_event.set()
+
+        tasks = [asyncio.create_task(server_runner())]
 
         if not args.no_bot:
-            tasks.append(asyncio.create_task(bot.start()))
+            tasks.append(asyncio.create_task(bot_runner()))
 
         logger.info(
             "dashboard_started",
@@ -69,15 +86,27 @@ def run_dashboard() -> None:
             bot_mode=config.bot.mode if not args.no_bot else "disabled",
         )
 
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+
+        # Graceful cleanup
+        logger.info("shutting_down")
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+
+        for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     def handle_signal(sig: int, _frame) -> None:
         logger.info("signal_received", signal=sig)
-        loop.create_task(bot.stop())
+        # Thread-safe way to stop — set the bot's running flag
+        bot._running = False
 
     signal_mod.signal(signal_mod.SIGINT, handle_signal)
     signal_mod.signal(signal_mod.SIGTERM, handle_signal)
@@ -85,8 +114,17 @@ def run_dashboard() -> None:
     try:
         loop.run_until_complete(run_all())
     except KeyboardInterrupt:
-        loop.run_until_complete(bot.stop())
+        try:
+            loop.run_until_complete(bot.stop())
+        except Exception:
+            pass
     finally:
+        # Cancel remaining tasks
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
 
