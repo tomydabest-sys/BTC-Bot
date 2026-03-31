@@ -18,6 +18,13 @@ logger = structlog.get_logger()
 
 def run_dashboard() -> None:
     """CLI entry point for the dashboard."""
+    # Load .env file if present
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed, rely on real env vars
+
     parser = argparse.ArgumentParser(description="PolyBot Dashboard")
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--mode", choices=["paper", "live"], help="Override trading mode")

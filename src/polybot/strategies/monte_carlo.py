@@ -16,6 +16,7 @@ import math
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
+from polybot.strategies.market_filter import is_crypto_window_market
 
 
 class MonteCarloStrategy(BaseStrategy):
@@ -29,6 +30,7 @@ class MonteCarloStrategy(BaseStrategy):
         vol_lookback_seconds: int = 300,
         size_pct: float = 0.05,
         confidence_floor: float = 0.55,
+        market_keywords: list[str] | None = None,
     ) -> None:
         self._num_simulations = num_simulations
         self._min_edge_pct = min_edge_pct
@@ -36,6 +38,7 @@ class MonteCarloStrategy(BaseStrategy):
         self._vol_lookback = vol_lookback_seconds
         self._size_pct = size_pct
         self._confidence_floor = confidence_floor
+        self._market_keywords = market_keywords
         self._exchange_feed: PriceFeedState | None = None
 
     @property
@@ -50,15 +53,7 @@ class MonteCarloStrategy(BaseStrategy):
             return None
 
         # Only works on crypto time-window markets
-        question = snapshot.market.question.lower()
-        is_price_market = any(
-            kw in question
-            for kw in [
-                "up or down", "higher or lower", "above", "below",
-                "5 min", "15 min", "minute", "hour",
-            ]
-        )
-        if not is_price_market:
+        if not is_crypto_window_market(snapshot.market.question, self._market_keywords):
             return None
 
         # Get current exchange price and volatility

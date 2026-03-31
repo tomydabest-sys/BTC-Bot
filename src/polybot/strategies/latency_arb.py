@@ -11,11 +11,10 @@ larger gaps (3-5%) where the edge exceeds dynamic fees.
 
 from __future__ import annotations
 
-import time
-
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
+from polybot.strategies.market_filter import is_crypto_window_market
 
 
 class LatencyArbStrategy(BaseStrategy):
@@ -29,6 +28,7 @@ class LatencyArbStrategy(BaseStrategy):
         confidence_floor: float = 0.6,
         size_pct: float = 0.08,
         fee_buffer_pct: float = 0.01,
+        market_keywords: list[str] | None = None,
     ) -> None:
         self._min_gap_pct = min_gap_pct
         self._max_gap_pct = max_gap_pct
@@ -36,6 +36,7 @@ class LatencyArbStrategy(BaseStrategy):
         self._confidence_floor = confidence_floor
         self._size_pct = size_pct
         self._fee_buffer_pct = fee_buffer_pct
+        self._market_keywords = market_keywords
         self._exchange_feed: PriceFeedState | None = None
 
     @property
@@ -50,12 +51,7 @@ class LatencyArbStrategy(BaseStrategy):
             return None
 
         # Only works on crypto up/down markets
-        question = snapshot.market.question.lower()
-        is_up_down = any(
-            kw in question
-            for kw in ["up or down", "higher or lower", "above or below", "increase or decrease"]
-        )
-        if not is_up_down:
+        if not is_crypto_window_market(snapshot.market.question, self._market_keywords):
             return None
 
         # Determine which direction the exchange is moving

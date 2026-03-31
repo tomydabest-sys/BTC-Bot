@@ -10,11 +10,10 @@ priced and where it actually is, specifically on ultra-short timeframes.
 
 from __future__ import annotations
 
-import time
-
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
+from polybot.strategies.market_filter import is_crypto_window_market
 
 
 class MomentumLagStrategy(BaseStrategy):
@@ -28,6 +27,7 @@ class MomentumLagStrategy(BaseStrategy):
         max_gap_pct: float = 0.10,
         thin_book_threshold: float = 0.04,
         size_pct: float = 0.07,
+        market_keywords: list[str] | None = None,
     ) -> None:
         self._min_move_30s = min_move_30s_pct
         self._min_move_60s = min_move_60s_pct
@@ -35,6 +35,7 @@ class MomentumLagStrategy(BaseStrategy):
         self._max_gap_pct = max_gap_pct
         self._thin_book_threshold = thin_book_threshold
         self._size_pct = size_pct
+        self._market_keywords = market_keywords
         self._exchange_feed: PriceFeedState | None = None
 
     @property
@@ -49,12 +50,7 @@ class MomentumLagStrategy(BaseStrategy):
             return None
 
         # Target crypto prediction markets
-        question = snapshot.market.question.lower()
-        is_crypto_window = any(
-            kw in question
-            for kw in ["up or down", "higher or lower", "5 min", "15 min", "minute"]
-        )
-        if not is_crypto_window:
+        if not is_crypto_window_market(snapshot.market.question, self._market_keywords):
             return None
 
         # Check for strong directional exchange move

@@ -46,6 +46,9 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "monte_carlo": MonteCarloStrategy,
 }
 
+# Default paper balance when no wallet is connected
+DEFAULT_PAPER_BALANCE = 10_000.0
+
 
 class Bot:
     """Main bot orchestrator — wires components and runs the trading loop."""
@@ -53,11 +56,15 @@ class Bot:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._running = False
+        self._wallet_balance = 0.0
 
         # Core infrastructure
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
-        self._client = PolymarketClient(api_key="")  # Set in start()
+        self._client = PolymarketClient(
+            api_key=self._safe_env(config.wallet.api_key_env),
+            private_key=self._safe_env(config.wallet.private_key_env),
+        )
         self._ws_manager = WebSocketManager(self._event_bus)
         self._data_pipeline = DataPipeline()
         self._exchange_feed = ExchangePriceFeed(
@@ -85,6 +92,12 @@ class Bot:
             min_confidence=config.strategies.aggregation.min_confidence,
             conflict_resolution=config.strategies.aggregation.conflict_resolution,
         )
+
+    @staticmethod
+    def _safe_env(env_var: str) -> str:
+        """Read env var without raising if missing (returns empty string)."""
+        import os
+        return os.environ.get(env_var, "")
 
     @property
     def config(self) -> Config:
@@ -143,14 +156,26 @@ class Bot:
         await self._client.start()
         await self._exchange_feed.start()
 
+        # Fetch wallet balance (or use paper default)
+        if self._config.is_live:
+            self._wallet_balance = await self._client.get_balance()
+            logger.info("wallet_balance_fetched", balance=self._wallet_balance)
+        else:
+            self._wallet_balance = DEFAULT_PAPER_BALANCE
+            logger.info("paper_balance_set", balance=self._wallet_balance)
+
         # Load strategies
         for strat_config in self._config.strategies.enabled:
             cls = STRATEGY_REGISTRY.get(strat_config.name)
             if cls:
-                strategy = cls(**strat_config.params)
+                # Filter out exchange_symbol from params passed to constructor
+                ctor_params = {
+                    k: v for k, v in strat_config.params.items()
+                    if k != "exchange_symbol"
+                }
+                strategy = cls(**ctor_params)
                 # Wire exchange feed into strategies that need it
                 if hasattr(strategy, "set_exchange_feed"):
-                    # Default to BTC feed; can be configured per-strategy
                     symbol = strat_config.params.get("exchange_symbol", "BTC")
                     feed = self._exchange_feed.get_feed(symbol)
                     if feed:
@@ -162,6 +187,7 @@ class Bot:
 
         # Wire events
         self._event_bus.subscribe("market_discovered", self._on_market_discovered)
+        self._event_bus.subscribe("order_filled", self._on_order_filled)
 
         # Start components
         await self._scanner.start()
@@ -185,6 +211,31 @@ class Bot:
         await self._storage.close()
         logger.info("bot_stopped")
 
+    async def _on_order_filled(self, order: Order, **kwargs) -> None:
+        """Handle order fill — update positions and log to dashboard."""
+        self._position_manager.update_from_fill(order)
+
+        # Record trade result for circuit breaker
+        if order.avg_fill_price > 0 and order.filled_size > 0:
+            # Estimate PnL direction from the fill for circuit breaker tracking
+            # (actual PnL is tracked by position manager)
+            portfolio = self._position_manager.get_portfolio()
+            self._circuit_breaker.record_trade_result(portfolio.daily_pnl)
+
+        # Log to dashboard
+        try:
+            from polybot.dashboard.app import log_trade
+            log_trade({
+                "market_id": order.market_id,
+                "side": order.side.value,
+                "price": order.avg_fill_price,
+                "size": order.filled_size,
+                "strategy": order.strategy,
+                "order_id": order.order_id,
+            })
+        except ImportError:
+            pass
+
     async def _trading_loop(self) -> None:
         """Main loop: evaluate strategies and execute signals."""
         while self._running:
@@ -193,6 +244,12 @@ class Bot:
                     logger.debug("trading_paused_circuit_breaker")
                     await asyncio.sleep(10)
                     continue
+
+                # Periodically refresh balance in live mode
+                if self._config.is_live:
+                    balance = await self._client.get_balance()
+                    if balance > 0:
+                        self._wallet_balance = balance
 
                 # Evaluate all active markets
                 for market_id in self._scanner.active_markets:
@@ -208,14 +265,30 @@ class Bot:
                     # Generate signals from all strategies
                     signals = []
                     for strategy in self._strategies:
-                        signal = await strategy.evaluate(snapshot)
-                        if signal:
-                            signals.append(signal)
+                        sig = await strategy.evaluate(snapshot)
+                        if sig:
+                            signals.append(sig)
+                            # Log signal to dashboard
+                            try:
+                                from polybot.dashboard.app import log_signal
+                                log_signal({
+                                    "market_id": sig.market_id,
+                                    "strategy": sig.strategy,
+                                    "direction": sig.direction.value,
+                                    "confidence": round(sig.confidence, 3),
+                                    "reason": sig.reason,
+                                    "target_price": round(sig.target_price, 4),
+                                    "size_pct": round(sig.size_pct, 4),
+                                })
+                            except ImportError:
+                                pass
 
                     # Aggregate and execute
                     final_signals = self._aggregator.aggregate(signals)
                     for sig in final_signals:
                         portfolio = self._position_manager.get_portfolio()
+                        # Use wallet balance for sizing
+                        balance = self._wallet_balance if self._wallet_balance > 0 else DEFAULT_PAPER_BALANCE
                         order = Order(
                             market_id=sig.market_id,
                             token_id=snapshot.market.token_ids[0]
@@ -223,12 +296,30 @@ class Bot:
                             else "",
                             side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
                             price=sig.target_price,
-                            size=sig.size_pct * portfolio.balance if portfolio.balance > 0 else 100,
+                            size=sig.size_pct * balance,
                             order_type=OrderType.LIMIT,
                             strategy=sig.strategy,
                         )
                         order.size *= self._circuit_breaker.size_multiplier
-                        await self._execution_engine.execute_order(order, portfolio)
+                        filled_order = await self._execution_engine.execute_order(order, portfolio)
+
+                        # Save to storage
+                        await self._storage.save_order({
+                            "order_id": filled_order.order_id,
+                            "market_id": filled_order.market_id,
+                            "token_id": filled_order.token_id,
+                            "side": filled_order.side.value,
+                            "price": filled_order.price,
+                            "size": filled_order.size,
+                            "order_type": filled_order.order_type.value,
+                            "status": filled_order.status.value,
+                            "strategy": filled_order.strategy,
+                            "signal_id": filled_order.signal_id,
+                            "filled_size": filled_order.filled_size,
+                            "avg_fill_price": filled_order.avg_fill_price,
+                            "created_at": filled_order.created_at.isoformat(),
+                            "updated_at": filled_order.created_at.isoformat(),
+                        })
 
                 # Check exits
                 exits = self._position_manager.check_exits()
@@ -238,6 +329,17 @@ class Bot:
                         market=exit_signal.position.market_id,
                         reason=exit_signal.reason,
                     )
+
+                # Snapshot P&L to storage
+                portfolio = self._position_manager.get_portfolio()
+                portfolio.balance = self._wallet_balance
+                await self._storage.save_pnl_snapshot({
+                    "timestamp": asyncio.get_event_loop().time(),
+                    "realized_pnl": portfolio.realized_pnl,
+                    "unrealized_pnl": portfolio.unrealized_pnl,
+                    "total_exposure": portfolio.total_exposure,
+                    "num_positions": len(portfolio.positions),
+                })
 
                 await asyncio.sleep(5)
 
@@ -256,6 +358,13 @@ class Bot:
 def cli() -> None:
     """CLI entry point."""
     import argparse
+
+    # Load .env file if present
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed, rely on real env vars
 
     parser = argparse.ArgumentParser(description="Polymarket Trading Bot")
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
