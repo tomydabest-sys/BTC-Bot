@@ -46,17 +46,24 @@ class MeanReversionStrategy(BaseStrategy):
 
         # Price is above fair value → sell (expect reversion down)
         # Price is below fair value → buy (expect reversion up)
+        # Research: NO outperforms YES at 69/99 price levels, so prefer
+        # NO-side trades when confidence is similar
         if deviation > 0:
             direction = Direction.SELL
             outcome = "No"
-            target_price = mid  # Sell at current elevated price
+            target_price = mid
         else:
             direction = Direction.BUY
             outcome = "Yes"
-            target_price = mid  # Buy at current depressed price
+            target_price = mid
 
         confidence = min(abs(deviation) / (self._deviation_threshold * 3), 1.0)
-        size_pct = 0.05 * confidence  # 1–5% of capital based on confidence
+
+        # Apply NO-side bonus from research (optimism tax)
+        if outcome == "No":
+            confidence = min(confidence * 1.05, 1.0)
+
+        size_pct = 0.05 * confidence
 
         return Signal(
             market_id=snapshot.market.id,

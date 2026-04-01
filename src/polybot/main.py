@@ -31,6 +31,8 @@ from polybot.strategies.volatility_breakout import VolatilityBreakoutStrategy
 from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
 from polybot.strategies.market_maker import MarketMakerStrategy
 from polybot.strategies.monte_carlo import MonteCarloStrategy
+from polybot.strategies.calibration_edge import CalibrationEdgeStrategy
+from polybot.strategies.maker_edge import MakerEdgeStrategy
 from polybot.data.models import Order, OrderType, Side
 
 logger = structlog.get_logger()
@@ -44,6 +46,8 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "dual_direction_arb": DualDirectionArbStrategy,
     "market_maker": MarketMakerStrategy,
     "monte_carlo": MonteCarloStrategy,
+    "calibration_edge": CalibrationEdgeStrategy,
+    "maker_edge": MakerEdgeStrategy,
 }
 
 # Default paper balance when no wallet is connected
@@ -289,6 +293,12 @@ class Bot:
                         portfolio = self._position_manager.get_portfolio()
                         # Use wallet balance for sizing
                         balance = self._wallet_balance if self._wallet_balance > 0 else DEFAULT_PAPER_BALANCE
+                        # Maker-only strategies use GTC to stay passive
+                        order_type = (
+                            OrderType.GTC
+                            if sig.metadata.get("is_maker_only") or sig.metadata.get("is_market_maker")
+                            else OrderType.LIMIT
+                        )
                         order = Order(
                             market_id=sig.market_id,
                             token_id=snapshot.market.token_ids[0]
@@ -297,7 +307,7 @@ class Bot:
                             side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
                             price=sig.target_price,
                             size=sig.size_pct * balance,
-                            order_type=OrderType.LIMIT,
+                            order_type=order_type,
                             strategy=sig.strategy,
                         )
                         order.size *= self._circuit_breaker.size_multiplier
@@ -389,7 +399,7 @@ def cli() -> None:
 
     def handle_signal(sig: int, _frame) -> None:
         logger.info("signal_received", signal=sig)
-        loop.create_task(bot.stop())
+        bot._running = False  # Thread-safe flag, avoids event loop issues
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)

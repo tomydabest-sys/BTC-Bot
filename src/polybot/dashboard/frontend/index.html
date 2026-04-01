@@ -259,7 +259,36 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 
 /* Full-width panels */
 .panel.full { grid-column: 1 / -1; }
+
+/* Terminal Panel */
+.terminal-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-top: 16px;
+}
+.terminal-panel .panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+}
+.terminal-panel .panel-header h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+#terminal-container {
+  width: 100%;
+  height: 300px;
+  padding: 4px;
+}
+.terminal-controls {
+  display: flex;
+  gap: 8px;
+}
+.terminal-controls .btn { padding: 4px 12px; font-size: 11px; }
 </style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 </head>
 <body>
 
@@ -391,6 +420,19 @@ tr:hover td { background: rgba(255,255,255,0.02); }
       </div>
       <div class="panel-body" id="tradeLog"></div>
     </div>
+  </div>
+
+  <!-- Live Terminal -->
+  <div class="terminal-panel">
+    <div class="panel-header">
+      <h2>Live Bot Terminal</h2>
+      <div class="terminal-controls">
+        <button class="btn" onclick="clearTerminal()">Clear</button>
+        <button class="btn" onclick="toggleTerminalScroll()" id="scrollToggle">Auto-Scroll: ON</button>
+        <div class="badge" id="terminalBadge" style="background:var(--green-dim);color:var(--green)">CONNECTED</div>
+      </div>
+    </div>
+    <div id="terminal-container"></div>
   </div>
 </div>
 
@@ -717,12 +759,104 @@ function connectWS() {
   ws.onerror = () => { ws.close(); };
 }
 
+// --- Terminal (xterm.js) ---
+let term = null;
+let termWs = null;
+let termAutoScroll = true;
+
+function initTerminal() {
+  term = new Terminal({
+    theme: {
+      background: '#0a0e17',
+      foreground: '#e2e8f0',
+      cursor: '#3b82f6',
+      selectionBackground: '#1e3a5f',
+      black: '#0a0e17',
+      red: '#ef4444',
+      green: '#10b981',
+      yellow: '#f59e0b',
+      blue: '#3b82f6',
+      magenta: '#8b5cf6',
+      cyan: '#06b6d4',
+      white: '#e2e8f0',
+    },
+    fontFamily: "'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', monospace",
+    fontSize: 12,
+    lineHeight: 1.4,
+    cursorBlink: false,
+    disableStdin: true,
+    scrollback: 2000,
+    convertEol: true,
+  });
+
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal-container'));
+  fitAddon.fit();
+
+  window.addEventListener('resize', () => { fitAddon.fit(); });
+
+  term.writeln('\x1b[36m=== PolyBot Live Terminal ===\x1b[0m');
+  term.writeln('\x1b[90mStreaming bot logs in real-time...\x1b[0m');
+  term.writeln('');
+
+  connectTerminalWS();
+}
+
+function connectTerminalWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  termWs = new WebSocket(`${proto}//${location.host}/ws/terminal`);
+  termWs.onopen = () => {
+    const badge = $('terminalBadge');
+    badge.textContent = 'CONNECTED';
+    badge.style.background = 'var(--green-dim)';
+    badge.style.color = 'var(--green)';
+    if (term) term.writeln('\x1b[32m[terminal] Connected to bot log stream\x1b[0m');
+  };
+  termWs.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'log' && msg.data && term) {
+        // Colorize log levels
+        let line = msg.data;
+        line = line.replace(/\[INFO\]/g, '\x1b[36m[INFO]\x1b[0m');
+        line = line.replace(/\[WARNING\]/g, '\x1b[33m[WARNING]\x1b[0m');
+        line = line.replace(/\[ERROR\]/g, '\x1b[31m[ERROR]\x1b[0m');
+        line = line.replace(/\[DEBUG\]/g, '\x1b[90m[DEBUG]\x1b[0m');
+        term.writeln(line);
+        if (termAutoScroll) term.scrollToBottom();
+      }
+    } catch (err) {}
+  };
+  termWs.onclose = () => {
+    const badge = $('terminalBadge');
+    badge.textContent = 'DISCONNECTED';
+    badge.style.background = 'var(--red-dim)';
+    badge.style.color = 'var(--red)';
+    if (term) term.writeln('\x1b[31m[terminal] Disconnected. Reconnecting...\x1b[0m');
+    setTimeout(connectTerminalWS, 3000);
+  };
+  termWs.onerror = () => { termWs.close(); };
+}
+
+function clearTerminal() {
+  if (term) { term.clear(); term.writeln('\x1b[90m--- Terminal cleared ---\x1b[0m'); }
+}
+
+function toggleTerminalScroll() {
+  termAutoScroll = !termAutoScroll;
+  $('scrollToggle').textContent = 'Auto-Scroll: ' + (termAutoScroll ? 'ON' : 'OFF');
+}
+
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
   refreshAll();
   startAutoRefresh();
   connectWS();
+  initTerminal();
 });
 </script>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 </body>
 </html>

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,43 @@ _trade_log: list[dict] = []
 _signal_log: list[dict] = []
 
 MAX_LOG_SIZE = 500
+
+# --- Terminal log streaming ---
+_terminal_clients: list[WebSocket] = []
+_terminal_buffer: deque[str] = deque(maxlen=500)
+
+
+class WebSocketLogHandler(logging.Handler):
+    """Captures Python log records and pushes them to terminal WebSocket clients."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            _terminal_buffer.append(msg)
+            # Schedule broadcast (non-blocking)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_broadcast_terminal(msg))
+            except RuntimeError:
+                pass  # No running loop yet
+        except Exception:
+            pass
+
+
+async def _broadcast_terminal(line: str) -> None:
+    """Send a log line to all terminal WebSocket clients."""
+    if not _terminal_clients:
+        return
+    disconnected = []
+    payload = json.dumps({"type": "log", "data": line})
+    for ws in _terminal_clients:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            disconnected.append(ws)
+    for ws in disconnected:
+        if ws in _terminal_clients:
+            _terminal_clients.remove(ws)
 
 
 def set_bot(bot) -> None:
@@ -143,7 +182,8 @@ async def get_strategies() -> dict:
         ],
         "available": list(
             {"mean_reversion", "momentum", "latency_arb", "momentum_lag",
-             "volatility_breakout", "dual_direction_arb", "market_maker", "monte_carlo"}
+             "volatility_breakout", "dual_direction_arb", "market_maker",
+             "monte_carlo", "calibration_edge", "maker_edge"}
         ),
     }
 
@@ -230,12 +270,29 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     _ws_clients.append(websocket)
     try:
         while True:
-            # Keep connection alive; client can send commands
             data = await websocket.receive_text()
-            # Handle client commands if needed
     except WebSocketDisconnect:
         if websocket in _ws_clients:
             _ws_clients.remove(websocket)
+
+
+@app.websocket("/ws/terminal")
+async def terminal_websocket(websocket: WebSocket) -> None:
+    """Stream bot logs to an xterm.js terminal in the dashboard."""
+    await websocket.accept()
+    _terminal_clients.append(websocket)
+    # Send buffered history so new clients see recent logs
+    for line in _terminal_buffer:
+        try:
+            await websocket.send_text(json.dumps({"type": "log", "data": line}))
+        except Exception:
+            break
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        if websocket in _terminal_clients:
+            _terminal_clients.remove(websocket)
 
 
 # --- Background task to push updates ---
@@ -278,6 +335,11 @@ async def _push_updates_loop() -> None:
 @app.on_event("startup")
 async def startup_event() -> None:
     asyncio.create_task(_push_updates_loop())
+    # Install log handler to stream all bot logs to terminal clients
+    handler = WebSocketLogHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
 
 
 # --- Serve the frontend ---

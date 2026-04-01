@@ -86,6 +86,23 @@ def run_dashboard() -> None:
             bot_mode=config.bot.mode if not args.no_bot else "disabled",
         )
 
+        # Print clear startup message
+        print(f"\n{'='*60}")
+        print(f"  POLYBOT DASHBOARD RUNNING")
+        print(f"  URL: http://{args.host}:{args.port}")
+        print(f"  Mode: {config.bot.mode.upper()}")
+        print(f"  Strategies: {len(config.strategies.enabled)} loaded")
+        print(f"  Terminal: Live log streaming via WebSocket")
+        print(f"  Press Ctrl+C to stop")
+        print(f"{'='*60}\n")
+
+        # Auto-open browser
+        import webbrowser
+        try:
+            webbrowser.open(f"http://{args.host}:{args.port}")
+        except Exception:
+            pass
+
         # Wait for shutdown signal
         await shutdown_event.wait()
 
