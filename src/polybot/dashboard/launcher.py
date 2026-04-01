@@ -28,7 +28,7 @@ def run_dashboard() -> None:
     parser = argparse.ArgumentParser(description="PolyBot Dashboard")
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--mode", choices=["paper", "live"], help="Override trading mode")
-    parser.add_argument("--host", default="127.0.0.1", help="Dashboard host")
+    parser.add_argument("--host", default="0.0.0.0", help="Dashboard host")
     parser.add_argument("--port", type=int, default=8080, help="Dashboard port")
     parser.add_argument("--no-bot", action="store_true", help="Run dashboard only (no bot)")
     args = parser.parse_args()
