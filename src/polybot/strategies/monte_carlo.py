@@ -52,9 +52,8 @@ class MonteCarloStrategy(BaseStrategy):
         if not self._exchange_feed or len(self._exchange_feed.ticks) < 30:
             return None
 
-        # Only works on crypto time-window markets
-        if not is_crypto_window_market(snapshot.market.question, self._market_keywords):
-            return None
+        # Scanner guarantees only BTC up/down markets reach here.
+        # No keyword filtering needed.
 
         # Get current exchange price and volatility
         current_price = self._exchange_feed.last_price
