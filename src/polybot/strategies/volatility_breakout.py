@@ -47,9 +47,8 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         if not self._exchange_feed or len(self._exchange_feed.ticks) < 20:
             return None
 
-        # Only target crypto up/down markets
-        if not is_crypto_window_market(snapshot.market.question, self._market_keywords):
-            return None
+       # Scanner guarantees only BTC up/down markets reach here.
+       # No keyword filtering needed.
 
         # Step 1: Measure volatility compression
         recent_vol = self._exchange_feed.volatility_window(self._lookback_compress)
