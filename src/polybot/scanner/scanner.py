@@ -103,12 +103,17 @@ class MarketScanner:
         now = datetime.utcnow()
         min_days, max_days = self._config.resolution_window_days
 
+        # Ensure end_date is timezone-naive for comparison (API may return aware datetimes)
+        end_date = market.end_date
+        if end_date.tzinfo is not None:
+            end_date = end_date.replace(tzinfo=None)
+
         # Markets that already expired
-        if market.end_date < now:
+        if end_date < now:
             return False, "expired"
 
         # Only apply max_days filter if configured (> 0)
-        if max_days > 0 and market.end_date > now + timedelta(days=max_days):
+        if max_days > 0 and end_date > now + timedelta(days=max_days):
             return False, "too_far_out"
 
         # Category filters
