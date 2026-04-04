@@ -4,16 +4,73 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import signal as signal_mod
 
 import structlog
 import uvicorn
 
 from polybot.config import load_config
-from polybot.dashboard.app import set_bot, app
+from polybot.dashboard.app import set_bot, app, WebSocketLogHandler
 from polybot.main import Bot
 
 logger = structlog.get_logger()
+
+
+def _configure_logging(log_level: str) -> None:
+    """Configure structlog to output to both stdout AND the dashboard terminal.
+
+    structlog by default writes directly to stdout via PrintLogger,
+    bypassing Python's logging.Handler system entirely. We replace the
+    logger factory with a DualOutputLogger that writes to stdout AND
+    pushes every line into the WebSocket terminal buffer so the
+    dashboard xterm.js panel receives live bot logs.
+    """
+    from polybot.dashboard.app import _terminal_buffer, _broadcast_terminal
+
+    level = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(
+        log_level, 20
+    )
+
+    class DualOutputLogger:
+        """Writes to both stdout and the WebSocket terminal buffer."""
+
+        def __init__(self, file=None):
+            import sys
+            self._file = file or sys.stdout
+
+        def msg(self, message: str) -> None:
+            # Write to stdout (normal terminal output)
+            print(message, file=self._file)
+            # Also push to WebSocket terminal buffer
+            _terminal_buffer.append(str(message))
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_broadcast_terminal(str(message)))
+            except RuntimeError:
+                pass  # No event loop yet
+
+        # structlog calls these aliases depending on log level
+        debug = info = warning = error = critical = fatal = msg
+        log = msg
+
+        def __repr__(self) -> str:
+            return "<DualOutputLogger>"
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.StackInfoRenderer(),
+            structlog.dev.set_exc_info,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+            structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        context_class=dict,
+        logger_factory=DualOutputLogger,
+        cache_logger_on_first_use=False,
+    )
 
 
 def run_dashboard() -> None:
@@ -37,13 +94,8 @@ def run_dashboard() -> None:
     if args.mode:
         config.bot.mode = args.mode
 
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(
-                config.bot.log_level, 20
-            )
-        ),
-    )
+    # Configure structlog → stdlib logging → WebSocket terminal
+    _configure_logging(config.bot.log_level)
 
     bot = Bot(config)
     set_bot(bot)
@@ -87,9 +139,11 @@ def run_dashboard() -> None:
         )
 
         # Print clear startup message
+        # Use localhost for display/browser even if binding to 0.0.0.0
+        display_host = "localhost" if args.host == "0.0.0.0" else args.host
         print(f"\n{'='*60}")
         print(f"  POLYBOT DASHBOARD RUNNING")
-        print(f"  URL: http://{args.host}:{args.port}")
+        print(f"  URL: http://{display_host}:{args.port}")
         print(f"  Mode: {config.bot.mode.upper()}")
         print(f"  Strategies: {len(config.strategies.enabled)} loaded")
         print(f"  Terminal: Live log streaming via WebSocket")
@@ -99,7 +153,7 @@ def run_dashboard() -> None:
         # Auto-open browser
         import webbrowser
         try:
-            webbrowser.open(f"http://{args.host}:{args.port}")
+            webbrowser.open(f"http://{display_host}:{args.port}")
         except Exception:
             pass
 

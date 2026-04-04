@@ -335,11 +335,6 @@ async def _push_updates_loop() -> None:
 @app.on_event("startup")
 async def startup_event() -> None:
     asyncio.create_task(_push_updates_loop())
-    # Install log handler to stream all bot logs to terminal clients
-    handler = WebSocketLogHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.INFO)
 
 
 # --- Serve the frontend ---
