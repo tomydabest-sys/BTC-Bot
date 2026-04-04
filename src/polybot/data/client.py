@@ -70,8 +70,13 @@ class PolymarketClient:
             timeout=30.0,
         )
 
-        # Initialize py-clob-client if we have credentials for live trading
-        if self._private_key and self._api_key:
+        # Initialize py-clob-client only if credentials look valid
+        # A valid private key is a 64-char hex string (with optional 0x prefix)
+        pk = self._private_key.strip()
+        pk_hex = pk[2:] if pk.startswith("0x") else pk
+        has_valid_pk = bool(pk_hex) and all(c in "0123456789abcdefABCDEF" for c in pk_hex)
+
+        if has_valid_pk and self._api_key:
             try:
                 from py_clob_client.client import ClobClient
 
@@ -91,6 +96,8 @@ class PolymarketClient:
             except Exception as e:
                 logger.error("clob_client_init_error", error=str(e))
                 self._clob_client = None
+        elif pk and not has_valid_pk:
+            logger.warning("private_key_not_hex", hint="Key must be a hex string (with optional 0x prefix). Paper mode will work without it.")
 
     async def close(self) -> None:
         if self._http:
@@ -174,6 +181,9 @@ class PolymarketClient:
             )
             try:
                 end_date = datetime.fromisoformat(end_date_raw.replace("Z", "+00:00")) if end_date_raw else datetime.utcnow()
+                # Strip timezone info so all comparisons use naive UTC
+                if end_date.tzinfo is not None:
+                    end_date = end_date.replace(tzinfo=None)
             except (ValueError, TypeError):
                 end_date = datetime.utcnow()
 

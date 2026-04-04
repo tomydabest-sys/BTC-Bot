@@ -407,8 +407,20 @@ def cli() -> None:
     try:
         loop.run_until_complete(bot.start())
     except KeyboardInterrupt:
-        loop.run_until_complete(bot.stop())
+        pass  # bot._running already set to False by signal handler
     finally:
+        if bot._running:
+            bot._running = False
+        try:
+            loop.run_until_complete(bot.stop())
+        except Exception:
+            pass
+        # Cancel remaining tasks
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
 
