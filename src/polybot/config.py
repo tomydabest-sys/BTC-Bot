@@ -36,6 +36,8 @@ class ScannerConfig(BaseModel):
     categories_allowlist: list[str] = Field(default_factory=list)
     categories_blocklist: list[str] = Field(default_factory=list)
     resolution_window_days: list[int] = Field(default_factory=lambda: [1, 30])
+    btc_updown_only: bool = True
+    btc_timeframes: list[str] = Field(default_factory=lambda: ["5 min", "15 min", "1 hour", "4 hour"])
 
 
 class StrategyParams(BaseModel):
