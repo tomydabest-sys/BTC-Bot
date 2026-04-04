@@ -50,15 +50,8 @@ class LatencyArbStrategy(BaseStrategy):
         if not self._exchange_feed or self._exchange_feed.last_price == 0:
             return None
 
-        # Only works on crypto up/down markets
-        if not is_crypto_window_market(snapshot.market.question, self._market_keywords):
-            return None
-
-        # Determine which direction the exchange is moving
-        exchange_price = self._exchange_feed.last_price
-        exchange_5s = self._exchange_feed.price_5s_ago
-        if exchange_5s == 0:
-            return None
+        # Scanner guarantees only BTC up/down markets reach here.
+        # No keyword filtering needed.
 
         exchange_move_pct = (exchange_price - exchange_5s) / exchange_5s
 
