@@ -1,117 +1,88 @@
-"""Configuration loading and validation via Pydantic."""
+bot:
+  name: "btc-bot"
+  mode: "paper"
+  log_level: "INFO"
+  data_dir: "./data"
 
-from __future__ import annotations
+wallet:
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  api_key_env: "POLYMARKET_API_KEY"
 
-from pathlib import Path
-from typing import Any
+scanner:
+  interval_seconds: 30
+  min_volume_24h: 0
+  min_liquidity: 10
+  max_spread_pct: 20.0
+  categories_allowlist: []
+  categories_blocklist: []
+  resolution_window_days: [0, 1]
+  btc_updown_only: true
+  btc_timeframes: ["5 min", "15 min", "1 hour", "4 hour"]
 
-import yaml
-from pydantic import BaseModel, Field
+strategies:
+  enabled:
+    # PRIMARY: Sub-second latency arb
+    # Binance WS ticks → detect 0.05% BTC move → buy before Polymarket adjusts
+    - name: "latency_arb"
+      weight: 1.0
+      params:
+        min_gap_pct: 0.015
+        max_gap_pct: 0.20
+        min_exchange_move_pct: 0.003
+        fee_buffer_pct: 0.005
+        size_pct: 0.04
+        confidence_floor: 0.55
+        exchange_symbol: "BTC"
 
+    # SECONDARY: Momentum lag (1-5s trend continuation)
+    - name: "momentum_lag"
+      weight: 1.0
+      params:
+        min_move_30s_pct: 0.003
+        min_move_60s_pct: 0.006
+        min_gap_pct: 0.015
+        max_gap_pct: 0.15
+        thin_book_threshold: 0.015
+        size_pct: 0.04
+        exchange_symbol: "BTC"
 
-class BotConfig(BaseModel):
-    name: str = "polymarket-bot"
-    mode: str = "paper"  # "paper" or "live"
-    log_level: str = "INFO"
-    data_dir: str = "./data"
+    # TERTIARY: Dual direction arb (free money if Up+Down < $1)
+    - name: "dual_direction_arb"
+      weight: 1.0
+      params:
+        min_profit_pct: 0.01
+        max_total_cost: 0.99
+        min_liquidity_each_side: 10.0
+        size_pct: 0.06
 
+  aggregation:
+    min_confidence: 0.55
+    conflict_resolution: "highest_confidence"
 
-class WalletConfig(BaseModel):
-    private_key_env: str = "POLYMARKET_PRIVATE_KEY"
-    api_key_env: str = "POLYMARKET_API_KEY"
+risk:
+  max_position_size: 30
+  max_portfolio_exposure: 150
+  max_positions: 5
+  max_daily_loss: 25
+  min_trade_interval_seconds: 8
+  max_order_size: 20
+  max_slippage_pct: 5.0
+  circuit_breakers:
+    consecutive_losses_pause: 6
+    consecutive_losses_size_reduction: 0.5
+    api_errors_per_minute_pause: 15
+    ws_disconnect_cancel_seconds: 30
 
+execution:
+  rate_limit_per_second: 5
+  order_ttl_seconds: 15
+  retry_attempts: 1
+  retry_backoff_seconds: [1]
 
-class ScannerConfig(BaseModel):
-    interval_seconds: int = 300
-    min_volume_24h: float = 10000
-    min_liquidity: float = 5000
-    max_spread_pct: float = 5.0
-    categories_allowlist: list[str] = Field(default_factory=list)
-    categories_blocklist: list[str] = Field(default_factory=list)
-    resolution_window_days: list[int] = Field(default_factory=lambda: [1, 30])
-    btc_updown_only: bool = True
-    btc_timeframes: list[str] = Field(
-        default_factory=lambda: ["5 min", "15 min", "1 hour", "4 hour"]
-    )
-
-
-class StrategyItemConfig(BaseModel):
-    name: str
-    weight: float = 1.0
-    params: dict[str, Any] = Field(default_factory=dict)
-
-
-class AggregationConfig(BaseModel):
-    min_confidence: float = 0.5
-    conflict_resolution: str = "skip"
-
-
-class StrategiesConfig(BaseModel):
-    enabled: list[StrategyItemConfig] = Field(default_factory=list)
-    aggregation: AggregationConfig = AggregationConfig()
-
-
-class CircuitBreakerConfig(BaseModel):
-    consecutive_losses_pause: int = 3
-    consecutive_losses_size_reduction: float = 0.5
-    api_errors_per_minute_pause: int = 5
-    ws_disconnect_cancel_seconds: int = 120
-
-
-class RiskConfig(BaseModel):
-    max_position_size: float = 500
-    max_portfolio_exposure: float = 5000
-    max_positions: int = 10
-    max_daily_loss: float = 250
-    min_trade_interval_seconds: int = 30
-    max_order_size: float = 200
-    max_slippage_pct: float = 2.0
-    circuit_breakers: CircuitBreakerConfig = CircuitBreakerConfig()
-
-
-class ExecutionConfig(BaseModel):
-    rate_limit_per_second: int = 5
-    order_ttl_seconds: int = 300
-    retry_attempts: int = 3
-    retry_backoff_seconds: list[int] = Field(default_factory=lambda: [1, 2, 4])
-
-
-class AlertsConfig(BaseModel):
-    discord_webhook_env: str = "DISCORD_WEBHOOK_URL"
-    telegram_bot_token_env: str = "TELEGRAM_BOT_TOKEN"
-    telegram_chat_id_env: str = "TELEGRAM_CHAT_ID"
-
-
-class MonitoringConfig(BaseModel):
-    metrics_port: int = 9090
-    alerts: AlertsConfig = AlertsConfig()
-    daily_summary_hour: int = 18
-
-
-class Config(BaseModel):
-    bot: BotConfig = BotConfig()
-    wallet: WalletConfig = WalletConfig()
-    scanner: ScannerConfig = ScannerConfig()
-    strategies: StrategiesConfig = StrategiesConfig()
-    risk: RiskConfig = RiskConfig()
-    execution: ExecutionConfig = ExecutionConfig()
-    monitoring: MonitoringConfig = MonitoringConfig()
-
-    @property
-    def is_live(self) -> bool:
-        return self.bot.mode == "live"
-
-
-def load_config(path: str = "config.yaml") -> Config:
-    """Load configuration from a YAML file."""
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
-
-    if raw is None:
-        return Config()
-
-    return Config(**raw)
+monitoring:
+  metrics_port: 9090
+  alerts:
+    discord_webhook_env: "DISCORD_WEBHOOK_URL"
+    telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
+    telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+  daily_summary_hour: 18
