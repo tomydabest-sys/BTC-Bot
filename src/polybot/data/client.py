@@ -317,4 +317,4 @@ class PolymarketClient:
     async def get_open_orders(self) -> list[dict]:
         """Fetch current open orders."""
         data = await self._clob_request("GET", "/orders")
-        return data if isinstance(data, list) else data.get("data", [])
+        return data if isinstance(data, list) else data.get("data", []) 
