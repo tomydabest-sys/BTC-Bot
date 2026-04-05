@@ -53,7 +53,8 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "maker_edge": MakerEdgeStrategy,
 }
 
-DEFAULT_PAPER_BALANCE = 10_000.0
+# Paper balance — set this to match your real budget
+DEFAULT_PAPER_BALANCE = 500.0
 
 
 class Bot:
@@ -64,7 +65,6 @@ class Bot:
         self._running = False
         self._wallet_balance = 0.0
 
-        # Core infrastructure
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
         self._client = PolymarketClient(
@@ -78,7 +78,6 @@ class Bot:
             poll_interval=0.5,
         )
 
-        # Trading components
         self._scanner = MarketScanner(self._client, config.scanner, self._event_bus)
         self._risk_manager = RiskManager(config.risk)
         self._circuit_breaker = CircuitBreaker(config.risk.circuit_breakers)
@@ -92,7 +91,6 @@ class Bot:
         )
         self._alert_manager = AlertManager([LogChannel()])
 
-        # Strategies
         self._strategies: list[BaseStrategy] = []
         self._aggregator = StrategyAggregator(
             min_confidence=config.strategies.aggregation.min_confidence,
@@ -166,7 +164,6 @@ class Bot:
             self._wallet_balance = DEFAULT_PAPER_BALANCE
             logger.info("paper_balance_set", balance=self._wallet_balance)
 
-        # Load strategies
         for strat_config in self._config.strategies.enabled:
             cls = STRATEGY_REGISTRY.get(strat_config.name)
             if cls:
@@ -185,11 +182,9 @@ class Bot:
             else:
                 logger.warning("strategy_unknown", name=strat_config.name)
 
-        # Wire events
         self._event_bus.subscribe("market_discovered", self._on_market_discovered)
         self._event_bus.subscribe("order_filled", self._on_order_filled)
 
-        # Start components
         await self._scanner.start()
         await self._ws_manager.start()
 
@@ -243,13 +238,10 @@ class Bot:
                     if balance > 0:
                         self._wallet_balance = balance
 
-                # Evaluate all active markets
                 active_markets = self._scanner.active_markets
                 for market_id, market in active_markets.items():
 
-                    # ═══ POLL ORDERBOOK VIA REST ═══
-                    # The WebSocket isn't feeding data yet, so we fetch
-                    # orderbooks directly for each market every loop cycle.
+                    # Fetch orderbook via REST for each market
                     if market.token_ids:
                         try:
                             orderbook = await self._client.get_orderbook(market.token_ids[0])
@@ -261,18 +253,24 @@ class Bot:
                     if not snapshot:
                         continue
 
-                    # Update position prices
                     self._position_manager.update_prices(
                         market_id, snapshot.orderbook.mid_price
                     )
 
-                    # Generate signals from all strategies
                     signals = []
                     for strategy in self._strategies:
                         try:
                             sig = await strategy.evaluate(snapshot)
                             if sig:
                                 signals.append(sig)
+                                logger.info(
+                                    "signal_generated",
+                                    strategy=sig.strategy,
+                                    direction=sig.direction.value,
+                                    confidence=round(sig.confidence, 3),
+                                    market=market_id[:16],
+                                    reason=sig.reason[:60],
+                                )
                                 try:
                                     from polybot.dashboard.app import log_signal
                                     log_signal({
@@ -289,7 +287,6 @@ class Bot:
                         except Exception as e:
                             logger.debug("strategy_error", strategy=strategy.name, error=str(e))
 
-                    # Aggregate and execute
                     final_signals = self._aggregator.aggregate(signals)
                     for sig in final_signals:
                         portfolio = self._position_manager.get_portfolio()
@@ -309,6 +306,7 @@ class Bot:
                             strategy=sig.strategy,
                         )
                         order.size *= self._circuit_breaker.size_multiplier
+
                         filled_order = await self._execution_engine.execute_order(order, portfolio)
 
                         await self._storage.save_order({
@@ -328,7 +326,6 @@ class Bot:
                             "updated_at": filled_order.created_at.isoformat(),
                         })
 
-                # Check exits
                 exits = self._position_manager.check_exits()
                 for exit_signal in exits:
                     logger.info(
@@ -337,7 +334,6 @@ class Bot:
                         reason=exit_signal.reason,
                     )
 
-                # Snapshot P&L
                 portfolio = self._position_manager.get_portfolio()
                 portfolio.balance = self._wallet_balance
                 await self._storage.save_pnl_snapshot({
@@ -389,7 +385,6 @@ def cli() -> None:
     )
 
     bot = Bot(config)
-
     loop = asyncio.new_event_loop()
 
     def handle_signal(sig: int, _frame) -> None:
