@@ -11,68 +11,79 @@ wallet:
 scanner:
   interval_seconds: 30
   min_volume_24h: 0
-  min_liquidity: 50
+  min_liquidity: 20
   max_spread_pct: 15.0
   categories_allowlist: []
   categories_blocklist: []
   resolution_window_days: [0, 1]
+  btc_updown_only: true
+  btc_timeframes: ["5 min", "15 min", "1 hour", "4 hour"]
 
 strategies:
   enabled:
-    # ONLY 3 strategies. Monte Carlo is DISABLED — it fires random
-    # noise signals on 50/50 markets and loses money consistently.
-
+    # ── PRIMARY: Latency arb ──
+    # When BTC ticks on Binance/Coinbase, Polymarket 5m markets
+    # lag by seconds. Even a 0.1-0.3% BTC move creates a gap
+    # between fair value and the stale 50¢ orderbook.
     - name: "latency_arb"
       weight: 1.0
       params:
-        min_gap_pct: 0.05
+        min_gap_pct: 0.015
         max_gap_pct: 0.15
-        min_exchange_move_pct: 0.03
-        fee_buffer_pct: 0.02
-        size_pct: 0.02
+        min_exchange_move_pct: 0.005
+        fee_buffer_pct: 0.005
+        size_pct: 0.04
+        confidence_floor: 0.55
         exchange_symbol: "BTC"
 
+    # ── SECONDARY: Momentum lag ──
+    # When BTC trends for 30-60 seconds, the 5m market should
+    # be pricing well above/below 50¢ but often lags.
     - name: "momentum_lag"
       weight: 1.0
       params:
-        min_move_30s_pct: 0.02
-        min_move_60s_pct: 0.035
-        min_gap_pct: 0.05
-        thin_book_threshold: 0.05
-        size_pct: 0.02
+        min_move_30s_pct: 0.004
+        min_move_60s_pct: 0.008
+        min_gap_pct: 0.02
+        max_gap_pct: 0.10
+        thin_book_threshold: 0.02
+        size_pct: 0.04
         exchange_symbol: "BTC"
 
+    # ── TERTIARY: Dual direction arb ──
+    # If Up + Down < $1.00 on any market, guaranteed profit.
+    # Rare but free money when it appears.
     - name: "dual_direction_arb"
       weight: 1.0
       params:
-        min_profit_pct: 0.02
-        max_total_cost: 0.98
-        min_liquidity_each_side: 50.0
-        size_pct: 0.03
+        min_profit_pct: 0.01
+        max_total_cost: 0.99
+        min_liquidity_each_side: 20.0
+        size_pct: 0.06
 
   aggregation:
-    min_confidence: 0.65
-    conflict_resolution: "skip"
+    min_confidence: 0.55
+    conflict_resolution: "highest_confidence"
 
 risk:
-  max_position_size: 20
-  max_portfolio_exposure: 75
-  max_positions: 3
-  max_daily_loss: 15
-  min_trade_interval_seconds: 120
-  max_order_size: 10
-  max_slippage_pct: 3.0
+  max_position_size: 30
+  max_portfolio_exposure: 150
+  max_positions: 5
+  max_daily_loss: 25
+  min_trade_interval_seconds: 10
+  max_order_size: 20
+  max_slippage_pct: 5.0
   circuit_breakers:
-    consecutive_losses_pause: 3
+    consecutive_losses_pause: 5
     consecutive_losses_size_reduction: 0.5
-    api_errors_per_minute_pause: 5
-    ws_disconnect_cancel_seconds: 120
+    api_errors_per_minute_pause: 10
+    ws_disconnect_cancel_seconds: 60
 
 execution:
   rate_limit_per_second: 5
-  order_ttl_seconds: 120
-  retry_attempts: 3
-  retry_backoff_seconds: [1, 2, 4]
+  order_ttl_seconds: 30
+  retry_attempts: 2
+  retry_backoff_seconds: [1, 2]
 
 monitoring:
   metrics_port: 9090
