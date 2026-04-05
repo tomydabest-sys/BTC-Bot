@@ -1,12 +1,15 @@
-"""Latency arbitrage — exploits price lag between exchanges and Polymarket.
+"""Latency arbitrage — sub-second exchange-to-Polymarket price gap trading.
 
-Inspired by the OpenClaw/Fast-Loop approach: when a crypto asset moves on
-Binance/Coinbase, Polymarket's 5-15 minute up/down markets lag by 20-90ms
-(or more on thin books). This strategy detects the gap and trades before
-Polymarket catches up.
+Core mechanic for 5-minute BTC Up/Down markets:
+1. Binance WS delivers price ticks in ~50ms
+2. Polymarket orderbook lags by 1-5 seconds (retail participants)
+3. When BTC ticks up $30-100 on Binance, "Up" should be >50¢
+4. But the Polymarket book is still sitting at 50¢
+5. Buy "Up" at 50¢, wait for book to catch up or hold to resolution
 
-Post-fee-change adaptation: instead of pure speed, this now focuses on
-larger gaps (3-5%) where the edge exceeds dynamic fees.
+This version uses sub-second price data (200ms, 500ms, 1s, 2s windows)
+instead of the old 5-second minimum. The WebSocket feed provides the
+raw speed; this strategy converts that into signals.
 """
 
 from __future__ import annotations
@@ -14,20 +17,19 @@ from __future__ import annotations
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
-from polybot.strategies.market_filter import is_crypto_window_market
 
 
 class LatencyArbStrategy(BaseStrategy):
-    """Detects exchange-to-Polymarket price gaps and trades the lag."""
+    """Detects sub-second exchange-to-Polymarket price gaps."""
 
     def __init__(
         self,
-        min_gap_pct: float = 0.03,
+        min_gap_pct: float = 0.015,
         max_gap_pct: float = 0.15,
-        min_exchange_move_pct: float = 0.02,
-        confidence_floor: float = 0.6,
-        size_pct: float = 0.08,
-        fee_buffer_pct: float = 0.01,
+        min_exchange_move_pct: float = 0.005,
+        confidence_floor: float = 0.55,
+        size_pct: float = 0.04,
+        fee_buffer_pct: float = 0.005,
         market_keywords: list[str] | None = None,
     ) -> None:
         self._min_gap_pct = min_gap_pct
@@ -50,37 +52,63 @@ class LatencyArbStrategy(BaseStrategy):
         if not self._exchange_feed or self._exchange_feed.last_price == 0:
             return None
 
-        # Scanner guarantees only BTC up/down markets reach here.
-        # No keyword filtering needed.
+        if len(self._exchange_feed.ticks) < 10:
+            return None
 
-        # Get exchange price data
+        # ── Detect exchange move across multiple timeframes ──
+        # Check from fastest to slowest. Any confirmed move is tradeable.
         exchange_price = self._exchange_feed.last_price
-        exchange_5s = self._exchange_feed.price_5s_ago
-        if exchange_5s == 0:
+
+        # Sub-second moves (fastest signal, from WebSocket)
+        move_500ms = self._exchange_feed.price_change_since(0.5)
+        move_1s = self._exchange_feed.price_change_since(1.0)
+        move_2s = self._exchange_feed.price_change_since(2.0)
+        move_5s = self._exchange_feed.price_change_since(5.0)
+
+        # Micro-momentum: composite sub-second trend
+        micro_mom = self._exchange_feed.micro_momentum()
+
+        # Find the strongest confirmed move
+        # Prioritize speed: a 0.1% move in 500ms is better than 0.2% in 5s
+        best_move = 0.0
+        move_window = "none"
+
+        if abs(move_500ms) >= self._min_exchange_move_pct * 0.6:
+            # 500ms move with lower threshold (speed premium)
+            best_move = move_500ms
+            move_window = "500ms"
+        elif abs(move_1s) >= self._min_exchange_move_pct * 0.8:
+            best_move = move_1s
+            move_window = "1s"
+        elif abs(move_2s) >= self._min_exchange_move_pct:
+            best_move = move_2s
+            move_window = "2s"
+        elif abs(move_5s) >= self._min_exchange_move_pct:
+            best_move = move_5s
+            move_window = "5s"
+
+        if best_move == 0.0:
             return None
 
-        exchange_move_pct = (exchange_price - exchange_5s) / exchange_5s
-
-        # Need a meaningful exchange move
-        if abs(exchange_move_pct) < self._min_exchange_move_pct:
+        # ── Confirm direction with micro-momentum ──
+        # If micro_momentum disagrees with the move, skip (reversal risk)
+        if best_move > 0 and micro_mom < -0.0001:
+            return None
+        if best_move < 0 and micro_mom > 0.0001:
             return None
 
-        # Polymarket mid should reflect this move but might lag
+        # ── Calculate gap vs Polymarket ──
         poly_mid = snapshot.orderbook.mid_price
 
-        # For "up" markets: if exchange is pumping, Yes should be > 0.5
-        # For "down" markets: if exchange is dumping, Yes should be > 0.5
-        # The gap is the discrepancy
-
-        if exchange_move_pct > 0:
-            # Exchange going up → "Yes" on up market should be high
-            # If poly_mid is still low, there's a gap to exploit
-            fair_yes = min(0.5 + abs(exchange_move_pct) * 5, 0.95)
+        if best_move > 0:
+            # Exchange going up → "Up" should be > 50¢
+            # Scale: a 0.1% BTC move ≈ 5¢ on a 5m market
+            fair_yes = min(0.5 + abs(best_move) * 50, 0.92)
             gap = fair_yes - poly_mid
         else:
-            # Exchange going down → "No" on up market should be high
-            fair_yes = max(0.5 - abs(exchange_move_pct) * 5, 0.05)
-            gap = poly_mid - fair_yes  # positive gap means poly is too high
+            # Exchange going down → "Up" should be < 50¢
+            fair_yes = max(0.5 - abs(best_move) * 50, 0.08)
+            gap = poly_mid - fair_yes  # positive = poly is too high
 
         # Adjust for fees
         effective_gap = abs(gap) - self._fee_buffer_pct
@@ -89,25 +117,32 @@ class LatencyArbStrategy(BaseStrategy):
             return None
 
         if abs(gap) > self._max_gap_pct:
-            return None  # Too wide, might be stale data
+            return None  # Too wide — stale data or crossed book
 
-        # Determine direction
-        if gap > 0 and exchange_move_pct > 0:
+        # ── Direction ──
+        if gap > 0 and best_move > 0:
             direction = Direction.BUY
             outcome = "Yes"
-            target_price = poly_mid
-        elif gap > 0 and exchange_move_pct < 0:
+            target_price = poly_mid  # Buy at current mid
+        elif gap > 0 and best_move < 0:
             direction = Direction.SELL
             outcome = "No"
             target_price = poly_mid
         else:
             return None
 
-        # Confidence scales with gap size and exchange move strength
+        # ── Confidence ──
+        # Speed bonus: faster detection = higher confidence
+        speed_bonus = {"500ms": 0.15, "1s": 0.10, "2s": 0.05, "5s": 0.0}
         gap_confidence = min(effective_gap / (self._min_gap_pct * 3), 1.0)
-        move_confidence = min(abs(exchange_move_pct) / (self._min_exchange_move_pct * 3), 1.0)
-        confidence = max((gap_confidence * 0.6 + move_confidence * 0.4), self._confidence_floor)
-        confidence = min(confidence, 1.0)
+        move_confidence = min(abs(best_move) / (self._min_exchange_move_pct * 3), 1.0)
+        confidence = (
+            gap_confidence * 0.4
+            + move_confidence * 0.4
+            + speed_bonus.get(move_window, 0) 
+            + abs(micro_mom) * 100  # micro-momentum boost
+        )
+        confidence = max(min(confidence, 0.95), self._confidence_floor)
 
         return Signal(
             market_id=snapshot.market.id,
@@ -118,16 +153,23 @@ class LatencyArbStrategy(BaseStrategy):
             confidence=confidence,
             size_pct=self._size_pct * confidence,
             reason=(
-                f"Exchange moved {exchange_move_pct:+.2%} in 5s, "
-                f"Polymarket gap {gap:+.4f} (net {effective_gap:+.4f} after fees)"
+                f"Latency arb [{move_window}]: BTC {best_move:+.3%}, "
+                f"poly={poly_mid:.3f}, fair={fair_yes:.3f}, "
+                f"gap={effective_gap:+.3f}, μ-mom={micro_mom:+.5f}"
             ),
             metadata={
                 "exchange_price": exchange_price,
-                "exchange_move_pct": exchange_move_pct,
+                "best_move": best_move,
+                "move_window": move_window,
+                "micro_momentum": micro_mom,
                 "poly_mid": poly_mid,
                 "fair_yes": fair_yes,
                 "gap": gap,
                 "effective_gap": effective_gap,
+                "move_500ms": move_500ms,
+                "move_1s": move_1s,
+                "move_2s": move_2s,
+                "move_5s": move_5s,
             },
         )
 
