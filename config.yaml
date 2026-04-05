@@ -17,12 +17,11 @@ scanner:
   categories_blocklist: []
   resolution_window_days: [0, 1]
   btc_updown_only: true
-  btc_timeframes: ["5 min", "15 min", "1 hour", "4 hour"]
+  # ONLY 5-minute windows — the sigmoid is calibrated for these
+  btc_timeframes: ["5 min"]
 
 strategies:
   enabled:
-    # PRIMARY: Sub-second latency arb
-    # Binance WS ticks → detect 0.05% BTC move → buy before Polymarket adjusts
     - name: "latency_arb"
       weight: 1.0
       params:
@@ -34,7 +33,6 @@ strategies:
         confidence_floor: 0.55
         exchange_symbol: "BTC"
 
-    # SECONDARY: Momentum lag (1-5s trend continuation)
     - name: "momentum_lag"
       weight: 1.0
       params:
@@ -46,7 +44,6 @@ strategies:
         size_pct: 0.04
         exchange_symbol: "BTC"
 
-    # TERTIARY: Dual direction arb (free money if Up+Down < $1)
     - name: "dual_direction_arb"
       weight: 1.0
       params:
