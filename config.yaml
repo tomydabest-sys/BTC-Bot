@@ -1,6 +1,6 @@
 bot:
   name: "btc-bot"
-  mode: "paper"  # "paper" or "live"
+  mode: "paper"
   log_level: "INFO"
   data_dir: "./data"
 
@@ -9,29 +9,16 @@ wallet:
   api_key_env: "POLYMARKET_API_KEY"
 
 scanner:
-  interval_seconds: 30           # Scan every 30s — short markets roll constantly
-  min_volume_24h: 0              # New 5/15-min windows start at $0 volume
-  min_liquidity: 50              # Minimal liquidity threshold
-  max_spread_pct: 15.0           # Short-window markets have wider spreads
+  interval_seconds: 30
+  min_volume_24h: 0
+  min_liquidity: 50
+  max_spread_pct: 15.0
   categories_allowlist: []
   categories_blocklist: []
-  resolution_window_days: [0, 1] # Only markets resolving within 24 hours
-
-  # BTC Up/Down filter — ONLY these markets
-  btc_updown_only: true
-  btc_keywords:
-    - "bitcoin up or down"
-    - "btc up or down"
-  btc_timeframes:                # Which windows to trade
-    - "5 min"
-    - "15 min"
-    - "1 hour"
-    - "4 hour"
+  resolution_window_days: [0, 1]
 
 strategies:
   enabled:
-    # --- Core strategies for BTC up/down markets ---
-
     - name: "latency_arb"
       weight: 1.0
       params:
@@ -81,8 +68,6 @@ strategies:
         min_liquidity_each_side: 50.0
         size_pct: 0.10
 
-    # --- Secondary strategies (lower weight) ---
-
     - name: "mean_reversion"
       weight: 0.5
       params:
@@ -115,13 +100,13 @@ strategies:
     conflict_resolution: "skip"
 
 risk:
-  max_position_size: 100         # Tuned for $100-500 budget
+  max_position_size: 100
   max_portfolio_exposure: 500
   max_positions: 5
-  max_daily_loss: 25             # Max $25/day loss — 5% of $500
-  min_trade_interval_seconds: 15 # Faster for short-window markets
+  max_daily_loss: 25
+  min_trade_interval_seconds: 15
   max_order_size: 50
-  max_slippage_pct: 3.0          # Higher tolerance for thin books
+  max_slippage_pct: 3.0
   circuit_breakers:
     consecutive_losses_pause: 3
     consecutive_losses_size_reduction: 0.5
@@ -130,7 +115,7 @@ risk:
 
 execution:
   rate_limit_per_second: 5
-  order_ttl_seconds: 120         # Shorter TTL — markets resolve fast
+  order_ttl_seconds: 120
   retry_attempts: 3
   retry_backoff_seconds: [1, 2, 4]
 
