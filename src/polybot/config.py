@@ -1,124 +1,92 @@
-"""Configuration loading and validation."""
+bot:
+  name: "btc-bot"
+  mode: "paper"
+  log_level: "INFO"
+  data_dir: "./data"
 
-from __future__ import annotations
+wallet:
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  api_key_env: "POLYMARKET_API_KEY"
 
-import os
-from pathlib import Path
+scanner:
+  interval_seconds: 30
+  min_volume_24h: 0
+  min_liquidity: 50
+  max_spread_pct: 15.0
+  categories_allowlist: []
+  categories_blocklist: []
+  resolution_window_days: [0, 1]
 
-import yaml
-from pydantic import BaseModel, Field
+strategies:
+  enabled:
+    # Start with just 2 strategies until you validate they work.
+    # Monte Carlo was firing on every market every cycle — disabled for now.
 
+    - name: "latency_arb"
+      weight: 1.0
+      params:
+        min_gap_pct: 0.05
+        max_gap_pct: 0.15
+        min_exchange_move_pct: 0.03
+        fee_buffer_pct: 0.02
+        size_pct: 0.02
+        exchange_symbol: "BTC"
 
-class WalletConfig(BaseModel):
-    private_key_env: str = "POLYMARKET_PRIVATE_KEY"
-    api_key_env: str = "POLYMARKET_API_KEY"
+    - name: "momentum_lag"
+      weight: 1.0
+      params:
+        min_move_30s_pct: 0.02
+        min_move_60s_pct: 0.035
+        min_gap_pct: 0.05
+        thin_book_threshold: 0.05
+        size_pct: 0.02
+        exchange_symbol: "BTC"
 
-    @property
-    def private_key(self) -> str:
-        value = os.environ.get(self.private_key_env, "")
-        if not value:
-            raise ValueError(f"Environment variable {self.private_key_env} not set")
-        return value
+    - name: "dual_direction_arb"
+      weight: 1.0
+      params:
+        min_profit_pct: 0.02
+        max_total_cost: 0.98
+        min_liquidity_each_side: 50.0
+        size_pct: 0.03
 
-    @property
-    def api_key(self) -> str:
-        value = os.environ.get(self.api_key_env, "")
-        if not value:
-            raise ValueError(f"Environment variable {self.api_key_env} not set")
-        return value
+    - name: "market_maker"
+      weight: 0.5
+      params:
+        min_spread: 0.04
+        target_spread: 0.05
+        max_inventory_pct: 0.10
+        skew_factor: 0.5
+        size_pct: 0.01
 
+  aggregation:
+    min_confidence: 0.6
+    conflict_resolution: "skip"
 
-class ScannerConfig(BaseModel):
-    interval_seconds: int = 300
-    min_volume_24h: float = 10000
-    min_liquidity: float = 5000
-    max_spread_pct: float = 5.0
-    categories_allowlist: list[str] = Field(default_factory=list)
-    categories_blocklist: list[str] = Field(default_factory=list)
-    resolution_window_days: list[int] = Field(default_factory=lambda: [1, 30])
-    btc_updown_only: bool = True
-    btc_timeframes: list[str] = Field(default_factory=lambda: ["5 min", "15 min", "1 hour", "4 hour"])
+risk:
+  max_position_size: 25
+  max_portfolio_exposure: 100
+  max_positions: 3
+  max_daily_loss: 15
+  min_trade_interval_seconds: 60
+  max_order_size: 15
+  max_slippage_pct: 3.0
+  circuit_breakers:
+    consecutive_losses_pause: 3
+    consecutive_losses_size_reduction: 0.5
+    api_errors_per_minute_pause: 5
+    ws_disconnect_cancel_seconds: 120
 
+execution:
+  rate_limit_per_second: 5
+  order_ttl_seconds: 120
+  retry_attempts: 3
+  retry_backoff_seconds: [1, 2, 4]
 
-class StrategyParams(BaseModel):
-    name: str
-    weight: float = 1.0
-    params: dict = Field(default_factory=dict)
-
-
-class AggregationConfig(BaseModel):
-    min_confidence: float = 0.5
-    conflict_resolution: str = "skip"
-
-
-class StrategiesConfig(BaseModel):
-    enabled: list[StrategyParams] = Field(default_factory=list)
-    aggregation: AggregationConfig = Field(default_factory=AggregationConfig)
-
-
-class CircuitBreakerConfig(BaseModel):
-    consecutive_losses_pause: int = 3
-    consecutive_losses_size_reduction: float = 0.5
-    api_errors_per_minute_pause: int = 5
-    ws_disconnect_cancel_seconds: int = 120
-
-
-class RiskConfig(BaseModel):
-    max_position_size: float = 500
-    max_portfolio_exposure: float = 5000
-    max_positions: int = 10
-    max_daily_loss: float = 250
-    min_trade_interval_seconds: int = 30
-    max_order_size: float = 200
-    max_slippage_pct: float = 2.0
-    circuit_breakers: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
-
-
-class ExecutionConfig(BaseModel):
-    rate_limit_per_second: int = 5
-    order_ttl_seconds: int = 300
-    retry_attempts: int = 3
-    retry_backoff_seconds: list[int] = Field(default_factory=lambda: [1, 2, 4])
-
-
-class AlertsConfig(BaseModel):
-    discord_webhook_env: str = "DISCORD_WEBHOOK_URL"
-    telegram_bot_token_env: str = "TELEGRAM_BOT_TOKEN"
-    telegram_chat_id_env: str = "TELEGRAM_CHAT_ID"
-
-
-class MonitoringConfig(BaseModel):
-    metrics_port: int = 9090
-    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
-    daily_summary_hour: int = 18
-
-
-class BotConfig(BaseModel):
-    name: str = "polymarket-bot"
-    mode: str = "paper"
-    log_level: str = "INFO"
-    data_dir: str = "./data"
-
-
-class Config(BaseModel):
-    bot: BotConfig = Field(default_factory=BotConfig)
-    wallet: WalletConfig = Field(default_factory=WalletConfig)
-    scanner: ScannerConfig = Field(default_factory=ScannerConfig)
-    strategies: StrategiesConfig = Field(default_factory=StrategiesConfig)
-    risk: RiskConfig = Field(default_factory=RiskConfig)
-    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
-
-    @property
-    def is_live(self) -> bool:
-        return self.bot.mode == "live"
-
-
-def load_config(path: str | Path = "config.yaml") -> Config:
-    """Load configuration from a YAML file."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path) as f:
-        raw = yaml.safe_load(f)
-    return Config.model_validate(raw)
+monitoring:
+  metrics_port: 9090
+  alerts:
+    discord_webhook_env: "DISCORD_WEBHOOK_URL"
+    telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
+    telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+  daily_summary_hour: 18
