@@ -140,6 +140,8 @@ class MarketScanner:
         # Fetch all active markets from Polymarket
         all_markets = await self._client.get_markets(active=True)
 
+    for m in all_markets[:10]:
+        logger.info("market_sample", question=m.question, category=m.category, volume=m.volume_24h)
         # ═══ FILTER: Only BTC Up/Down markets ═══
         btc_markets = []
         for market in all_markets:
