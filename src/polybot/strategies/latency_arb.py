@@ -53,6 +53,12 @@ class LatencyArbStrategy(BaseStrategy):
         # Scanner guarantees only BTC up/down markets reach here.
         # No keyword filtering needed.
 
+        # Get exchange price data
+        exchange_price = self._exchange_feed.last_price
+        exchange_5s = self._exchange_feed.price_5s_ago
+        if exchange_5s == 0:
+            return None
+
         exchange_move_pct = (exchange_price - exchange_5s) / exchange_5s
 
         # Need a meaningful exchange move
