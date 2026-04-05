@@ -1,7 +1,6 @@
 """Momentum lag — trades sustained BTC trends vs stale Polymarket books.
 
-Uses k=800 sigmoid matching latency_arb so that real $20-200 BTC moves
-map to meaningful probability shifts (56¢-91¢ vs stale 50¢ books).
+Same entry price guards as latency_arb: only enter between 35¢-65¢.
 """
 
 from __future__ import annotations
@@ -19,8 +18,11 @@ def btc_move_to_fair_probability(move_pct: float) -> float:
     return max(0.05, min(0.95, prob))
 
 
+MAX_ENTRY_PRICE = 0.65
+MIN_ENTRY_PRICE = 0.35
+
+
 class MomentumLagStrategy(BaseStrategy):
-    """Trades the lag between sustained exchange momentum and Polymarket."""
 
     def __init__(
         self,
@@ -52,6 +54,12 @@ class MomentumLagStrategy(BaseStrategy):
         if not self._exchange_feed or len(self._exchange_feed.ticks) < 30:
             return None
 
+        poly_mid = snapshot.orderbook.mid_price
+
+        # Entry price guard
+        if poly_mid > MAX_ENTRY_PRICE or poly_mid < MIN_ENTRY_PRICE:
+            return None
+
         move_30s = self._exchange_feed.price_change_pct(30)
         move_60s = self._exchange_feed.price_change_pct(60)
 
@@ -60,7 +68,6 @@ class MomentumLagStrategy(BaseStrategy):
 
         if not (strong_30s or strong_60s):
             return None
-
         if move_30s * move_60s < 0:
             return None
 
@@ -72,9 +79,7 @@ class MomentumLagStrategy(BaseStrategy):
         if not is_thin and abs(move_60s) < self._min_move_60s * 1.5:
             return None
 
-        # ── Fair value via sigmoid (k=800) ──
         fair_yes = btc_move_to_fair_probability(move_pct)
-        poly_mid = snapshot.orderbook.mid_price
 
         if move_pct > 0:
             gap = fair_yes - poly_mid
@@ -88,10 +93,14 @@ class MomentumLagStrategy(BaseStrategy):
             direction = Direction.BUY
             outcome = "Yes"
             target_price = snapshot.orderbook.best_ask
+            if target_price > MAX_ENTRY_PRICE:
+                return None
         else:
             direction = Direction.SELL
             outcome = "No"
             target_price = snapshot.orderbook.best_bid
+            if target_price < MIN_ENTRY_PRICE:
+                return None
 
         move_score = min(abs(move_pct) / (self._min_move_60s * 3), 1.0)
         gap_score = min(gap / 0.08, 1.0)
@@ -121,7 +130,6 @@ class MomentumLagStrategy(BaseStrategy):
                 "spread": spread,
                 "is_thin_book": is_thin,
                 "exchange_price": exchange_price,
-                "btc_dollar_move": exchange_price * abs(move_pct),
             },
         )
 
