@@ -1,20 +1,39 @@
 """Latency arbitrage — sub-second exchange-to-Polymarket price gap trading.
 
-Tuned for 5-minute BTC Up/Down markets where:
-- Markets open at ~50c and resolve in 5 minutes
-- A $50 BTC move (0.07%) shifts fair value to 52-55c
-- Polymarket books lag Binance by 1-5 seconds
-- Edge = buying at 50c when Binance already says 53c
+Fair value model calibrated to real 5-minute BTC price action:
+- Typical 5m move: $20-$80 (0.03%-0.12%)
+- Large 5m move: $100-$200 (0.15%-0.30%)
+- These small $ moves are DECISIVE for binary up/down resolution
+
+Sigmoid steepness k=800 so that:
+  $20 move (0.03%) → fair ≈ 0.56  (6¢ gap vs stale 50¢ book)
+  $50 move (0.07%) → fair ≈ 0.64  (14¢ gap)
+  $100 move (0.15%) → fair ≈ 0.77 (27¢ gap)
+  $200 move (0.30%) → fair ≈ 0.91 (41¢ gap)
 """
 
 from __future__ import annotations
+
+import math
 
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
 
 
+def btc_move_to_fair_probability(move_pct: float) -> float:
+    """Convert BTC % move to fair Up probability.
+    
+    k=800 calibrated for real 5-minute BTC price action where
+    $20-200 moves ($67k BTC = 0.03%-0.30%) are the norm.
+    """
+    k = 800.0
+    prob = 1.0 / (1.0 + math.exp(-k * move_pct))
+    return max(0.05, min(0.95, prob))
+
+
 class LatencyArbStrategy(BaseStrategy):
+    """Detects sub-second exchange-to-Polymarket price gaps."""
 
     def __init__(
         self,
@@ -45,66 +64,62 @@ class LatencyArbStrategy(BaseStrategy):
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
         if not self._exchange_feed or self._exchange_feed.last_price == 0:
             return None
-        if len(self._exchange_feed.ticks) < 10:
+
+        if len(self._exchange_feed.ticks) < 20:
             return None
 
         exchange_price = self._exchange_feed.last_price
 
-        # ── Detect exchange move (fastest window first) ──
+        # ── Detect move across sub-second timeframes ──
         move_500ms = self._exchange_feed.price_change_since(0.5)
         move_1s = self._exchange_feed.price_change_since(1.0)
         move_2s = self._exchange_feed.price_change_since(2.0)
         move_5s = self._exchange_feed.price_change_since(5.0)
         move_10s = self._exchange_feed.price_change_since(10.0)
+
         micro_mom = self._exchange_feed.micro_momentum()
 
-        threshold = self._min_exchange_move_pct
+        # Take the fastest confirmed move (speed premium on thresholds)
         best_move = 0.0
         move_window = "none"
 
-        if abs(move_500ms) >= threshold * 0.5:
-            best_move = move_500ms
-            move_window = "500ms"
-        elif abs(move_1s) >= threshold * 0.6:
-            best_move = move_1s
-            move_window = "1s"
-        elif abs(move_2s) >= threshold * 0.8:
-            best_move = move_2s
-            move_window = "2s"
-        elif abs(move_5s) >= threshold:
-            best_move = move_5s
-            move_window = "5s"
-        elif abs(move_10s) >= threshold * 1.2:
-            best_move = move_10s
-            move_window = "10s"
+        checks = [
+            (move_500ms, self._min_exchange_move_pct * 0.4, "500ms"),
+            (move_1s,    self._min_exchange_move_pct * 0.6, "1s"),
+            (move_2s,    self._min_exchange_move_pct * 0.8, "2s"),
+            (move_5s,    self._min_exchange_move_pct,       "5s"),
+            (move_10s,   self._min_exchange_move_pct * 1.2, "10s"),
+        ]
+
+        for move, threshold, window in checks:
+            if abs(move) >= threshold:
+                best_move = move
+                move_window = window
+                break
 
         if best_move == 0.0:
             return None
 
-        # Confirm micro-momentum agrees with move direction
+        # Confirm direction with micro-momentum
         if best_move > 0 and micro_mom < -0.0002:
             return None
         if best_move < 0 and micro_mom > 0.0002:
             return None
 
-        # ── Fair value calculation ──
-        # Each 0.01% BTC move ~ 1.5c on a 5-min prediction market
-        # 0.05% move → fair=0.575, 0.10% → 0.65, 0.30% → 0.92(cap)
+        # ── Fair value via sigmoid (k=800) ──
+        fair_yes = btc_move_to_fair_probability(best_move)
         poly_mid = snapshot.orderbook.mid_price
-        move_abs = abs(best_move)
-        shift = min(move_abs * 150, 0.42)
 
         if best_move > 0:
-            fair_yes = 0.50 + shift
             gap = fair_yes - poly_mid
         else:
-            fair_yes = 0.50 - shift
             gap = poly_mid - fair_yes
 
         effective_gap = abs(gap) - self._fee_buffer_pct
 
         if effective_gap < self._min_gap_pct:
             return None
+
         if abs(gap) > self._max_gap_pct:
             return None
 
@@ -119,12 +134,16 @@ class LatencyArbStrategy(BaseStrategy):
             target_price = snapshot.orderbook.best_bid
 
         # ── Confidence ──
-        speed_bonus = {"500ms": 0.15, "1s": 0.10, "2s": 0.05, "5s": 0.0, "10s": 0.0}
-        gap_conf = min(effective_gap / (self._min_gap_pct * 2.5), 1.0)
-        move_conf = min(move_abs / (self._min_exchange_move_pct * 2.5), 1.0)
-        mom_conf = min(abs(micro_mom) * 500, 0.15)
+        speed_bonus = {"500ms": 0.12, "1s": 0.08, "2s": 0.04, "5s": 0.0, "10s": 0.0}
+        gap_score = min(effective_gap / 0.10, 1.0)
+        move_score = min(abs(best_move) / 0.002, 1.0)
 
-        confidence = gap_conf * 0.35 + move_conf * 0.35 + speed_bonus.get(move_window, 0) + mom_conf
+        confidence = (
+            gap_score * 0.45
+            + move_score * 0.35
+            + speed_bonus.get(move_window, 0)
+            + min(abs(micro_mom) * 500, 0.1)
+        )
         confidence = max(min(confidence, 0.95), self._confidence_floor)
 
         return Signal(
@@ -136,9 +155,8 @@ class LatencyArbStrategy(BaseStrategy):
             confidence=confidence,
             size_pct=self._size_pct * confidence,
             reason=(
-                f"[{move_window}] BTC {best_move:+.4%} "
-                f"poly={poly_mid:.3f} fair={fair_yes:.3f} "
-                f"gap={effective_gap:+.3f} mom={micro_mom:+.5f}"
+                f"[{move_window}] BTC {best_move:+.4%} (${exchange_price * abs(best_move):.0f}) "
+                f"fair={fair_yes:.3f} poly={poly_mid:.3f} gap={effective_gap:+.3f}"
             ),
             metadata={
                 "exchange_price": exchange_price,
@@ -149,6 +167,12 @@ class LatencyArbStrategy(BaseStrategy):
                 "fair_yes": fair_yes,
                 "gap": gap,
                 "effective_gap": effective_gap,
+                "btc_dollar_move": exchange_price * abs(best_move),
+                "move_500ms": move_500ms,
+                "move_1s": move_1s,
+                "move_2s": move_2s,
+                "move_5s": move_5s,
+                "move_10s": move_10s,
             },
         )
 
