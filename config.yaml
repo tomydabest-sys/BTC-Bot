@@ -141,5 +141,3 @@ monitoring:
     telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
     telegram_chat_id_env: "TELEGRAM_CHAT_ID"
   daily_summary_hour: 18
-    telegram_chat_id_env: "TELEGRAM_CHAT_ID"
-  daily_summary_hour: 18
