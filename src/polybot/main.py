@@ -8,6 +8,7 @@ load_dotenv()
 import asyncio
 import signal
 import sys
+import time
 
 import structlog
 
@@ -53,7 +54,6 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "maker_edge": MakerEdgeStrategy,
 }
 
-# Paper balance — set this to match your real budget
 DEFAULT_PAPER_BALANCE = 500.0
 
 
@@ -64,6 +64,7 @@ class Bot:
         self._config = config
         self._running = False
         self._wallet_balance = 0.0
+        self._last_trade_time = 0.0  # Global cooldown across all markets
 
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
@@ -189,7 +190,7 @@ class Bot:
         await self._ws_manager.start()
 
         self._running = True
-        logger.info("bot_started")
+        logger.info("bot_started", strategies=[s.name for s in self._strategies])
 
         await self._trading_loop()
 
@@ -206,6 +207,7 @@ class Bot:
 
     async def _on_order_filled(self, order: Order, **kwargs) -> None:
         self._position_manager.update_from_fill(order)
+        self._last_trade_time = time.time()
 
         if order.avg_fill_price > 0 and order.filled_size > 0:
             portfolio = self._position_manager.get_portfolio()
@@ -238,6 +240,11 @@ class Bot:
                     if balance > 0:
                         self._wallet_balance = balance
 
+                # ── Check global trade cooldown ──
+                min_interval = self._config.risk.min_trade_interval_seconds
+                since_last = time.time() - self._last_trade_time
+                in_cooldown = since_last < min_interval and self._last_trade_time > 0
+
                 active_markets = self._scanner.active_markets
                 for market_id, market in active_markets.items():
 
@@ -256,6 +263,10 @@ class Bot:
                     self._position_manager.update_prices(
                         market_id, snapshot.orderbook.mid_price
                     )
+
+                    # ── Skip signal generation if in global cooldown ──
+                    if in_cooldown:
+                        continue
 
                     signals = []
                     for strategy in self._strategies:
@@ -326,12 +337,34 @@ class Bot:
                             "updated_at": filled_order.created_at.isoformat(),
                         })
 
+                # ── Execute exits (stop-loss) ──
                 exits = self._position_manager.check_exits()
                 for exit_signal in exits:
+                    pos = exit_signal.position
                     logger.info(
-                        "exit_triggered",
-                        market=exit_signal.position.market_id,
+                        "exit_executing",
+                        market=pos.market_id[:16],
                         reason=exit_signal.reason,
+                        unrealized_pnl=round(pos.unrealized_pnl, 4),
+                    )
+                    # Create a closing order (opposite side)
+                    close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+                    close_order = Order(
+                        market_id=pos.market_id,
+                        token_id=pos.token_id,
+                        side=close_side,
+                        price=pos.current_price,
+                        size=pos.size,
+                        order_type=OrderType.LIMIT,
+                        strategy=f"exit_{pos.strategy}",
+                    )
+                    portfolio = self._position_manager.get_portfolio()
+                    closed = await self._execution_engine.execute_order(close_order, portfolio)
+                    logger.info(
+                        "exit_completed",
+                        market=pos.market_id[:16],
+                        status=closed.status.value,
+                        pnl=round(pos.unrealized_pnl, 4),
                     )
 
                 portfolio = self._position_manager.get_portfolio()
