@@ -1,11 +1,8 @@
-"""Momentum lag strategy — exploit delayed Polymarket reactions to crypto moves.
+"""Momentum lag — exploit delayed Polymarket reactions to BTC micro-moves.
 
-From the Jane Street bot analysis: when crypto moves hard in one direction,
-short-window Polymarket markets lag by 30-90 seconds. The order books thin
-out, prices stick, and the market freezes while the asset keeps moving.
-
-This strategy watches for 3-5% gaps between where the market should be
-priced and where it actually is, specifically on ultra-short timeframes.
+When BTC trends consistently for 2-10 seconds, the 5-minute markets
+lag behind. This catches the 1-5 second delay between Binance tick
+and Polymarket orderbook adjustment.
 """
 
 from __future__ import annotations
@@ -13,22 +10,23 @@ from __future__ import annotations
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
-from polybot.strategies.market_filter import is_crypto_window_market
 
 
 class MomentumLagStrategy(BaseStrategy):
-    """Trades the lag between exchange momentum and Polymarket pricing."""
 
     def __init__(
         self,
-        min_move_30s_pct: float = 0.015,
-        min_move_60s_pct: float = 0.025,
-        min_gap_pct: float = 0.03,
-        max_gap_pct: float = 0.10,
-        thin_book_threshold: float = 0.04,
-        size_pct: float = 0.07,
+        min_move_30s_pct: float = 0.003,
+        min_move_60s_pct: float = 0.006,
+        min_gap_pct: float = 0.015,
+        max_gap_pct: float = 0.15,
+        thin_book_threshold: float = 0.015,
+        size_pct: float = 0.04,
         market_keywords: list[str] | None = None,
     ) -> None:
+        self._min_move_2s = min_move_30s_pct * 0.3   # Derived: ~0.001 for 2s
+        self._min_move_5s = min_move_30s_pct * 0.5    # ~0.0015 for 5s
+        self._min_move_10s = min_move_30s_pct * 0.8   # ~0.0024 for 10s
         self._min_move_30s = min_move_30s_pct
         self._min_move_60s = min_move_60s_pct
         self._min_gap_pct = min_gap_pct
@@ -46,53 +44,52 @@ class MomentumLagStrategy(BaseStrategy):
         self._exchange_feed = feed
 
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
-        if not self._exchange_feed or len(self._exchange_feed.ticks) < 30:
+        if not self._exchange_feed or len(self._exchange_feed.ticks) < 20:
             return None
 
-        # Scanner guarantees only BTC up/down markets reach here.
-        # No keyword filtering needed.
+        # ── Check for consistent directional move ──
+        move_2s = self._exchange_feed.price_change_since(2.0)
+        move_5s = self._exchange_feed.price_change_since(5.0)
+        move_10s = self._exchange_feed.price_change_since(10.0)
+        move_30s = self._exchange_feed.price_change_since(30.0)
 
-        # Check for strong directional exchange move
-        move_30s = self._exchange_feed.price_change_pct(30)
-        move_60s = self._exchange_feed.price_change_pct(60)
+        # Need at least one timeframe to show a real move
+        has_fast = abs(move_2s) >= self._min_move_2s or abs(move_5s) >= self._min_move_5s
+        has_medium = abs(move_10s) >= self._min_move_10s or abs(move_30s) >= self._min_move_30s
 
-        # Need consistent strong move
-        strong_30s = abs(move_30s) >= self._min_move_30s
-        strong_60s = abs(move_60s) >= self._min_move_60s
-
-        if not (strong_30s or strong_60s):
+        if not (has_fast or has_medium):
             return None
 
-        # Both should agree on direction
-        if move_30s * move_60s < 0:
+        # All non-zero moves must agree on direction
+        moves = [m for m in [move_2s, move_5s, move_10s, move_30s] if abs(m) > 0.00005]
+        if not moves:
             return None
+        if not all(m > 0 for m in moves) and not all(m < 0 for m in moves):
+            return None  # Mixed signals, skip
 
-        # Check if Polymarket book is thin (sign of lagging)
+        # Use the fastest confirmed move as the signal
+        move_pct = moves[0]  # Already sorted fast→slow by the list order
+
+        # ── Check if Polymarket book is lagging ──
+        poly_mid = snapshot.orderbook.mid_price
         spread = snapshot.orderbook.spread
         is_thin = spread >= self._thin_book_threshold
 
-        # Even without thin book, proceed if exchange move is very strong
-        if not is_thin and abs(move_60s) < self._min_move_60s * 2:
-            return None
+        # Fair value: same mapping as latency_arb
+        move_abs = abs(move_pct)
+        shift = min(move_abs * 150, 0.42)
 
-        # Estimate where Polymarket should be priced
-        poly_mid = snapshot.orderbook.mid_price
-        move_pct = move_30s if strong_30s else move_60s
-
-        # For "will price go up" markets
         if move_pct > 0:
-            # Price going up → Yes should be high
-            fair_yes = min(0.5 + abs(move_pct) * 8, 0.92)
+            fair_yes = 0.50 + shift
             gap = fair_yes - poly_mid
         else:
-            # Price going down → Yes should be low
-            fair_yes = max(0.5 - abs(move_pct) * 8, 0.08)
+            fair_yes = 0.50 - shift
             gap = poly_mid - fair_yes
 
         if gap < self._min_gap_pct or gap > self._max_gap_pct:
             return None
 
-        # Direction
+        # ── Direction ──
         if move_pct > 0:
             direction = Direction.BUY
             outcome = "Yes"
@@ -100,11 +97,12 @@ class MomentumLagStrategy(BaseStrategy):
             direction = Direction.SELL
             outcome = "No"
 
-        # Confidence from move strength, book thinness, and gap size
-        move_score = min(abs(move_pct) / (self._min_move_60s * 3), 1.0)
-        gap_score = min(gap / (self._min_gap_pct * 3), 1.0)
+        # ── Confidence ──
+        move_score = min(move_abs / (self._min_move_30s * 2), 1.0)
+        gap_score = min(gap / (self._min_gap_pct * 2.5), 1.0)
         thin_bonus = 0.1 if is_thin else 0.0
-        confidence = min(move_score * 0.5 + gap_score * 0.4 + thin_bonus, 0.95)
+        fast_bonus = 0.1 if has_fast else 0.0
+        confidence = min(move_score * 0.35 + gap_score * 0.35 + thin_bonus + fast_bonus, 0.95)
 
         return Signal(
             market_id=snapshot.market.id,
@@ -115,12 +113,14 @@ class MomentumLagStrategy(BaseStrategy):
             confidence=confidence,
             size_pct=self._size_pct * confidence,
             reason=(
-                f"Momentum lag: exchange {move_30s:+.2%} (30s) / {move_60s:+.2%} (60s), "
-                f"Polymarket gap={gap:.4f}, spread={spread:.4f}"
+                f"MomLag: 2s={move_2s:+.4%} 5s={move_5s:+.4%} 10s={move_10s:+.4%} "
+                f"gap={gap:.3f} spread={spread:.3f}"
             ),
             metadata={
+                "move_2s": move_2s,
+                "move_5s": move_5s,
+                "move_10s": move_10s,
                 "move_30s": move_30s,
-                "move_60s": move_60s,
                 "fair_yes": fair_yes,
                 "gap": gap,
                 "spread": spread,
