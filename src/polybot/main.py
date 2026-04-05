@@ -1,6 +1,6 @@
-"""Entry point and orchestrator for the Polymarket trading bot."""
-
 from __future__ import annotations
+
+"""Entry point and orchestrator for the Polymarket trading bot."""
 
 from dotenv import load_dotenv
 load_dotenv()
