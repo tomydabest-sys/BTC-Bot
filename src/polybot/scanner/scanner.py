@@ -214,7 +214,7 @@ class MarketScanner:
             return False
 
         # Resolution window — only markets resolving soon
-        now = datetime.utcnow()
+        now = datetime.utcnow().replace(tzinfo=None)
         min_days, max_days = self._config.resolution_window_days
         if market.end_date < now + timedelta(days=min_days):
             return False
