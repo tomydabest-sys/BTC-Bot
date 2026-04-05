@@ -1,15 +1,10 @@
 """Latency arbitrage — sub-second exchange-to-Polymarket price gap trading.
 
-Fair value model calibrated to real 5-minute BTC price action:
-- Typical 5m move: $20-$80 (0.03%-0.12%)
-- Large 5m move: $100-$200 (0.15%-0.30%)
-- These small $ moves are DECISIVE for binary up/down resolution
-
-Sigmoid steepness k=800 so that:
-  $20 move (0.03%) → fair ≈ 0.56  (6¢ gap vs stale 50¢ book)
-  $50 move (0.07%) → fair ≈ 0.64  (14¢ gap)
-  $100 move (0.15%) → fair ≈ 0.77 (27¢ gap)
-  $200 move (0.30%) → fair ≈ 0.91 (41¢ gap)
+ONLY for 5-minute BTC Up/Down markets. Key safeguards:
+- Never buy Up above 65¢ (limited upside to $1, huge downside to $0)
+- Never buy Down above 65¢ (same logic on the other side)
+- Entry price must be between 35¢-65¢ for best risk/reward
+- Sigmoid k=800 calibrated for $20-200 BTC moves in 5 minutes
 """
 
 from __future__ import annotations
@@ -22,14 +17,14 @@ from polybot.strategies.base import BaseStrategy
 
 
 def btc_move_to_fair_probability(move_pct: float) -> float:
-    """Convert BTC % move to fair Up probability.
-    
-    k=800 calibrated for real 5-minute BTC price action where
-    $20-200 moves ($67k BTC = 0.03%-0.30%) are the norm.
-    """
     k = 800.0
     prob = 1.0 / (1.0 + math.exp(-k * move_pct))
     return max(0.05, min(0.95, prob))
+
+
+# Entry price bounds — only trade when risk/reward is favorable
+MAX_ENTRY_PRICE = 0.65  # Never buy above 65¢ (max profit 35¢, risk 65¢)
+MIN_ENTRY_PRICE = 0.35  # Never buy below 35¢ (means other side is >65¢)
 
 
 class LatencyArbStrategy(BaseStrategy):
@@ -64,11 +59,19 @@ class LatencyArbStrategy(BaseStrategy):
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
         if not self._exchange_feed or self._exchange_feed.last_price == 0:
             return None
-
         if len(self._exchange_feed.ticks) < 20:
             return None
 
         exchange_price = self._exchange_feed.last_price
+        poly_mid = snapshot.orderbook.mid_price
+
+        # ── Entry price guard ──
+        # If poly_mid is already near the extremes, there's no good entry.
+        # At 80¢ for Up: you risk 80¢ to make 20¢. Terrible r/r.
+        # At 50¢: you risk 50¢ to make 50¢. Fair.
+        # At 35¢: you risk 35¢ to make 65¢. Good.
+        if poly_mid > MAX_ENTRY_PRICE or poly_mid < MIN_ENTRY_PRICE:
+            return None
 
         # ── Detect move across sub-second timeframes ──
         move_500ms = self._exchange_feed.price_change_since(0.5)
@@ -76,10 +79,8 @@ class LatencyArbStrategy(BaseStrategy):
         move_2s = self._exchange_feed.price_change_since(2.0)
         move_5s = self._exchange_feed.price_change_since(5.0)
         move_10s = self._exchange_feed.price_change_since(10.0)
-
         micro_mom = self._exchange_feed.micro_momentum()
 
-        # Take the fastest confirmed move (speed premium on thresholds)
         best_move = 0.0
         move_window = "none"
 
@@ -108,7 +109,6 @@ class LatencyArbStrategy(BaseStrategy):
 
         # ── Fair value via sigmoid (k=800) ──
         fair_yes = btc_move_to_fair_probability(best_move)
-        poly_mid = snapshot.orderbook.mid_price
 
         if best_move > 0:
             gap = fair_yes - poly_mid
@@ -119,19 +119,24 @@ class LatencyArbStrategy(BaseStrategy):
 
         if effective_gap < self._min_gap_pct:
             return None
-
         if abs(gap) > self._max_gap_pct:
             return None
 
-        # ── Direction ──
+        # ── Direction + entry price check ──
         if best_move > 0:
             direction = Direction.BUY
             outcome = "Yes"
             target_price = snapshot.orderbook.best_ask
+            # Don't buy Up if ask is already too high
+            if target_price > MAX_ENTRY_PRICE:
+                return None
         else:
             direction = Direction.SELL
             outcome = "No"
             target_price = snapshot.orderbook.best_bid
+            # Don't buy Down (sell Up) if bid is already too low
+            if target_price < MIN_ENTRY_PRICE:
+                return None
 
         # ── Confidence ──
         speed_bonus = {"500ms": 0.12, "1s": 0.08, "2s": 0.04, "5s": 0.0, "10s": 0.0}
@@ -168,11 +173,6 @@ class LatencyArbStrategy(BaseStrategy):
                 "gap": gap,
                 "effective_gap": effective_gap,
                 "btc_dollar_move": exchange_price * abs(best_move),
-                "move_500ms": move_500ms,
-                "move_1s": move_1s,
-                "move_2s": move_2s,
-                "move_5s": move_5s,
-                "move_10s": move_10s,
             },
         )
 
