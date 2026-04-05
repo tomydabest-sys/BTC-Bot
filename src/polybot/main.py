@@ -9,6 +9,7 @@ import asyncio
 import signal
 import sys
 import time
+from datetime import datetime
 
 import structlog
 
@@ -64,7 +65,7 @@ class Bot:
         self._config = config
         self._running = False
         self._wallet_balance = 0.0
-        self._last_trade_time = 0.0  # Global cooldown across all markets
+        self._last_trade_time = 0.0
 
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
@@ -226,13 +227,26 @@ class Bot:
         except ImportError:
             pass
 
+    def _market_time_remaining(self, market) -> float:
+        """Seconds until a market's end_date. Negative = already expired."""
+        now = datetime.utcnow()
+        end = market.end_date.replace(tzinfo=None) if market.end_date.tzinfo else market.end_date
+        return (end - now).total_seconds()
+
     async def _trading_loop(self) -> None:
-        """Main loop: fetch orderbooks, evaluate strategies, execute signals."""
+        """Main loop: fetch orderbooks, evaluate strategies, execute signals.
+
+        Optimized for 5-minute rolling markets:
+        - Prefer the freshest (most time remaining) 5m window
+        - Auto-close positions on markets about to expire
+        - 10-second global cooldown between trades
+        - Cycle through markets quickly (2s loop)
+        """
         while self._running:
             try:
                 if not self._circuit_breaker.is_trading_allowed:
                     logger.debug("trading_paused_circuit_breaker")
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(5)
                     continue
 
                 if self._config.is_live:
@@ -240,15 +254,58 @@ class Bot:
                     if balance > 0:
                         self._wallet_balance = balance
 
-                # ── Check global trade cooldown ──
+                # ── Global trade cooldown ──
                 min_interval = self._config.risk.min_trade_interval_seconds
                 since_last = time.time() - self._last_trade_time
                 in_cooldown = since_last < min_interval and self._last_trade_time > 0
 
                 active_markets = self._scanner.active_markets
-                for market_id, market in active_markets.items():
 
-                    # Fetch orderbook via REST for each market
+                # ── Sort markets: most time remaining first (freshest windows) ──
+                sorted_markets = sorted(
+                    active_markets.items(),
+                    key=lambda x: self._market_time_remaining(x[1]),
+                    reverse=True,
+                )
+
+                traded_this_cycle = False
+
+                for market_id, market in sorted_markets:
+                    time_left = self._market_time_remaining(market)
+
+                    # ── Auto-close positions on expiring markets (<30s left) ──
+                    if time_left < 30:
+                        pos = None
+                        for p in self._position_manager.get_portfolio().positions:
+                            if p.market_id == market_id:
+                                pos = p
+                                break
+                        if pos:
+                            logger.info(
+                                "auto_closing_expiring",
+                                market=market_id[:16],
+                                time_left=round(time_left),
+                                pnl=round(pos.unrealized_pnl, 4),
+                            )
+                            close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+                            close_order = Order(
+                                market_id=pos.market_id,
+                                token_id=pos.token_id,
+                                side=close_side,
+                                price=pos.current_price,
+                                size=pos.size,
+                                order_type=OrderType.LIMIT,
+                                strategy=f"auto_exit_{pos.strategy}",
+                            )
+                            portfolio = self._position_manager.get_portfolio()
+                            await self._execution_engine.execute_order(close_order, portfolio)
+                        continue  # Skip trading on expiring markets
+
+                    # ── Skip markets with <60s left (too close to resolution) ──
+                    if time_left < 60:
+                        continue
+
+                    # Fetch orderbook via REST
                     if market.token_ids:
                         try:
                             orderbook = await self._client.get_orderbook(market.token_ids[0])
@@ -264,8 +321,8 @@ class Bot:
                         market_id, snapshot.orderbook.mid_price
                     )
 
-                    # ── Skip signal generation if in global cooldown ──
-                    if in_cooldown:
+                    # ── Skip signal generation if in cooldown or already traded ──
+                    if in_cooldown or traded_this_cycle:
                         continue
 
                     signals = []
@@ -280,7 +337,8 @@ class Bot:
                                     direction=sig.direction.value,
                                     confidence=round(sig.confidence, 3),
                                     market=market_id[:16],
-                                    reason=sig.reason[:60],
+                                    time_left=round(time_left),
+                                    reason=sig.reason[:80],
                                 )
                                 try:
                                     from polybot.dashboard.app import log_signal
@@ -320,6 +378,9 @@ class Bot:
 
                         filled_order = await self._execution_engine.execute_order(order, portfolio)
 
+                        if filled_order.filled_size > 0:
+                            traded_this_cycle = True
+
                         await self._storage.save_order({
                             "order_id": filled_order.order_id,
                             "market_id": filled_order.market_id,
@@ -337,7 +398,7 @@ class Bot:
                             "updated_at": filled_order.created_at.isoformat(),
                         })
 
-                # ── Execute exits (stop-loss) ──
+                # ── Execute stop-loss exits ──
                 exits = self._position_manager.check_exits()
                 for exit_signal in exits:
                     pos = exit_signal.position
@@ -345,9 +406,8 @@ class Bot:
                         "exit_executing",
                         market=pos.market_id[:16],
                         reason=exit_signal.reason,
-                        unrealized_pnl=round(pos.unrealized_pnl, 4),
+                        pnl=round(pos.unrealized_pnl, 4),
                     )
-                    # Create a closing order (opposite side)
                     close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
                     close_order = Order(
                         market_id=pos.market_id,
@@ -359,13 +419,7 @@ class Bot:
                         strategy=f"exit_{pos.strategy}",
                     )
                     portfolio = self._position_manager.get_portfolio()
-                    closed = await self._execution_engine.execute_order(close_order, portfolio)
-                    logger.info(
-                        "exit_completed",
-                        market=pos.market_id[:16],
-                        status=closed.status.value,
-                        pnl=round(pos.unrealized_pnl, 4),
-                    )
+                    await self._execution_engine.execute_order(close_order, portfolio)
 
                 portfolio = self._position_manager.get_portfolio()
                 portfolio.balance = self._wallet_balance
@@ -377,12 +431,13 @@ class Bot:
                     "num_positions": len(portfolio.positions),
                 })
 
-                await asyncio.sleep(5)
+                # Fast loop — 2 seconds for HF trading
+                await asyncio.sleep(2)
 
             except Exception as e:
                 logger.error("trading_loop_error", error=str(e))
                 self._circuit_breaker.record_api_error()
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
 
     async def _on_market_discovered(self, market) -> None:
         self._data_pipeline.register_market(market)
