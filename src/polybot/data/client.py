@@ -68,8 +68,9 @@ class RateLimiter:
 class PolymarketClient:
     """Async client — Gamma API for BTC up/down discovery, CLOB for trading."""
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, private_key: str = "") -> None:
         self._api_key = api_key
+        self._private_key = private_key
         self._rate_limiter = RateLimiter(max_requests=10, per_seconds=1.0)
         self._clob_client: httpx.AsyncClient | None = None
         self._gamma_client: httpx.AsyncClient | None = None
@@ -93,6 +94,11 @@ class PolymarketClient:
             await self._clob_client.aclose()
         if self._gamma_client:
             await self._gamma_client.aclose()
+
+    async def get_balance(self) -> float:
+        """Get wallet USDC balance. Returns 0 if not available."""
+        # TODO: Implement via py-clob-client or web3
+        return 0.0
 
     # ═══════════════════════════════════════════════════════════════
     #  MARKET DISCOVERY — slug-based lookup via Gamma /events
@@ -317,4 +323,4 @@ class PolymarketClient:
     async def get_open_orders(self) -> list[dict]:
         """Fetch current open orders."""
         data = await self._clob_request("GET", "/orders")
-        return data if isinstance(data, list) else data.get("data", []) 
+        return data if isinstance(data, list) else data.get("data", [])
