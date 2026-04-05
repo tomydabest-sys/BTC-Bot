@@ -15,22 +15,10 @@ from polybot.events import EventBus
 
 logger = structlog.get_logger()
 
-# ─── BTC Up/Down Detection ────────────────────────────────────────
-# Polymarket BTC up/down market titles look like:
-#   "Bitcoin Up or Down - April 5, 12:30AM-12:45AM ET"     (15-min)
-#   "Bitcoin Up or Down - April 4, 6:10PM-6:15PM ET"       (5-min)
-#   "Bitcoin Up or Down - April 4, 6:00PM-7:00PM ET"       (1-hour)
-#   "Bitcoin Up or Down - April 4, 2:00PM-6:00PM ET"       (4-hour)
-#
-# We match on "bitcoin" + "up or down" in the question text.
-# Everything else (politics, sports, price targets, etc.) is ignored.
-
 BTC_UPDOWN_PATTERN = re.compile(
     r"bitcoin\s+up\s+or\s+down", re.IGNORECASE
 )
 
-# Pattern to extract the time window duration from the title
-# Matches patterns like "12:30AM-12:45AM" or "6:00PM-7:00PM"
 TIME_WINDOW_PATTERN = re.compile(
     r"(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
     re.IGNORECASE,
@@ -38,15 +26,10 @@ TIME_WINDOW_PATTERN = re.compile(
 
 
 def is_btc_updown_market(question: str) -> bool:
-    """Check if a market is a BTC Up/Down market."""
     return bool(BTC_UPDOWN_PATTERN.search(question))
 
 
 def estimate_window_minutes(question: str) -> int | None:
-    """Estimate the time window in minutes from the market question.
-
-    Returns None if the window can't be determined.
-    """
     match = TIME_WINDOW_PATTERN.search(question)
     if not match:
         return None
@@ -64,7 +47,6 @@ def estimate_window_minutes(question: str) -> int | None:
     start = to_minutes(h1, m1, ap1)
     end = to_minutes(h2, m2, ap2)
 
-    # Handle midnight crossing (e.g., 11:45PM-12:00AM)
     if end <= start:
         end += 24 * 60
 
@@ -72,10 +54,6 @@ def estimate_window_minutes(question: str) -> int | None:
 
 
 def classify_btc_market(question: str) -> str | None:
-    """Classify a BTC market into a timeframe bucket.
-
-    Returns: "5m", "15m", "1h", "4h", or None if not a BTC up/down market.
-    """
     if not is_btc_updown_market(question):
         return None
 
@@ -108,7 +86,7 @@ class MarketScanner:
         self._config = config
         self._event_bus = event_bus
         self._active_markets: dict[str, Market] = {}
-        self._market_timeframes: dict[str, str] = {}  # market_id → "5m"/"15m"/etc
+        self._market_timeframes: dict[str, str] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -123,7 +101,6 @@ class MarketScanner:
         return dict(self._active_markets)
 
     def get_timeframe(self, market_id: str) -> str | None:
-        """Get the classified timeframe for a market."""
         return self._market_timeframes.get(market_id)
 
     async def _scan_loop(self) -> None:
@@ -136,21 +113,17 @@ class MarketScanner:
 
     async def _scan(self) -> None:
         logger.info("scanning_btc_updown_markets")
-        # Fetch all active markets from Polymarket
         all_markets = await self._client.get_markets(active=True)
 
-        # ═══ FILTER: Only BTC Up/Down markets ═══
         btc_markets = []
         for market in all_markets:
             timeframe = classify_btc_market(market.question)
             if timeframe is None:
-                continue  # Not a BTC up/down market — skip entirely
+                continue
 
-            # Apply basic quality filters
             if not self._passes_quality_filters(market):
                 continue
 
-            # Optionally filter by specific timeframes
             allowed_timeframes = self._get_allowed_timeframes()
             if allowed_timeframes and timeframe not in allowed_timeframes:
                 continue
@@ -158,10 +131,8 @@ class MarketScanner:
             btc_markets.append(market)
             self._market_timeframes[market.id] = timeframe
 
-        # Sort by volume (highest first)
         btc_markets.sort(key=lambda m: m.volume_24h, reverse=True)
 
-        # Update active markets
         new_markets = {m.id: m for m in btc_markets}
         added = set(new_markets) - set(self._active_markets)
         removed = set(self._active_markets) - set(new_markets)
@@ -184,7 +155,6 @@ class MarketScanner:
 
         self._active_markets = new_markets
 
-        # Log summary by timeframe
         tf_counts: dict[str, int] = {}
         for mid in new_markets:
             tf = self._market_timeframes.get(mid, "?")
@@ -201,31 +171,28 @@ class MarketScanner:
         )
 
     def _passes_quality_filters(self, market: Market) -> bool:
-        """Basic quality checks — volume, liquidity, spread, resolution window."""
         if not market.active:
             return False
 
-        # Volume filter (relaxed — new windows start at $0)
         if market.volume_24h < self._config.min_volume_24h:
             return False
 
-        # Liquidity filter
         if market.liquidity < self._config.min_liquidity:
             return False
 
-        # Resolution window — only markets resolving soon
         now = datetime.utcnow().replace(tzinfo=None)
         min_days, max_days = self._config.resolution_window_days
-        if market.end_date < now + timedelta(days=min_days):
+
+        end_date = market.end_date.replace(tzinfo=None) if market.end_date.tzinfo else market.end_date
+
+        if end_date < now + timedelta(days=min_days):
             return False
-        if market.end_date > now + timedelta(days=max_days):
+        if end_date > now + timedelta(days=max_days):
             return False
 
         return True
 
     def _get_allowed_timeframes(self) -> set[str] | None:
-        """Get allowed timeframes from config, or None for all."""
-        # Check if config has btc_timeframes (custom field)
         raw = getattr(self._config, "btc_timeframes", None)
         if not raw:
             return None
