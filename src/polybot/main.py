@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Entry point — optimized for sub-second latency arb on 5-minute windows."""
+"""Entry point — optimized for 5-minute BTC Up/Down latency arb."""
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -59,16 +59,12 @@ DEFAULT_PAPER_BALANCE = 500.0
 
 
 class Bot:
-    """Main bot orchestrator — optimized for sub-second latency arb."""
-
     def __init__(self, config: Config) -> None:
         self._config = config
         self._running = False
         self._wallet_balance = 0.0
         self._last_trade_time = 0.0
-
-        # Cache orderbooks to avoid redundant fetches within same second
-        self._orderbook_cache: dict[str, float] = {}  # market_id → last_fetch_time
+        self._orderbook_cache: dict[str, float] = {}
 
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
@@ -82,20 +78,15 @@ class Bot:
             symbols=["BTC", "ETH", "SOL", "XRP"],
             poll_interval=0.5,
         )
-
         self._scanner = MarketScanner(self._client, config.scanner, self._event_bus)
         self._risk_manager = RiskManager(config.risk)
         self._circuit_breaker = CircuitBreaker(config.risk.circuit_breakers)
         self._position_manager = PositionManager(self._event_bus)
         self._execution_engine = ExecutionEngine(
-            self._client,
-            self._risk_manager,
-            config.execution,
-            self._event_bus,
-            is_paper=not config.is_live,
+            self._client, self._risk_manager, config.execution,
+            self._event_bus, is_paper=not config.is_live,
         )
         self._alert_manager = AlertManager([LogChannel()])
-
         self._strategies: list[BaseStrategy] = []
         self._aggregator = StrategyAggregator(
             min_confidence=config.strategies.aggregation.min_confidence,
@@ -108,102 +99,58 @@ class Bot:
         return os.environ.get(env_var, "")
 
     @property
-    def config(self) -> Config:
-        return self._config
-
+    def config(self): return self._config
     @property
-    def position_manager(self) -> PositionManager:
-        return self._position_manager
-
+    def position_manager(self): return self._position_manager
     @property
-    def circuit_breaker(self) -> CircuitBreaker:
-        return self._circuit_breaker
-
+    def circuit_breaker(self): return self._circuit_breaker
     @property
-    def risk_manager(self) -> RiskManager:
-        return self._risk_manager
-
+    def risk_manager(self): return self._risk_manager
     @property
-    def execution_engine(self) -> ExecutionEngine:
-        return self._execution_engine
-
+    def execution_engine(self): return self._execution_engine
     @property
-    def scanner(self) -> MarketScanner:
-        return self._scanner
-
+    def scanner(self): return self._scanner
     @property
-    def exchange_feed(self) -> ExchangePriceFeed:
-        return self._exchange_feed
-
+    def exchange_feed(self): return self._exchange_feed
     @property
-    def strategies(self) -> list[BaseStrategy]:
-        return self._strategies
-
+    def strategies(self): return self._strategies
     @property
-    def running(self) -> bool:
-        return self._running
-
+    def running(self): return self._running
     @property
-    def data_pipeline(self) -> DataPipeline:
-        return self._data_pipeline
-
+    def data_pipeline(self): return self._data_pipeline
     @property
-    def storage(self) -> Storage:
-        return self._storage
+    def storage(self): return self._storage
 
     async def start(self) -> None:
-        logger.info(
-            "bot_starting",
-            name=self._config.bot.name,
-            mode=self._config.bot.mode,
-        )
-
+        logger.info("bot_starting", name=self._config.bot.name, mode=self._config.bot.mode)
         await self._storage.initialize()
         await self._client.start()
         await self._exchange_feed.start()
 
         if self._config.is_live:
             self._wallet_balance = await self._client.get_balance()
-            logger.info("wallet_balance_fetched", balance=self._wallet_balance)
         else:
             self._wallet_balance = DEFAULT_PAPER_BALANCE
             logger.info("paper_balance_set", balance=self._wallet_balance)
 
-        for strat_config in self._config.strategies.enabled:
-            cls = STRATEGY_REGISTRY.get(strat_config.name)
+        for sc in self._config.strategies.enabled:
+            cls = STRATEGY_REGISTRY.get(sc.name)
             if cls:
-                ctor_params = {
-                    k: v for k, v in strat_config.params.items()
-                    if k != "exchange_symbol"
-                }
-                strategy = cls(**ctor_params)
+                params = {k: v for k, v in sc.params.items() if k != "exchange_symbol"}
+                strategy = cls(**params)
                 if hasattr(strategy, "set_exchange_feed"):
-                    symbol = strat_config.params.get("exchange_symbol", "BTC")
-                    feed = self._exchange_feed.get_feed(symbol)
+                    feed = self._exchange_feed.get_feed(sc.params.get("exchange_symbol", "BTC"))
                     if feed:
                         strategy.set_exchange_feed(feed)
                 self._strategies.append(strategy)
-                logger.info("strategy_loaded", name=strat_config.name)
-            else:
-                logger.warning("strategy_unknown", name=strat_config.name)
+                logger.info("strategy_loaded", name=sc.name)
 
         self._event_bus.subscribe("market_discovered", self._on_market_discovered)
         self._event_bus.subscribe("order_filled", self._on_order_filled)
-
         await self._scanner.start()
         await self._ws_manager.start()
-
         self._running = True
-
-        # Log feed diagnostics
-        btc_feed = self._exchange_feed.get_feed("BTC")
-        logger.info(
-            "bot_started",
-            strategies=[s.name for s in self._strategies],
-            feed_type="binance_ws",
-            note="Sub-second latency arb mode",
-        )
-
+        logger.info("bot_started", strategies=[s.name for s in self._strategies])
         await self._trading_loop()
 
     async def stop(self) -> None:
@@ -219,7 +166,9 @@ class Bot:
 
     async def _on_order_filled(self, order: Order, **kwargs) -> None:
         self._position_manager.update_from_fill(order)
-        self._last_trade_time = time.time()
+        # Only set cooldown for NEW positions, not exits
+        if not order.strategy.startswith("exit_") and not order.strategy.startswith("auto_exit"):
+            self._last_trade_time = time.time()
 
         if order.avg_fill_price > 0 and order.filled_size > 0:
             portfolio = self._position_manager.get_portfolio()
@@ -228,12 +177,9 @@ class Bot:
         try:
             from polybot.dashboard.app import log_trade
             log_trade({
-                "market_id": order.market_id,
-                "side": order.side.value,
-                "price": order.avg_fill_price,
-                "size": order.filled_size,
-                "strategy": order.strategy,
-                "order_id": order.order_id,
+                "market_id": order.market_id, "side": order.side.value,
+                "price": order.avg_fill_price, "size": order.filled_size,
+                "strategy": order.strategy, "order_id": order.order_id,
             })
         except ImportError:
             pass
@@ -243,34 +189,37 @@ class Bot:
         end = market.end_date.replace(tzinfo=None) if market.end_date.tzinfo else market.end_date
         return (end - now).total_seconds()
 
-    async def _fetch_orderbook_throttled(self, market_id: str, token_id: str) -> bool:
-        """Fetch orderbook but throttle to max once per second per market."""
-        now = time.time()
-        last_fetch = self._orderbook_cache.get(market_id, 0)
-        if now - last_fetch < 1.0:
-            return False  # Already fetched recently
+    async def _execute_exit(self, pos) -> None:
+        """Execute a stop-loss exit. Bypasses trade interval cooldown."""
+        close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+        close_order = Order(
+            market_id=pos.market_id, token_id=pos.token_id,
+            side=close_side, price=pos.current_price, size=pos.size,
+            order_type=OrderType.LIMIT, strategy=f"exit_{pos.strategy}",
+        )
+        # Temporarily clear trade time so exit isn't blocked
+        saved_time = self._last_trade_time
+        self._last_trade_time = 0
+        portfolio = self._position_manager.get_portfolio()
+        result = await self._execution_engine.execute_order(close_order, portfolio)
+        # Restore (don't set new cooldown for exits)
+        self._last_trade_time = saved_time
+        return result
 
+    async def _fetch_orderbook_throttled(self, market_id: str, token_id: str) -> bool:
+        now = time.time()
+        if now - self._orderbook_cache.get(market_id, 0) < 1.0:
+            return False
         try:
-            orderbook = await self._client.get_orderbook(token_id)
-            self._data_pipeline.ingest_orderbook(market_id, orderbook)
+            ob = await self._client.get_orderbook(token_id)
+            self._data_pipeline.ingest_orderbook(market_id, ob)
             self._orderbook_cache[market_id] = now
             return True
         except Exception as e:
-            logger.debug("orderbook_fetch_error", market=market_id[:16], error=str(e))
+            logger.debug("ob_err", m=market_id[:12], e=str(e))
             return False
 
     async def _trading_loop(self) -> None:
-        """Main loop — 1-second cycle for sub-second latency arb.
-
-        Flow per cycle:
-        1. Check circuit breaker
-        2. Auto-close expiring positions (<30s left)
-        3. Refresh orderbooks (throttled, 1/sec per market)
-        4. Run strategies on freshest markets first
-        5. Execute at most 1 trade per cycle
-        6. Run stop-loss exits
-        7. Sleep 1 second
-        """
         cycle_count = 0
 
         while self._running:
@@ -282,20 +231,16 @@ class Bot:
                     await asyncio.sleep(3)
                     continue
 
-                # Live balance refresh (every 30 cycles)
                 if self._config.is_live and cycle_count % 30 == 0:
-                    balance = await self._client.get_balance()
-                    if balance > 0:
-                        self._wallet_balance = balance
+                    bal = await self._client.get_balance()
+                    if bal > 0:
+                        self._wallet_balance = bal
 
-                # ── Global cooldown ──
                 min_interval = self._config.risk.min_trade_interval_seconds
                 since_last = time.time() - self._last_trade_time
                 in_cooldown = since_last < min_interval and self._last_trade_time > 0
 
                 active_markets = self._scanner.active_markets
-
-                # Sort: freshest (most time left) first
                 sorted_markets = sorted(
                     active_markets.items(),
                     key=lambda x: self._market_time_remaining(x[1]),
@@ -307,35 +252,17 @@ class Bot:
                 for market_id, market in sorted_markets:
                     time_left = self._market_time_remaining(market)
 
-                    # ── Auto-close positions on expiring markets ──
+                    # Auto-close expiring positions (<30s)
                     if time_left < 30:
                         for p in list(self._position_manager.get_portfolio().positions):
                             if p.market_id == market_id:
-                                logger.info(
-                                    "auto_close_expiring",
-                                    market=market_id[:16],
-                                    time_left=round(time_left),
-                                    pnl=round(p.unrealized_pnl, 4),
-                                )
-                                close_side = Side.SELL if p.side == Side.BUY else Side.BUY
-                                close_order = Order(
-                                    market_id=p.market_id,
-                                    token_id=p.token_id,
-                                    side=close_side,
-                                    price=p.current_price,
-                                    size=p.size,
-                                    order_type=OrderType.LIMIT,
-                                    strategy=f"auto_exit",
-                                )
-                                portfolio = self._position_manager.get_portfolio()
-                                await self._execution_engine.execute_order(close_order, portfolio)
+                                logger.info("auto_close", m=market_id[:12], t=round(time_left), pnl=round(p.unrealized_pnl, 4))
+                                await self._execute_exit(p)
                         continue
 
-                    # Skip markets too close to resolution
                     if time_left < 60:
                         continue
 
-                    # ── Refresh orderbook (throttled) ──
                     if market.token_ids:
                         await self._fetch_orderbook_throttled(market_id, market.token_ids[0])
 
@@ -343,11 +270,8 @@ class Bot:
                     if not snapshot:
                         continue
 
-                    self._position_manager.update_prices(
-                        market_id, snapshot.orderbook.mid_price
-                    )
+                    self._position_manager.update_prices(market_id, snapshot.orderbook.mid_price)
 
-                    # ── Signal generation ──
                     if in_cooldown or traded_this_cycle:
                         continue
 
@@ -358,19 +282,14 @@ class Bot:
                             if sig:
                                 signals.append(sig)
                                 logger.info(
-                                    "signal",
-                                    s=sig.strategy,
-                                    d=sig.direction.value,
-                                    c=round(sig.confidence, 3),
-                                    m=market_id[:12],
-                                    t=round(time_left),
-                                    r=sig.reason[:100],
+                                    "signal", s=sig.strategy, d=sig.direction.value,
+                                    c=round(sig.confidence, 3), m=market_id[:12],
+                                    t=round(time_left), r=sig.reason[:100],
                                 )
                                 try:
                                     from polybot.dashboard.app import log_signal
                                     log_signal({
-                                        "market_id": sig.market_id,
-                                        "strategy": sig.strategy,
+                                        "market_id": sig.market_id, "strategy": sig.strategy,
                                         "direction": sig.direction.value,
                                         "confidence": round(sig.confidence, 3),
                                         "reason": sig.reason,
@@ -386,68 +305,36 @@ class Bot:
                     for sig in final_signals:
                         portfolio = self._position_manager.get_portfolio()
                         balance = self._wallet_balance if self._wallet_balance > 0 else DEFAULT_PAPER_BALANCE
-                        order_type = (
-                            OrderType.GTC
-                            if sig.metadata.get("is_maker_only") or sig.metadata.get("is_market_maker")
-                            else OrderType.LIMIT
-                        )
+                        order_type = OrderType.GTC if sig.metadata.get("is_maker_only") or sig.metadata.get("is_market_maker") else OrderType.LIMIT
                         order = Order(
                             market_id=sig.market_id,
                             token_id=market.token_ids[0] if market.token_ids else "",
                             side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
-                            price=sig.target_price,
-                            size=sig.size_pct * balance,
-                            order_type=order_type,
-                            strategy=sig.strategy,
+                            price=sig.target_price, size=sig.size_pct * balance,
+                            order_type=order_type, strategy=sig.strategy,
                         )
                         order.size *= self._circuit_breaker.size_multiplier
-
                         filled = await self._execution_engine.execute_order(order, portfolio)
-
                         if filled.filled_size > 0:
                             traded_this_cycle = True
-
                         await self._storage.save_order({
-                            "order_id": filled.order_id,
-                            "market_id": filled.market_id,
-                            "token_id": filled.token_id,
-                            "side": filled.side.value,
-                            "price": filled.price,
-                            "size": filled.size,
-                            "order_type": filled.order_type.value,
-                            "status": filled.status.value,
-                            "strategy": filled.strategy,
-                            "signal_id": filled.signal_id,
-                            "filled_size": filled.filled_size,
-                            "avg_fill_price": filled.avg_fill_price,
+                            "order_id": filled.order_id, "market_id": filled.market_id,
+                            "token_id": filled.token_id, "side": filled.side.value,
+                            "price": filled.price, "size": filled.size,
+                            "order_type": filled.order_type.value, "status": filled.status.value,
+                            "strategy": filled.strategy, "signal_id": filled.signal_id,
+                            "filled_size": filled.filled_size, "avg_fill_price": filled.avg_fill_price,
                             "created_at": filled.created_at.isoformat(),
                             "updated_at": filled.created_at.isoformat(),
                         })
 
-                # ── Stop-loss exits ──
+                # Stop-loss exits (bypass cooldown)
                 exits = self._position_manager.check_exits()
                 for exit_signal in exits:
                     pos = exit_signal.position
-                    logger.info(
-                        "exit_exec",
-                        m=pos.market_id[:12],
-                        reason=exit_signal.reason[:40],
-                        pnl=round(pos.unrealized_pnl, 4),
-                    )
-                    close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
-                    close_order = Order(
-                        market_id=pos.market_id,
-                        token_id=pos.token_id,
-                        side=close_side,
-                        price=pos.current_price,
-                        size=pos.size,
-                        order_type=OrderType.LIMIT,
-                        strategy=f"exit_{pos.strategy}",
-                    )
-                    portfolio = self._position_manager.get_portfolio()
-                    await self._execution_engine.execute_order(close_order, portfolio)
+                    logger.info("exit_exec", m=pos.market_id[:12], reason=exit_signal.reason[:40], pnl=round(pos.unrealized_pnl, 4))
+                    await self._execute_exit(pos)
 
-                # Periodic P&L snapshot (every 10 cycles)
                 if cycle_count % 10 == 0:
                     portfolio = self._position_manager.get_portfolio()
                     portfolio.balance = self._wallet_balance
@@ -459,13 +346,11 @@ class Bot:
                         "num_positions": len(portfolio.positions),
                     })
 
-                # ── Periodic diagnostics (every 60 cycles) ──
                 if cycle_count % 60 == 0:
                     btc_feed = self._exchange_feed.get_feed("BTC")
                     if btc_feed:
                         logger.info(
-                            "feed_diag",
-                            btc=round(btc_feed.last_price, 2),
+                            "feed_diag", btc=round(btc_feed.last_price, 2),
                             tps=round(btc_feed.ticks_per_second, 1),
                             ticks=len(btc_feed.ticks),
                             micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
@@ -473,10 +358,8 @@ class Bot:
                             positions=len(self._position_manager.get_portfolio().positions),
                         )
 
-                # ── Cycle timing ──
                 elapsed = time.time() - cycle_start
-                sleep_time = max(1.0 - elapsed, 0.1)
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(max(1.0 - elapsed, 0.1))
 
             except Exception as e:
                 logger.error("loop_error", error=str(e))
@@ -492,7 +375,6 @@ class Bot:
 
 def cli() -> None:
     import argparse
-
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -500,8 +382,8 @@ def cli() -> None:
         pass
 
     parser = argparse.ArgumentParser(description="Polymarket Trading Bot")
-    parser.add_argument("--config", default="config.yaml", help="Path to config file")
-    parser.add_argument("--mode", choices=["paper", "live"], help="Override trading mode")
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--mode", choices=["paper", "live"])
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -510,17 +392,14 @@ def cli() -> None:
 
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(
-            {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(
-                config.bot.log_level, 20
-            )
+            {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(config.bot.log_level, 20)
         ),
     )
 
     bot = Bot(config)
     loop = asyncio.new_event_loop()
 
-    def handle_signal(sig: int, _frame) -> None:
-        logger.info("signal_received", signal=sig)
+    def handle_signal(sig: int, _frame):
         bot._running = False
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -538,8 +417,8 @@ def cli() -> None:
         except Exception:
             pass
         pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
+        for t in pending:
+            t.cancel()
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
