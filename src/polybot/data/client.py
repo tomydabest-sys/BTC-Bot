@@ -1,8 +1,22 @@
-"""Polymarket API client — uses Gamma API for market discovery, CLOB for trading."""
+"""Polymarket API client — slug-based discovery for BTC Up/Down markets.
+
+The Gamma API's generic /markets and /events endpoints don't properly filter
+or sort, returning old/irrelevant markets. However, BTC up/down markets have
+predictable slugs based on Unix timestamps:
+
+    btc-updown-5m-{unix_ts}    (every 300 seconds)
+    btc-updown-15m-{unix_ts}   (every 900 seconds)
+    btc-updown-1h-{unix_ts}    (every 3600 seconds)
+    btc-updown-4h-{unix_ts}    (every 14400 seconds)
+
+This client fetches markets directly by constructing these slugs.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from datetime import datetime
 
 import httpx
@@ -15,20 +29,31 @@ logger = structlog.get_logger()
 CLOB_BASE_URL = "https://clob.polymarket.com"
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
+# Slug patterns for BTC up/down markets
+# Format: (slug_prefix, interval_seconds, lookback_count, lookahead_count)
+BTC_UPDOWN_WINDOWS = [
+    ("btc-updown-5m",  300,   3, 2),   # 5-min:  check 3 past + 2 future
+    ("btc-updown-15m", 900,   2, 2),   # 15-min: check 2 past + 2 future
+    ("btc-updown-1h",  3600,  1, 1),   # 1-hour: check 1 past + 1 future
+    ("btc-updown-4h",  14400, 1, 1),   # 4-hour: check 1 past + 1 future
+]
+
 
 class RateLimiter:
     """Token bucket rate limiter."""
 
-    def __init__(self, max_requests: int = 5, per_seconds: float = 1.0) -> None:
+    def __init__(self, max_requests: int = 10, per_seconds: float = 1.0) -> None:
         self._max = max_requests
         self._per = per_seconds
         self._tokens = float(max_requests)
-        self._last_refill = asyncio.get_event_loop().time()
+        self._last_refill = 0.0
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
         async with self._lock:
-            now = asyncio.get_event_loop().time()
+            now = time.monotonic()
+            if self._last_refill == 0:
+                self._last_refill = now
             elapsed = now - self._last_refill
             self._tokens = min(self._max, self._tokens + elapsed * (self._max / self._per))
             self._last_refill = now
@@ -41,11 +66,11 @@ class RateLimiter:
 
 
 class PolymarketClient:
-    """Async HTTP client for Polymarket — Gamma API for discovery, CLOB for trading."""
+    """Async client — Gamma API for BTC up/down discovery, CLOB for trading."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
-        self._rate_limiter = RateLimiter(max_requests=5, per_seconds=1.0)
+        self._rate_limiter = RateLimiter(max_requests=10, per_seconds=1.0)
         self._clob_client: httpx.AsyncClient | None = None
         self._gamma_client: httpx.AsyncClient | None = None
 
@@ -70,89 +95,96 @@ class PolymarketClient:
             await self._gamma_client.aclose()
 
     # ═══════════════════════════════════════════════════════════════
-    #  MARKET DISCOVERY — via Gamma API
-    #
-    #  The Gamma API returns currently active markets with proper
-    #  filtering. The CLOB /markets endpoint returns from oldest
-    #  first and is not suitable for discovery.
+    #  MARKET DISCOVERY — slug-based lookup via Gamma /events
     # ═══════════════════════════════════════════════════════════════
 
     async def get_markets(self, active: bool = True, limit: int = 100) -> list[Market]:
-        """Fetch active markets from the Gamma API.
+        """Fetch current BTC up/down markets by constructing time-based slugs.
 
-        Uses the /markets endpoint on gamma-api.polymarket.com which
-        returns currently active markets (not historical ones from 2023).
+        Instead of paginating through thousands of irrelevant events,
+        we build the predictable slugs for current/recent time windows
+        and fetch each one directly.
         """
         assert self._gamma_client is not None, "Client not started"
-        await self._rate_limiter.acquire()
 
+        now = int(time.time())
         all_markets: list[Market] = []
-        offset = 0
-        max_pages = 10  # Safety limit
+        seen_ids: set[str] = set()
 
-        for _ in range(max_pages):
-            try:
-                response = await self._gamma_client.get(
-                    "/markets",
-                    params={
-                        "active": "true" if active else "false",
-                        "closed": "false",
-                        "archived": "false",
-                        "limit": limit,
-                        "offset": offset,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
+        for prefix, interval, lookback, lookahead in BTC_UPDOWN_WINDOWS:
+            # Align to the interval boundary
+            current_window = (now // interval) * interval
 
-                # Gamma API returns a list directly
-                items = data if isinstance(data, list) else data.get("data", [])
+            # Check past, current, and future windows
+            for offset in range(-lookback, lookahead + 1):
+                ts = current_window + (offset * interval)
+                slug = f"{prefix}-{ts}"
 
-                if not items:
-                    break
+                try:
+                    await self._rate_limiter.acquire()
+                    resp = await self._gamma_client.get(
+                        "/events",
+                        params={"slug": slug},
+                    )
 
-                for item in items:
-                    try:
-                        market = self._parse_gamma_market(item)
-                        if market:
-                            all_markets.append(market)
-                    except Exception as e:
-                        logger.debug("market_parse_error", error=str(e))
+                    if resp.status_code != 200:
                         continue
 
-                # If we got fewer than limit, we've reached the end
-                if len(items) < limit:
-                    break
+                    data = resp.json()
 
-                offset += limit
-                await self._rate_limiter.acquire()
+                    # Response can be a list or a single event dict
+                    events = data if isinstance(data, list) else [data] if isinstance(data, dict) and data.get("title") else []
 
-            except httpx.HTTPStatusError as e:
-                logger.error("gamma_api_error", status=e.response.status_code)
-                break
-            except Exception as e:
-                logger.error("gamma_fetch_error", error=str(e))
-                break
+                    for event in events:
+                        event_markets = event.get("markets", [])
+                        for item in event_markets:
+                            # Only include active, non-closed BTC markets
+                            if not item.get("active", False):
+                                continue
+                            if item.get("closed", False):
+                                continue
 
-        logger.info("markets_fetched", parsed_count=len(all_markets), raw_offset=offset)
+                            question = item.get("question", "")
+                            if "bitcoin" not in question.lower():
+                                continue
+
+                            condition_id = item.get("conditionId", "")
+                            if not condition_id or condition_id in seen_ids:
+                                continue
+
+                            seen_ids.add(condition_id)
+                            market = self._parse_gamma_market(item)
+                            if market:
+                                all_markets.append(market)
+
+                except httpx.HTTPStatusError:
+                    continue
+                except Exception as e:
+                    logger.debug("slug_fetch_error", slug=slug, error=str(e))
+                    continue
+
+        logger.info(
+            "markets_fetched",
+            parsed_count=len(all_markets),
+            slugs_checked=sum(
+                lookback + lookahead + 1 for _, _, lookback, lookahead in BTC_UPDOWN_WINDOWS
+            ),
+        )
         return all_markets
 
     def _parse_gamma_market(self, item: dict) -> Market | None:
-        """Parse a market from the Gamma API response."""
-        # Gamma API field names differ slightly from CLOB
-        condition_id = item.get("conditionId") or item.get("condition_id") or ""
-        question = item.get("question") or ""
+        """Parse a market from a Gamma API event's market object."""
+        condition_id = item.get("conditionId", item.get("condition_id", ""))
+        question = item.get("question", "")
 
         if not condition_id or not question:
             return None
 
-        # Parse token IDs from clobTokenIds or outcomes
+        # Parse token IDs
         token_ids = []
         clob_token_ids = item.get("clobTokenIds")
         if clob_token_ids:
             if isinstance(clob_token_ids, str):
-                # Sometimes it's a JSON string like "[\"id1\",\"id2\"]"
-                import json
                 try:
                     token_ids = json.loads(clob_token_ids)
                 except (json.JSONDecodeError, TypeError):
@@ -163,15 +195,14 @@ class PolymarketClient:
         # Parse outcomes
         outcomes_raw = item.get("outcomes")
         if isinstance(outcomes_raw, str):
-            import json
             try:
                 outcomes = json.loads(outcomes_raw)
             except (json.JSONDecodeError, TypeError):
-                outcomes = ["Yes", "No"]
+                outcomes = ["Up", "Down"]
         elif isinstance(outcomes_raw, list):
             outcomes = outcomes_raw
         else:
-            outcomes = ["Yes", "No"]
+            outcomes = ["Up", "Down"]
 
         # Parse end date
         end_date_str = (
@@ -182,7 +213,6 @@ class PolymarketClient:
         )
         try:
             if end_date_str:
-                # Handle various date formats
                 end_date_str = end_date_str.replace("Z", "+00:00")
                 end_date = datetime.fromisoformat(end_date_str)
             else:
@@ -190,7 +220,7 @@ class PolymarketClient:
         except (ValueError, TypeError):
             end_date = datetime.utcnow()
 
-        # Parse volume — Gamma uses different field names
+        # Parse volume
         volume = 0.0
         for key in ["volume", "volumeNum", "volume_num", "volume24hr", "volume_num_24hr"]:
             val = item.get(key)
@@ -219,7 +249,7 @@ class PolymarketClient:
             outcomes=outcomes,
             token_ids=token_ids,
             end_date=end_date,
-            category=item.get("category", item.get("groupItemTitle", "")),
+            category="crypto",
             active=item.get("active", True),
             volume_24h=volume,
             liquidity=liquidity,
@@ -266,7 +296,7 @@ class PolymarketClient:
                     side=Side(item.get("side", "BUY")),
                     price=float(item["price"]),
                     size=float(item["size"]),
-                    outcome=item.get("outcome", "Yes"),
+                    outcome=item.get("outcome", "Up"),
                 )
             )
         return trades
