@@ -1,15 +1,16 @@
-"""Momentum lag — trades sustained BTC trends vs stale Polymarket books.
-
-Same entry price guards as latency_arb: only enter between 35¢-65¢.
-"""
+"""Momentum lag with widened entry range and lower thresholds."""
 
 from __future__ import annotations
 
 import math
+import time
 
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
+
+import structlog
+logger = structlog.get_logger()
 
 
 def btc_move_to_fair_probability(move_pct: float) -> float:
@@ -18,19 +19,19 @@ def btc_move_to_fair_probability(move_pct: float) -> float:
     return max(0.05, min(0.95, prob))
 
 
-MAX_ENTRY_PRICE = 0.65
-MIN_ENTRY_PRICE = 0.35
+MAX_ENTRY_PRICE = 0.75
+MIN_ENTRY_PRICE = 0.25
 
 
 class MomentumLagStrategy(BaseStrategy):
 
     def __init__(
         self,
-        min_move_30s_pct: float = 0.003,
-        min_move_60s_pct: float = 0.006,
-        min_gap_pct: float = 0.015,
-        max_gap_pct: float = 0.15,
-        thin_book_threshold: float = 0.015,
+        min_move_30s_pct: float = 0.002,
+        min_move_60s_pct: float = 0.004,
+        min_gap_pct: float = 0.01,
+        max_gap_pct: float = 0.20,
+        thin_book_threshold: float = 0.01,
         size_pct: float = 0.04,
         market_keywords: list[str] | None = None,
     ) -> None:
@@ -42,6 +43,7 @@ class MomentumLagStrategy(BaseStrategy):
         self._size_pct = size_pct
         self._market_keywords = market_keywords
         self._exchange_feed: PriceFeedState | None = None
+        self._last_debug = 0.0
 
     @property
     def name(self) -> str:
@@ -55,13 +57,27 @@ class MomentumLagStrategy(BaseStrategy):
             return None
 
         poly_mid = snapshot.orderbook.mid_price
-
-        # Entry price guard
         if poly_mid > MAX_ENTRY_PRICE or poly_mid < MIN_ENTRY_PRICE:
             return None
 
         move_30s = self._exchange_feed.price_change_pct(30)
         move_60s = self._exchange_feed.price_change_pct(60)
+
+        # Debug logging every 30s
+        now = time.time()
+        if now - self._last_debug > 30:
+            self._last_debug = now
+            fair30 = btc_move_to_fair_probability(move_30s)
+            spread = snapshot.orderbook.spread
+            logger.debug(
+                "momlag_check",
+                m=snapshot.market.id[:12],
+                poly=round(poly_mid, 3),
+                mv30s=f"{move_30s:+.4%}",
+                mv60s=f"{move_60s:+.4%}",
+                fair30=round(fair30, 3),
+                spread=round(spread, 3),
+            )
 
         strong_30s = abs(move_30s) >= self._min_move_30s
         strong_60s = abs(move_60s) >= self._min_move_60s
@@ -76,7 +92,8 @@ class MomentumLagStrategy(BaseStrategy):
         spread = snapshot.orderbook.spread
         is_thin = spread >= self._thin_book_threshold
 
-        if not is_thin and abs(move_60s) < self._min_move_60s * 1.5:
+        # Relaxed: don't require thin book if 30s move is strong enough
+        if not is_thin and not strong_30s:
             return None
 
         fair_yes = btc_move_to_fair_probability(move_pct)
