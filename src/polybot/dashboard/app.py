@@ -254,6 +254,14 @@ async def get_trades() -> dict:
 async def get_signals() -> dict:
     return {"signals": _signal_log[-100:], "total": len(_signal_log)}
 
+@app.get("/api/analytics")
+async def api_analytics():
+    """Comprehensive trade analytics: edge, signal quality, risk metrics."""
+    db_path = "./data/bot.db"  # Adjust if your data dir differs
+    try:
+        return get_full_analytics(db_path)
+    except Exception as e:
+        return {"error": str(e), "edge": {}, "signal_analysis": {}, "risk": {}}
 
 @app.post("/api/bot/stop")
 async def stop_bot() -> dict:
