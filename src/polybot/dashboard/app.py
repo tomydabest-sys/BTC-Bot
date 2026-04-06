@@ -1,3 +1,5 @@
+from polybot.dashboard.analytics import get_full_analytics
+
 """FastAPI dashboard for the Polymarket trading bot."""
 
 from __future__ import annotations
