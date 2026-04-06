@@ -1,19 +1,20 @@
 """Latency arbitrage — sub-second exchange-to-Polymarket price gap trading.
 
-ONLY for 5-minute BTC Up/Down markets. Key safeguards:
-- Never buy Up above 65¢ (limited upside to $1, huge downside to $0)
-- Never buy Down above 65¢ (same logic on the other side)
-- Entry price must be between 35¢-65¢ for best risk/reward
-- Sigmoid k=800 calibrated for $20-200 BTC moves in 5 minutes
+Entry bounds 25¢-75¢, sigmoid k=800, with debug logging showing
+why signals pass or fail each cycle so we can diagnose no-trade periods.
 """
 
 from __future__ import annotations
 
 import math
+import time
 
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.strategies.base import BaseStrategy
+
+import structlog
+logger = structlog.get_logger()
 
 
 def btc_move_to_fair_probability(move_pct: float) -> float:
@@ -22,22 +23,20 @@ def btc_move_to_fair_probability(move_pct: float) -> float:
     return max(0.05, min(0.95, prob))
 
 
-# Entry price bounds — only trade when risk/reward is favorable
-MAX_ENTRY_PRICE = 0.65  # Never buy above 65¢ (max profit 35¢, risk 65¢)
-MIN_ENTRY_PRICE = 0.35  # Never buy below 35¢ (means other side is >65¢)
+MAX_ENTRY_PRICE = 0.75
+MIN_ENTRY_PRICE = 0.25
 
 
 class LatencyArbStrategy(BaseStrategy):
-    """Detects sub-second exchange-to-Polymarket price gaps."""
 
     def __init__(
         self,
-        min_gap_pct: float = 0.015,
-        max_gap_pct: float = 0.20,
-        min_exchange_move_pct: float = 0.003,
+        min_gap_pct: float = 0.01,
+        max_gap_pct: float = 0.25,
+        min_exchange_move_pct: float = 0.002,
         confidence_floor: float = 0.55,
         size_pct: float = 0.04,
-        fee_buffer_pct: float = 0.005,
+        fee_buffer_pct: float = 0.003,
         market_keywords: list[str] | None = None,
     ) -> None:
         self._min_gap_pct = min_gap_pct
@@ -48,6 +47,7 @@ class LatencyArbStrategy(BaseStrategy):
         self._fee_buffer_pct = fee_buffer_pct
         self._market_keywords = market_keywords
         self._exchange_feed: PriceFeedState | None = None
+        self._last_debug = 0.0
 
     @property
     def name(self) -> str:
@@ -65,15 +65,11 @@ class LatencyArbStrategy(BaseStrategy):
         exchange_price = self._exchange_feed.last_price
         poly_mid = snapshot.orderbook.mid_price
 
-        # ── Entry price guard ──
-        # If poly_mid is already near the extremes, there's no good entry.
-        # At 80¢ for Up: you risk 80¢ to make 20¢. Terrible r/r.
-        # At 50¢: you risk 50¢ to make 50¢. Fair.
-        # At 35¢: you risk 35¢ to make 65¢. Good.
+        # Entry price guard
         if poly_mid > MAX_ENTRY_PRICE or poly_mid < MIN_ENTRY_PRICE:
             return None
 
-        # ── Detect move across sub-second timeframes ──
+        # Detect move across sub-second timeframes
         move_500ms = self._exchange_feed.price_change_since(0.5)
         move_1s = self._exchange_feed.price_change_since(1.0)
         move_2s = self._exchange_feed.price_change_since(2.0)
@@ -98,6 +94,26 @@ class LatencyArbStrategy(BaseStrategy):
                 move_window = window
                 break
 
+        # Debug logging every 30 seconds to show what's happening
+        now = time.time()
+        if now - self._last_debug > 30:
+            self._last_debug = now
+            fair = btc_move_to_fair_probability(move_5s) if move_5s != 0 else 0.5
+            raw_gap = abs(fair - poly_mid) if move_5s > 0 else abs(poly_mid - fair)
+            logger.debug(
+                "latarb_check",
+                m=snapshot.market.id[:12],
+                poly=round(poly_mid, 3),
+                btc=round(exchange_price, 1),
+                mv500ms=f"{move_500ms:+.4%}",
+                mv5s=f"{move_5s:+.4%}",
+                mv10s=f"{move_10s:+.4%}",
+                fair=round(fair, 3),
+                gap=round(raw_gap, 3),
+                mom=round(micro_mom, 4),
+                best=f"{best_move:+.4%}" if best_move else "none",
+            )
+
         if best_move == 0.0:
             return None
 
@@ -107,7 +123,7 @@ class LatencyArbStrategy(BaseStrategy):
         if best_move < 0 and micro_mom > 0.0002:
             return None
 
-        # ── Fair value via sigmoid (k=800) ──
+        # Fair value via sigmoid (k=800)
         fair_yes = btc_move_to_fair_probability(best_move)
 
         if best_move > 0:
@@ -122,23 +138,21 @@ class LatencyArbStrategy(BaseStrategy):
         if abs(gap) > self._max_gap_pct:
             return None
 
-        # ── Direction + entry price check ──
+        # Direction + entry price check
         if best_move > 0:
             direction = Direction.BUY
             outcome = "Yes"
             target_price = snapshot.orderbook.best_ask
-            # Don't buy Up if ask is already too high
             if target_price > MAX_ENTRY_PRICE:
                 return None
         else:
             direction = Direction.SELL
             outcome = "No"
             target_price = snapshot.orderbook.best_bid
-            # Don't buy Down (sell Up) if bid is already too low
             if target_price < MIN_ENTRY_PRICE:
                 return None
 
-        # ── Confidence ──
+        # Confidence
         speed_bonus = {"500ms": 0.12, "1s": 0.08, "2s": 0.04, "5s": 0.0, "10s": 0.0}
         gap_score = min(effective_gap / 0.10, 1.0)
         move_score = min(abs(best_move) / 0.002, 1.0)
