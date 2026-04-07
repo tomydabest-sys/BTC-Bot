@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-"""Entry point — optimized for 5-minute BTC Up/Down latency arb."""
+"""Entry point — optimized for 5-minute BTC Up/Down latency arb.
+
+Key fix: orderbook fetch errors now log at WARNING (not DEBUG) so you can
+see when the CLOB API is failing to return data. Previously all ob_err
+were silent DEBUG logs, hiding the root cause of zero-trade periods.
+"""
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -57,6 +62,9 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
 
 DEFAULT_PAPER_BALANCE = 500.0
 
+# How often to log "no snapshot" warnings per market to avoid spam
+_NO_SNAPSHOT_WARN_INTERVAL = 60.0  # seconds
+
 
 class Bot:
     def __init__(self, config: Config) -> None:
@@ -65,6 +73,8 @@ class Bot:
         self._wallet_balance = 0.0
         self._last_trade_time = 0.0
         self._orderbook_cache: dict[str, float] = {}
+        self._no_snapshot_warn: dict[str, float] = {}  # market_id → last warn time
+        self._ob_fail_count: dict[str, int] = {}       # market_id → consecutive fail count
 
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
@@ -166,7 +176,6 @@ class Bot:
 
     async def _on_order_filled(self, order: Order, **kwargs) -> None:
         self._position_manager.update_from_fill(order)
-        # Only set cooldown for NEW positions, not exits
         if not order.strategy.startswith("exit_") and not order.strategy.startswith("auto_exit"):
             self._last_trade_time = time.time()
 
@@ -197,12 +206,10 @@ class Bot:
             side=close_side, price=pos.current_price, size=pos.size,
             order_type=OrderType.LIMIT, strategy=f"exit_{pos.strategy}",
         )
-        # Temporarily clear trade time so exit isn't blocked
         saved_time = self._last_trade_time
         self._last_trade_time = 0
         portfolio = self._position_manager.get_portfolio()
         result = await self._execution_engine.execute_order(close_order, portfolio)
-        # Restore (don't set new cooldown for exits)
         self._last_trade_time = saved_time
         return result
 
@@ -214,9 +221,19 @@ class Bot:
             ob = await self._client.get_orderbook(token_id)
             self._data_pipeline.ingest_orderbook(market_id, ob)
             self._orderbook_cache[market_id] = now
+            self._ob_fail_count[market_id] = 0  # Reset on success
             return True
         except Exception as e:
-            logger.debug("ob_err", m=market_id[:12], e=str(e))
+            fails = self._ob_fail_count.get(market_id, 0) + 1
+            self._ob_fail_count[market_id] = fails
+            # Log at WARNING every 5th consecutive failure so it's visible
+            if fails % 5 == 1:
+                logger.warning(
+                    "ob_fetch_fail",
+                    m=market_id[:12],
+                    consecutive_fails=fails,
+                    error=str(e)[:80],
+                )
             return False
 
     async def _trading_loop(self) -> None:
@@ -256,7 +273,12 @@ class Bot:
                     if time_left < 30:
                         for p in list(self._position_manager.get_portfolio().positions):
                             if p.market_id == market_id:
-                                logger.info("auto_close", m=market_id[:12], t=round(time_left), pnl=round(p.unrealized_pnl, 4))
+                                logger.info(
+                                    "auto_close",
+                                    m=market_id[:12],
+                                    t=round(time_left),
+                                    pnl=round(p.unrealized_pnl, 4),
+                                )
                                 await self._execute_exit(p)
                         continue
 
@@ -268,6 +290,18 @@ class Bot:
 
                     snapshot = self._data_pipeline.get_snapshot(market_id)
                     if not snapshot:
+                        # Warn if we haven't had a snapshot for this market in a while
+                        now = time.time()
+                        last_warn = self._no_snapshot_warn.get(market_id, 0.0)
+                        if now - last_warn > _NO_SNAPSHOT_WARN_INTERVAL:
+                            self._no_snapshot_warn[market_id] = now
+                            ob_fails = self._ob_fail_count.get(market_id, 0)
+                            logger.warning(
+                                "no_snapshot",
+                                m=market_id[:12],
+                                ob_fails=ob_fails,
+                                hint="Check CLOB orderbook API or token_id validity",
+                            )
                         continue
 
                     self._position_manager.update_prices(market_id, snapshot.orderbook.mid_price)
@@ -282,14 +316,19 @@ class Bot:
                             if sig:
                                 signals.append(sig)
                                 logger.info(
-                                    "signal", s=sig.strategy, d=sig.direction.value,
-                                    c=round(sig.confidence, 3), m=market_id[:12],
-                                    t=round(time_left), r=sig.reason[:100],
+                                    "signal",
+                                    s=sig.strategy,
+                                    d=sig.direction.value,
+                                    c=round(sig.confidence, 3),
+                                    m=market_id[:12],
+                                    t=round(time_left),
+                                    r=sig.reason[:100],
                                 )
                                 try:
                                     from polybot.dashboard.app import log_signal
                                     log_signal({
-                                        "market_id": sig.market_id, "strategy": sig.strategy,
+                                        "market_id": sig.market_id,
+                                        "strategy": sig.strategy,
                                         "direction": sig.direction.value,
                                         "confidence": round(sig.confidence, 3),
                                         "reason": sig.reason,
@@ -305,25 +344,37 @@ class Bot:
                     for sig in final_signals:
                         portfolio = self._position_manager.get_portfolio()
                         balance = self._wallet_balance if self._wallet_balance > 0 else DEFAULT_PAPER_BALANCE
-                        order_type = OrderType.GTC if sig.metadata.get("is_maker_only") or sig.metadata.get("is_market_maker") else OrderType.LIMIT
+                        order_type = (
+                            OrderType.GTC
+                            if sig.metadata.get("is_maker_only") or sig.metadata.get("is_market_maker")
+                            else OrderType.LIMIT
+                        )
                         order = Order(
                             market_id=sig.market_id,
                             token_id=market.token_ids[0] if market.token_ids else "",
                             side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
-                            price=sig.target_price, size=sig.size_pct * balance,
-                            order_type=order_type, strategy=sig.strategy,
+                            price=sig.target_price,
+                            size=sig.size_pct * balance,
+                            order_type=order_type,
+                            strategy=sig.strategy,
                         )
                         order.size *= self._circuit_breaker.size_multiplier
                         filled = await self._execution_engine.execute_order(order, portfolio)
                         if filled.filled_size > 0:
                             traded_this_cycle = True
                         await self._storage.save_order({
-                            "order_id": filled.order_id, "market_id": filled.market_id,
-                            "token_id": filled.token_id, "side": filled.side.value,
-                            "price": filled.price, "size": filled.size,
-                            "order_type": filled.order_type.value, "status": filled.status.value,
-                            "strategy": filled.strategy, "signal_id": filled.signal_id,
-                            "filled_size": filled.filled_size, "avg_fill_price": filled.avg_fill_price,
+                            "order_id": filled.order_id,
+                            "market_id": filled.market_id,
+                            "token_id": filled.token_id,
+                            "side": filled.side.value,
+                            "price": filled.price,
+                            "size": filled.size,
+                            "order_type": filled.order_type.value,
+                            "status": filled.status.value,
+                            "strategy": filled.strategy,
+                            "signal_id": filled.signal_id,
+                            "filled_size": filled.filled_size,
+                            "avg_fill_price": filled.avg_fill_price,
                             "created_at": filled.created_at.isoformat(),
                             "updated_at": filled.created_at.isoformat(),
                         })
@@ -332,7 +383,12 @@ class Bot:
                 exits = self._position_manager.check_exits()
                 for exit_signal in exits:
                     pos = exit_signal.position
-                    logger.info("exit_exec", m=pos.market_id[:12], reason=exit_signal.reason[:40], pnl=round(pos.unrealized_pnl, 4))
+                    logger.info(
+                        "exit_exec",
+                        m=pos.market_id[:12],
+                        reason=exit_signal.reason[:40],
+                        pnl=round(pos.unrealized_pnl, 4),
+                    )
                     await self._execute_exit(pos)
 
                 if cycle_count % 10 == 0:
@@ -350,7 +406,8 @@ class Bot:
                     btc_feed = self._exchange_feed.get_feed("BTC")
                     if btc_feed:
                         logger.info(
-                            "feed_diag", btc=round(btc_feed.last_price, 2),
+                            "feed_diag",
+                            btc=round(btc_feed.last_price, 2),
                             tps=round(btc_feed.ticks_per_second, 1),
                             ticks=len(btc_feed.ticks),
                             micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
@@ -392,7 +449,9 @@ def cli() -> None:
 
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(
-            {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(config.bot.log_level, 20)
+            {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(
+                config.bot.log_level, 20
+            )
         ),
     )
 
