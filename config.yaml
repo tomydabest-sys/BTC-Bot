@@ -24,20 +24,25 @@ strategies:
     - name: "latency_arb"
       weight: 1.0
       params:
-        min_gap_pct: 0.01
+        # Relaxed from 0.01 — tight BTC 5-min markets need lower threshold
+        min_gap_pct: 0.008
         max_gap_pct: 0.25
-        min_exchange_move_pct: 0.002
+        # Relaxed from 0.002 — catches more moves in ranging conditions
+        min_exchange_move_pct: 0.0015
         fee_buffer_pct: 0.003
         size_pct: 0.04
         confidence_floor: 0.55
         exchange_symbol: "BTC"
+        # Micro-lag predictor: extrapolates BTC 500ms forward
+        enable_micro_lag: true
 
     - name: "momentum_lag"
       weight: 1.0
       params:
-        min_move_30s_pct: 0.002
-        min_move_60s_pct: 0.004
-        min_gap_pct: 0.01
+        # Relaxed from 0.002/0.004 — BTC was ranging 0.15-0.37% during dead period
+        min_move_30s_pct: 0.0015
+        min_move_60s_pct: 0.0025
+        min_gap_pct: 0.008
         max_gap_pct: 0.20
         thin_book_threshold: 0.01
         size_pct: 0.04
@@ -60,7 +65,8 @@ risk:
   max_portfolio_exposure: 150
   max_positions: 5
   max_daily_loss: 25
-  min_trade_interval_seconds: 8
+  # Reduced from 8s — allows faster re-entry on different markets
+  min_trade_interval_seconds: 5
   max_order_size: 20
   max_slippage_pct: 5.0
   circuit_breakers:
