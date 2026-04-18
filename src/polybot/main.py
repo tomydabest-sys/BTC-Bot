@@ -1,26 +1,32 @@
-from __future__ import annotations
+"""Entry point — BTC Up/Down trading bot.
 
-"""Entry point — optimized for 5-minute BTC Up/Down latency arb.
+Integrates:
+  - Feature logger (features.db) — one row per market per cycle
+  - Overshoot-reversion strategy (behavioural-overshoot fade)
+  - Auto-backfill of settled_up once a market resolves
 
-Key fix: orderbook fetch errors now log at WARNING (not DEBUG) so you can
-see when the CLOB API is failing to return data. Previously all ob_err
-were silent DEBUG logs, hiding the root cause of zero-trade periods.
+Preserves all existing behaviour: latency_arb, momentum_lag, dual_direction_arb,
+market_maker, monte_carlo, volatility_breakout, calibration_edge, maker_edge.
 """
+
+from __future__ import annotations
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
 import signal
-import sys
 import time
 from datetime import datetime
 
+import httpx
 import structlog
 
-from polybot.config import load_config, Config
+from polybot.config import Config, load_config
 from polybot.data.client import PolymarketClient
 from polybot.data.exchange_feed import ExchangePriceFeed
+from polybot.data.features_logger import FeaturesLogger
+from polybot.data.models import Order, OrderType, Side
 from polybot.data.pipeline import DataPipeline
 from polybot.data.storage import Storage
 from polybot.data.websocket import WebSocketManager
@@ -33,17 +39,17 @@ from polybot.risk.manager import RiskManager
 from polybot.scanner.scanner import MarketScanner
 from polybot.strategies.aggregator import StrategyAggregator
 from polybot.strategies.base import BaseStrategy
+from polybot.strategies.calibration_edge import CalibrationEdgeStrategy
+from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
+from polybot.strategies.latency_arb import LatencyArbStrategy
+from polybot.strategies.maker_edge import MakerEdgeStrategy
+from polybot.strategies.market_maker import MarketMakerStrategy
 from polybot.strategies.mean_reversion import MeanReversionStrategy
 from polybot.strategies.momentum import MomentumStrategy
-from polybot.strategies.latency_arb import LatencyArbStrategy
 from polybot.strategies.momentum_lag import MomentumLagStrategy
-from polybot.strategies.volatility_breakout import VolatilityBreakoutStrategy
-from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
-from polybot.strategies.market_maker import MarketMakerStrategy
 from polybot.strategies.monte_carlo import MonteCarloStrategy
-from polybot.strategies.calibration_edge import CalibrationEdgeStrategy
-from polybot.strategies.maker_edge import MakerEdgeStrategy
-from polybot.data.models import Order, OrderType, Side
+from polybot.strategies.overshoot_reversion import OvershootReversionStrategy
+from polybot.strategies.volatility_breakout import VolatilityBreakoutStrategy
 
 logger = structlog.get_logger()
 
@@ -58,12 +64,13 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "monte_carlo": MonteCarloStrategy,
     "calibration_edge": CalibrationEdgeStrategy,
     "maker_edge": MakerEdgeStrategy,
+    "overshoot_reversion": OvershootReversionStrategy,
 }
 
 DEFAULT_PAPER_BALANCE = 500.0
-
-# How often to log "no snapshot" warnings per market to avoid spam
-_NO_SNAPSHOT_WARN_INTERVAL = 60.0  # seconds
+_NO_SNAPSHOT_WARN_INTERVAL = 60.0
+_SETTLEMENT_BACKFILL_INTERVAL = 60.0
+_GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
 
 class Bot:
@@ -73,11 +80,20 @@ class Bot:
         self._wallet_balance = 0.0
         self._last_trade_time = 0.0
         self._orderbook_cache: dict[str, float] = {}
-        self._no_snapshot_warn: dict[str, float] = {}  # market_id → last warn time
-        self._ob_fail_count: dict[str, int] = {}       # market_id → consecutive fail count
+        self._no_snapshot_warn: dict[str, float] = {}
+        self._ob_fail_count: dict[str, int] = {}
+
+        # Markets we've seen but not yet backfilled: market_id -> first_seen_missing_ts
+        self._pending_settlement: dict[str, float] = {}
+        self._backfilled: set[str] = set()
 
         self._event_bus = EventBus()
         self._storage = Storage(f"{config.bot.data_dir}/bot.db")
+        self._features_logger = FeaturesLogger(
+            db_path=f"{config.bot.data_dir}/features.db",
+            flush_interval_seconds=5.0,
+            max_buffer_rows=200,
+        )
         self._client = PolymarketClient(
             api_key=self._safe_env(config.wallet.api_key_env),
             private_key=self._safe_env(config.wallet.private_key_env),
@@ -102,6 +118,8 @@ class Bot:
             min_confidence=config.strategies.aggregation.min_confidence,
             conflict_resolution=config.strategies.aggregation.conflict_resolution,
         )
+        self._backfill_client: httpx.AsyncClient | None = None
+        self._backfill_task: asyncio.Task | None = None
 
     @staticmethod
     def _safe_env(env_var: str) -> str:
@@ -130,12 +148,16 @@ class Bot:
     def data_pipeline(self): return self._data_pipeline
     @property
     def storage(self): return self._storage
+    @property
+    def features_logger(self): return self._features_logger
 
     async def start(self) -> None:
         logger.info("bot_starting", name=self._config.bot.name, mode=self._config.bot.mode)
         await self._storage.initialize()
+        await self._features_logger.start()
         await self._client.start()
         await self._exchange_feed.start()
+        self._backfill_client = httpx.AsyncClient(timeout=10.0)
 
         if self._config.is_live:
             self._wallet_balance = await self._client.get_balance()
@@ -145,20 +167,31 @@ class Bot:
 
         for sc in self._config.strategies.enabled:
             cls = STRATEGY_REGISTRY.get(sc.name)
-            if cls:
-                params = {k: v for k, v in sc.params.items() if k != "exchange_symbol"}
+            if not cls:
+                logger.warning("strategy_not_found", name=sc.name)
+                continue
+            params = {k: v for k, v in sc.params.items() if k != "exchange_symbol"}
+            try:
                 strategy = cls(**params)
-                if hasattr(strategy, "set_exchange_feed"):
-                    feed = self._exchange_feed.get_feed(sc.params.get("exchange_symbol", "BTC"))
-                    if feed:
-                        strategy.set_exchange_feed(feed)
-                self._strategies.append(strategy)
-                logger.info("strategy_loaded", name=sc.name)
+            except TypeError as e:
+                logger.error("strategy_init_failed", name=sc.name, error=str(e))
+                continue
+            if hasattr(strategy, "set_exchange_feed"):
+                feed = self._exchange_feed.get_feed(sc.params.get("exchange_symbol", "BTC"))
+                if feed:
+                    strategy.set_exchange_feed(feed)
+            self._strategies.append(strategy)
+            logger.info("strategy_loaded", name=sc.name)
 
         self._event_bus.subscribe("market_discovered", self._on_market_discovered)
+        self._event_bus.subscribe("market_removed", self._on_market_removed)
         self._event_bus.subscribe("order_filled", self._on_order_filled)
+
         await self._scanner.start()
         await self._ws_manager.start()
+
+        self._backfill_task = asyncio.create_task(self._settlement_backfill_loop())
+
         self._running = True
         logger.info("bot_started", strategies=[s.name for s in self._strategies])
         await self._trading_loop()
@@ -166,12 +199,45 @@ class Bot:
     async def stop(self) -> None:
         logger.info("bot_stopping")
         self._running = False
-        await self._execution_engine.cancel_all()
-        await self._scanner.stop()
-        await self._ws_manager.stop()
-        await self._exchange_feed.stop()
-        await self._client.close()
-        await self._storage.close()
+        try:
+            await self._execution_engine.cancel_all()
+        except Exception as e:
+            logger.error("cancel_all_err", error=str(e))
+        if self._backfill_task:
+            self._backfill_task.cancel()
+            try:
+                await self._backfill_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await self._scanner.stop()
+        except Exception:
+            pass
+        try:
+            await self._ws_manager.stop()
+        except Exception:
+            pass
+        try:
+            await self._exchange_feed.stop()
+        except Exception:
+            pass
+        try:
+            await self._client.close()
+        except Exception:
+            pass
+        if self._backfill_client:
+            try:
+                await self._backfill_client.aclose()
+            except Exception:
+                pass
+        try:
+            await self._features_logger.stop()
+        except Exception:
+            pass
+        try:
+            await self._storage.close()
+        except Exception:
+            pass
         logger.info("bot_stopped")
 
     async def _on_order_filled(self, order: Order, **kwargs) -> None:
@@ -189,9 +255,20 @@ class Bot:
                 "market_id": order.market_id, "side": order.side.value,
                 "price": order.avg_fill_price, "size": order.filled_size,
                 "strategy": order.strategy, "order_id": order.order_id,
+                "target_price": order.price,
             })
         except ImportError:
             pass
+
+    async def _on_market_discovered(self, market) -> None:
+        self._data_pipeline.register_market(market)
+        for token_id in market.token_ids:
+            await self._ws_manager.subscribe_market(token_id)
+        logger.info("market_sub", id=market.id[:16], q=market.question[:50])
+
+    async def _on_market_removed(self, market_id: str, **kwargs) -> None:
+        if market_id not in self._backfilled:
+            self._pending_settlement[market_id] = time.time()
 
     def _market_time_remaining(self, market) -> float:
         now = datetime.utcnow()
@@ -199,7 +276,6 @@ class Bot:
         return (end - now).total_seconds()
 
     async def _execute_exit(self, pos) -> None:
-        """Execute a stop-loss exit. Bypasses trade interval cooldown."""
         close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
         close_order = Order(
             market_id=pos.market_id, token_id=pos.token_id,
@@ -221,12 +297,11 @@ class Bot:
             ob = await self._client.get_orderbook(token_id)
             self._data_pipeline.ingest_orderbook(market_id, ob)
             self._orderbook_cache[market_id] = now
-            self._ob_fail_count[market_id] = 0  # Reset on success
+            self._ob_fail_count[market_id] = 0
             return True
         except Exception as e:
             fails = self._ob_fail_count.get(market_id, 0) + 1
             self._ob_fail_count[market_id] = fails
-            # Log at WARNING every 5th consecutive failure so it's visible
             if fails % 5 == 1:
                 logger.warning(
                     "ob_fetch_fail",
@@ -265,11 +340,12 @@ class Bot:
                 )
 
                 traded_this_cycle = False
+                btc_feed = self._exchange_feed.get_feed("BTC")
 
                 for market_id, market in sorted_markets:
                     time_left = self._market_time_remaining(market)
 
-                    # Auto-close expiring positions (<30s)
+                    # Auto-close expiring positions
                     if time_left < 30:
                         for p in list(self._position_manager.get_portfolio().positions):
                             if p.market_id == market_id:
@@ -290,7 +366,6 @@ class Bot:
 
                     snapshot = self._data_pipeline.get_snapshot(market_id)
                     if not snapshot:
-                        # Warn if we haven't had a snapshot for this market in a while
                         now = time.time()
                         last_warn = self._no_snapshot_warn.get(market_id, 0.0)
                         if now - last_warn > _NO_SNAPSHOT_WARN_INTERVAL:
@@ -306,9 +381,21 @@ class Bot:
 
                     self._position_manager.update_prices(market_id, snapshot.orderbook.mid_price)
 
+                    # ── FEATURE LOGGING ───────────────────────────────────
+                    try:
+                        await self._features_logger.log_snapshot(
+                            market_id=market_id,
+                            snapshot=snapshot,
+                            btc_feed=btc_feed,
+                            time_remaining=time_left,
+                        )
+                    except Exception as e:
+                        logger.debug("feat_log_err", m=market_id[:12], error=str(e))
+
                     if in_cooldown or traded_this_cycle:
                         continue
 
+                    # ── STRATEGY EVALUATION ───────────────────────────────
                     signals = []
                     for strategy in self._strategies:
                         try:
@@ -379,14 +466,14 @@ class Bot:
                             "updated_at": filled.created_at.isoformat(),
                         })
 
-                # Stop-loss exits (bypass cooldown)
+                # Stop-loss / strategy-specific exits
                 exits = self._position_manager.check_exits()
                 for exit_signal in exits:
                     pos = exit_signal.position
                     logger.info(
                         "exit_exec",
                         m=pos.market_id[:12],
-                        reason=exit_signal.reason[:40],
+                        reason=exit_signal.reason[:60],
                         pnl=round(pos.unrealized_pnl, 4),
                     )
                     await self._execute_exit(pos)
@@ -402,18 +489,17 @@ class Bot:
                         "num_positions": len(portfolio.positions),
                     })
 
-                if cycle_count % 60 == 0:
-                    btc_feed = self._exchange_feed.get_feed("BTC")
-                    if btc_feed:
-                        logger.info(
-                            "feed_diag",
-                            btc=round(btc_feed.last_price, 2),
-                            tps=round(btc_feed.ticks_per_second, 1),
-                            ticks=len(btc_feed.ticks),
-                            micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
-                            markets=len(active_markets),
-                            positions=len(self._position_manager.get_portfolio().positions),
-                        )
+                if cycle_count % 60 == 0 and btc_feed:
+                    logger.info(
+                        "feed_diag",
+                        btc=round(btc_feed.last_price, 2),
+                        tps=round(btc_feed.ticks_per_second, 1),
+                        ticks=len(btc_feed.ticks),
+                        micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
+                        markets=len(active_markets),
+                        positions=len(self._position_manager.get_portfolio().positions),
+                        feat_rows=self._features_logger.rows_written,
+                    )
 
                 elapsed = time.time() - cycle_start
                 await asyncio.sleep(max(1.0 - elapsed, 0.1))
@@ -423,11 +509,75 @@ class Bot:
                 self._circuit_breaker.record_api_error()
                 await asyncio.sleep(3)
 
-    async def _on_market_discovered(self, market) -> None:
-        self._data_pipeline.register_market(market)
-        for token_id in market.token_ids:
-            await self._ws_manager.subscribe_market(token_id)
-        logger.info("market_sub", id=market.id[:16], q=market.question[:50])
+    # ──────────────────────────────────────────────────────────────────
+    #  Settlement backfill — mark settled_up for ended markets
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _settlement_backfill_loop(self) -> None:
+        """Every N seconds, query Gamma for resolution status of recently-ended markets."""
+        while self._running:
+            try:
+                await asyncio.sleep(_SETTLEMENT_BACKFILL_INTERVAL)
+                if not self._pending_settlement:
+                    continue
+
+                now = time.time()
+                # Only process markets that have been pending for >=30s (resolution delay)
+                ready = [mid for mid, ts in self._pending_settlement.items() if now - ts >= 30.0]
+                for market_id in ready:
+                    settled = await self._query_market_settlement(market_id)
+                    if settled is not None:
+                        await self._features_logger.backfill_settlement(market_id, settled)
+                        self._backfilled.add(market_id)
+                        self._pending_settlement.pop(market_id, None)
+                    else:
+                        # Still unresolved — retry next cycle, unless it's been >10 min
+                        if now - self._pending_settlement[market_id] > 600.0:
+                            logger.warning("backfill_giveup", m=market_id[:16])
+                            self._pending_settlement.pop(market_id, None)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("backfill_loop_err", error=str(e))
+
+    async def _query_market_settlement(self, market_id: str) -> int | None:
+        """Return 1 if Yes resolved, 0 if No resolved, None if still pending."""
+        if self._backfill_client is None:
+            return None
+        try:
+            resp = await self._backfill_client.get(
+                _GAMMA_MARKETS_URL,
+                params={"condition_ids": market_id, "closed": "true"},
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not item.get("closed"):
+                    continue
+                outcome_prices_raw = item.get("outcomePrices") or item.get("outcome_prices")
+                if not outcome_prices_raw:
+                    continue
+                if isinstance(outcome_prices_raw, str):
+                    import json
+                    try:
+                        outcome_prices = json.loads(outcome_prices_raw)
+                    except Exception:
+                        continue
+                else:
+                    outcome_prices = outcome_prices_raw
+                if not isinstance(outcome_prices, (list, tuple)) or not outcome_prices:
+                    continue
+                try:
+                    yes_price = float(outcome_prices[0])
+                except (TypeError, ValueError):
+                    continue
+                return 1 if yes_price > 0.5 else 0
+        except Exception as e:
+            logger.debug("query_settle_err", m=market_id[:16], error=str(e))
+        return None
 
 
 def cli() -> None:
