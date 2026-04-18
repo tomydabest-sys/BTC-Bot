@@ -1,7 +1,4 @@
-"""Trade analytics — edge, signal quality, and risk metrics.
-
-Drop this file at: src/polybot/dashboard/analytics.py
-"""
+"""Trade analytics — edge, signal quality, risk metrics + overshoot diagnostics."""
 
 from __future__ import annotations
 
@@ -19,7 +16,9 @@ class TradePair:
     strategy: str
     side: str
     entry_price: float
+    entry_target_price: float
     exit_price: float
+    exit_target_price: float
     size: float
     pnl: float
     pnl_pct: float
@@ -27,6 +26,8 @@ class TradePair:
     exit_time: float
     hold_seconds: float
     exit_reason: str
+    entry_slippage: float  # (target - fill) with sign = against us
+    exit_slippage: float
 
 
 def _load_orders(db_path: str, limit: int = 5000) -> list[dict]:
@@ -51,8 +52,16 @@ def _parse_time(s: str) -> float:
         return 0.0
 
 
+def _slippage(side: str, target: float, fill: float) -> float:
+    """Positive = we got worse price than we wanted."""
+    if target <= 0 or fill <= 0:
+        return 0.0
+    if side == "BUY":
+        return fill - target      # paid more than targeted
+    return target - fill          # sold for less than targeted
+
+
 def _pair_trades(orders: list[dict]) -> list[TradePair]:
-    """Match entries and exits into round-trip trades by market_id."""
     orders_sorted = sorted(orders, key=lambda o: o.get("created_at", ""))
     open_positions: dict[str, list[dict]] = defaultdict(list)
     pairs: list[TradePair] = []
@@ -77,9 +86,12 @@ def _pair_trades(orders: list[dict]) -> list[TradePair]:
             entry_time = _parse_time(entry["created_at"])
             exit_time = _parse_time(o["created_at"])
             entry_price = float(entry.get("avg_fill_price") or entry.get("price", 0))
+            entry_target = float(entry.get("price", entry_price))
             exit_price = float(o.get("avg_fill_price") or o.get("price", 0))
+            exit_target = float(o.get("price", exit_price))
             size = float(entry.get("filled_size") or entry.get("size", 0))
             entry_side = entry.get("side", "BUY")
+            exit_side = o.get("side", "SELL")
 
             if entry_side == "BUY":
                 pnl = (exit_price - entry_price) * size
@@ -88,7 +100,13 @@ def _pair_trades(orders: list[dict]) -> list[TradePair]:
 
             pnl_pct = (pnl / (entry_price * size)) if entry_price * size > 0 else 0
 
-            if "auto_exit" in strategy:
+            if "overshoot_tp" in strategy:
+                reason = "overshoot_tp"
+            elif "overshoot_timeout" in strategy:
+                reason = "overshoot_timeout"
+            elif "overshoot_sl" in strategy:
+                reason = "overshoot_sl"
+            elif "auto_exit" in strategy:
                 reason = "auto_close"
             elif "exit_" in strategy:
                 reason = "stop_loss"
@@ -100,7 +118,9 @@ def _pair_trades(orders: list[dict]) -> list[TradePair]:
                 strategy=entry.get("strategy", "unknown"),
                 side=entry_side,
                 entry_price=entry_price,
+                entry_target_price=entry_target,
                 exit_price=exit_price,
+                exit_target_price=exit_target,
                 size=size,
                 pnl=pnl,
                 pnl_pct=pnl_pct,
@@ -108,6 +128,8 @@ def _pair_trades(orders: list[dict]) -> list[TradePair]:
                 exit_time=exit_time,
                 hold_seconds=exit_time - entry_time,
                 exit_reason=reason,
+                entry_slippage=_slippage(entry_side, entry_target, entry_price),
+                exit_slippage=_slippage(exit_side, exit_target, exit_price),
             ))
         except (ValueError, KeyError, TypeError):
             continue
@@ -316,6 +338,77 @@ def compute_time_buckets(pairs: list[TradePair]) -> dict[str, Any]:
     }
 
 
+def compute_overshoot_metrics(pairs: list[TradePair]) -> dict[str, Any]:
+    """Overshoot-reversion strategy diagnostics."""
+    overshoot_pairs = [p for p in pairs if "overshoot_reversion" in (p.strategy or "")]
+
+    if not overshoot_pairs:
+        return {
+            "total_trades": 0,
+            "reversion_rate": 0.0,
+            "avg_time_to_revert_s": 0.0,
+            "median_time_to_revert_s": 0.0,
+            "avg_entry_slippage": 0.0,
+            "avg_exit_slippage": 0.0,
+            "tp_count": 0,
+            "timeout_count": 0,
+            "sl_count": 0,
+            "tp_rate": 0.0,
+            "timeout_rate": 0.0,
+            "sl_rate": 0.0,
+            "avg_pnl": 0.0,
+            "win_rate": 0.0,
+            "expectancy": 0.0,
+            "avg_hold_seconds": 0.0,
+            "total_pnl": 0.0,
+        }
+
+    reverted = [p for p in overshoot_pairs if p.exit_reason == "overshoot_tp"]
+    timeouts = [p for p in overshoot_pairs if p.exit_reason == "overshoot_timeout"]
+    stopouts = [p for p in overshoot_pairs if p.exit_reason in ("overshoot_sl", "stop_loss")]
+
+    wins = [p for p in overshoot_pairs if p.pnl > 0.001]
+    total = len(overshoot_pairs)
+
+    reversion_times = [p.hold_seconds for p in reverted if p.hold_seconds > 0]
+
+    avg_entry_slip = (
+        statistics.mean(p.entry_slippage for p in overshoot_pairs)
+        if overshoot_pairs else 0.0
+    )
+    avg_exit_slip = (
+        statistics.mean(p.exit_slippage for p in overshoot_pairs)
+        if overshoot_pairs else 0.0
+    )
+
+    total_pnl = sum(p.pnl for p in overshoot_pairs)
+    hold_avg = statistics.mean(p.hold_seconds for p in overshoot_pairs)
+
+    return {
+        "total_trades": total,
+        "reversion_rate": round(len(reverted) / total * 100, 2) if total else 0.0,
+        "avg_time_to_revert_s": round(
+            statistics.mean(reversion_times) if reversion_times else 0.0, 1
+        ),
+        "median_time_to_revert_s": round(
+            statistics.median(reversion_times) if reversion_times else 0.0, 1
+        ),
+        "avg_entry_slippage": round(avg_entry_slip, 5),
+        "avg_exit_slippage": round(avg_exit_slip, 5),
+        "tp_count": len(reverted),
+        "timeout_count": len(timeouts),
+        "sl_count": len(stopouts),
+        "tp_rate": round(len(reverted) / total * 100, 2) if total else 0.0,
+        "timeout_rate": round(len(timeouts) / total * 100, 2) if total else 0.0,
+        "sl_rate": round(len(stopouts) / total * 100, 2) if total else 0.0,
+        "avg_pnl": round(total_pnl / total, 4) if total else 0.0,
+        "win_rate": round(len(wins) / total * 100, 2) if total else 0.0,
+        "expectancy": round(total_pnl / total, 4) if total else 0.0,
+        "avg_hold_seconds": round(hold_avg, 1),
+        "total_pnl": round(total_pnl, 4),
+    }
+
+
 def get_full_analytics(db_path: str = "./data/bot.db") -> dict[str, Any]:
     """Main entry point — returns the complete analytics payload."""
     orders = _load_orders(db_path, limit=5000)
@@ -326,6 +419,7 @@ def get_full_analytics(db_path: str = "./data/bot.db") -> dict[str, Any]:
         "signal_analysis": compute_signal_analysis(pairs),
         "risk": compute_risk_metrics(pairs),
         "time_buckets": compute_time_buckets(pairs),
+        "overshoot_metrics": compute_overshoot_metrics(pairs),
         "recent_trades": [
             {
                 "market_id": p.market_id[:16],
@@ -339,6 +433,7 @@ def get_full_analytics(db_path: str = "./data/bot.db") -> dict[str, Any]:
                 "hold_seconds": round(p.hold_seconds, 1),
                 "exit_reason": p.exit_reason,
                 "exit_time": int(p.exit_time),
+                "entry_slippage": round(p.entry_slippage, 5),
             }
             for p in sorted(pairs, key=lambda x: x.exit_time, reverse=True)[:50]
         ],
