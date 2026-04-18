@@ -1,20 +1,22 @@
 """Entry point — BTC Up/Down trading bot.
 
-Integrates:
-  - Feature logger (features.db) — one row per market per cycle
-  - Overshoot-reversion strategy (behavioural-overshoot fade)
-  - Auto-backfill of settled_up once a market resolves
-
-Preserves all existing behaviour: latency_arb, momentum_lag, dual_direction_arb,
-market_maker, monte_carlo, volatility_breakout, calibration_edge, maker_edge.
+Hardened:
+- validate_system() runs before the trading loop.
+- Inner-loop try/except around update_prices, feature logging, and exit execution.
+- Timestamps for pnl_history are proper ISO strings.
+- Dictionary iteration uses defensive list() copies.
 """
 
 from __future__ import annotations
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import asyncio
+import os
 import signal
 import time
 from datetime import datetime
@@ -71,6 +73,8 @@ DEFAULT_PAPER_BALANCE = 500.0
 _NO_SNAPSHOT_WARN_INTERVAL = 60.0
 _SETTLEMENT_BACKFILL_INTERVAL = 60.0
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+_STARTUP_FEED_TIMEOUT_S = 12.0
+_STARTUP_SCAN_TIMEOUT_S = 45.0
 
 
 class Bot:
@@ -82,8 +86,6 @@ class Bot:
         self._orderbook_cache: dict[str, float] = {}
         self._no_snapshot_warn: dict[str, float] = {}
         self._ob_fail_count: dict[str, int] = {}
-
-        # Markets we've seen but not yet backfilled: market_id -> first_seen_missing_ts
         self._pending_settlement: dict[str, float] = {}
         self._backfilled: set[str] = set()
 
@@ -120,10 +122,10 @@ class Bot:
         )
         self._backfill_client: httpx.AsyncClient | None = None
         self._backfill_task: asyncio.Task | None = None
+        self._services_started = False
 
     @staticmethod
     def _safe_env(env_var: str) -> str:
-        import os
         return os.environ.get(env_var, "")
 
     @property
@@ -151,37 +153,202 @@ class Bot:
     @property
     def features_logger(self): return self._features_logger
 
+    # ═════════════════════════════════════════════════════════════════
+    #  STARTUP VALIDATION
+    # ═════════════════════════════════════════════════════════════════
+
+    async def validate_system(self) -> tuple[bool, list[str]]:
+        """Run pre-flight checks. Returns (ok, errors).
+
+        On success: all resources remain initialised and ready for start().
+        On failure: returns a list of human-readable errors, and stop() can be
+        called to tear everything down cleanly.
+        """
+        errors: list[str] = []
+
+        print("\n" + "=" * 60)
+        print("  STARTUP VALIDATION")
+        print("=" * 60)
+
+        # 1. Config sanity
+        print("  [1/6] Config ............................ ", end="", flush=True)
+        try:
+            assert self._config is not None
+            assert self._config.bot.mode in ("paper", "live"), (
+                f"bot.mode must be 'paper' or 'live', got {self._config.bot.mode!r}"
+            )
+            assert self._config.bot.data_dir, "bot.data_dir is empty"
+            if not self._config.strategies.enabled:
+                raise AssertionError("no strategies enabled in config")
+            print("OK")
+        except Exception as e:
+            print("FAIL")
+            errors.append(f"Config invalid: {e}")
+            return False, errors
+
+        # 2. Storage (bot.db)
+        print("  [2/6] Storage (bot.db) .................. ", end="", flush=True)
+        try:
+            await self._storage.initialize()
+            print("OK")
+        except Exception as e:
+            print("FAIL")
+            errors.append(f"Storage initialisation failed: {type(e).__name__}: {e}")
+            return False, errors
+
+        # 3. Features DB (features.db) — verify table exists and is writable
+        print("  [3/6] Features DB (features.db) ......... ", end="", flush=True)
+        try:
+            await self._features_logger.start()
+            unsettled = await self._features_logger.count_unsettled()
+            print(f"OK (existing unsettled rows: {unsettled})")
+        except Exception as e:
+            print("FAIL")
+            errors.append(f"Features logger failed: {type(e).__name__}: {e}")
+            return False, errors
+
+        # 4. HTTP clients + exchange feed (Binance WS)
+        print("  [4/6] Exchange feed (Binance WS) ........ ", end="", flush=True)
+        try:
+            await self._client.start()
+            await self._exchange_feed.start()
+            self._backfill_client = httpx.AsyncClient(timeout=10.0)
+
+            btc = self._exchange_feed.get_feed("BTC")
+            if btc is None:
+                raise RuntimeError("BTC feed not created in ExchangePriceFeed")
+
+            deadline = time.time() + _STARTUP_FEED_TIMEOUT_S
+            while time.time() < deadline:
+                if btc.last_price > 0 and len(btc.ticks) >= 2:
+                    break
+                await asyncio.sleep(0.2)
+
+            if btc.last_price <= 0:
+                raise RuntimeError(
+                    f"No BTC ticks received within {_STARTUP_FEED_TIMEOUT_S}s "
+                    f"(check internet / firewall to stream.binance.com:9443)"
+                )
+            print(f"OK (BTC=${btc.last_price:,.2f}, ticks={len(btc.ticks)})")
+        except Exception as e:
+            print("FAIL")
+            errors.append(f"Exchange feed failed: {type(e).__name__}: {e}")
+            return False, errors
+
+        # 5. Strategies instantiate without error
+        print("  [5/6] Strategies ........................ ", end="", flush=True)
+        try:
+            self._strategies = []
+            for sc in self._config.strategies.enabled:
+                cls = STRATEGY_REGISTRY.get(sc.name)
+                if cls is None:
+                    raise RuntimeError(
+                        f"Strategy {sc.name!r} is not registered. "
+                        f"Available: {sorted(STRATEGY_REGISTRY)}"
+                    )
+                params = {k: v for k, v in sc.params.items() if k != "exchange_symbol"}
+                try:
+                    strategy = cls(**params)
+                except TypeError as te:
+                    raise RuntimeError(
+                        f"{sc.name} init failed: {te}. "
+                        f"Provided params: {list(params)}"
+                    ) from te
+
+                if hasattr(strategy, "set_exchange_feed"):
+                    feed = self._exchange_feed.get_feed(sc.params.get("exchange_symbol", "BTC"))
+                    if feed is not None:
+                        strategy.set_exchange_feed(feed)
+
+                self._strategies.append(strategy)
+
+            if not self._strategies:
+                raise RuntimeError("no strategies loaded")
+            names = ", ".join(s.name for s in self._strategies)
+            print(f"OK ({len(self._strategies)}: {names})")
+        except Exception as e:
+            print("FAIL")
+            errors.append(f"Strategy init failed: {type(e).__name__}: {e}")
+            return False, errors
+
+        # 6. Market scan (at least one BTC up/down market discovered)
+        print("  [6/6] Market scan ....................... ", end="", flush=True)
+        try:
+            markets = await asyncio.wait_for(
+                self._client.get_markets(active=True),
+                timeout=_STARTUP_SCAN_TIMEOUT_S,
+            )
+            from polybot.scanner.scanner import classify_btc_market
+            btc_count = sum(1 for m in markets if classify_btc_market(m.question))
+            if btc_count == 0:
+                raise RuntimeError(
+                    f"no BTC Up/Down markets found (scanned {len(markets)} markets). "
+                    f"Try loosening scanner.btc_timeframes or check Polymarket status."
+                )
+            print(f"OK ({btc_count} BTC Up/Down markets available)")
+        except asyncio.TimeoutError:
+            print("FAIL")
+            errors.append(
+                f"Market scan timed out after {_STARTUP_SCAN_TIMEOUT_S}s "
+                f"(Polymarket Gamma API slow / unreachable)"
+            )
+            return False, errors
+        except Exception as e:
+            print("FAIL")
+            errors.append(f"Market scan failed: {type(e).__name__}: {e}")
+            return False, errors
+
+        self._services_started = True
+        print("=" * 60)
+        print("  VALIDATION PASSED — starting trading loop")
+        print("=" * 60 + "\n")
+        return True, []
+
+    # ═════════════════════════════════════════════════════════════════
+    #  LIFECYCLE
+    # ═════════════════════════════════════════════════════════════════
+
     async def start(self) -> None:
         logger.info("bot_starting", name=self._config.bot.name, mode=self._config.bot.mode)
-        await self._storage.initialize()
-        await self._features_logger.start()
-        await self._client.start()
-        await self._exchange_feed.start()
-        self._backfill_client = httpx.AsyncClient(timeout=10.0)
+
+        # If validate_system() already ran, services are up and strategies loaded.
+        if not self._services_started:
+            await self._storage.initialize()
+            await self._features_logger.start()
+            await self._client.start()
+            await self._exchange_feed.start()
+            if self._backfill_client is None:
+                self._backfill_client = httpx.AsyncClient(timeout=10.0)
+
+            for sc in self._config.strategies.enabled:
+                cls = STRATEGY_REGISTRY.get(sc.name)
+                if not cls:
+                    logger.warning("strategy_not_found", name=sc.name)
+                    continue
+                params = {k: v for k, v in sc.params.items() if k != "exchange_symbol"}
+                try:
+                    strategy = cls(**params)
+                except TypeError as e:
+                    logger.error("strategy_init_failed", name=sc.name, error=str(e))
+                    continue
+                if hasattr(strategy, "set_exchange_feed"):
+                    feed = self._exchange_feed.get_feed(sc.params.get("exchange_symbol", "BTC"))
+                    if feed:
+                        strategy.set_exchange_feed(feed)
+                self._strategies.append(strategy)
+                logger.info("strategy_loaded", name=sc.name)
+
+            self._services_started = True
 
         if self._config.is_live:
-            self._wallet_balance = await self._client.get_balance()
+            try:
+                self._wallet_balance = await self._client.get_balance()
+            except Exception as e:
+                logger.error("get_balance_failed", error=str(e))
+                self._wallet_balance = 0.0
         else:
             self._wallet_balance = DEFAULT_PAPER_BALANCE
             logger.info("paper_balance_set", balance=self._wallet_balance)
-
-        for sc in self._config.strategies.enabled:
-            cls = STRATEGY_REGISTRY.get(sc.name)
-            if not cls:
-                logger.warning("strategy_not_found", name=sc.name)
-                continue
-            params = {k: v for k, v in sc.params.items() if k != "exchange_symbol"}
-            try:
-                strategy = cls(**params)
-            except TypeError as e:
-                logger.error("strategy_init_failed", name=sc.name, error=str(e))
-                continue
-            if hasattr(strategy, "set_exchange_feed"):
-                feed = self._exchange_feed.get_feed(sc.params.get("exchange_symbol", "BTC"))
-                if feed:
-                    strategy.set_exchange_feed(feed)
-            self._strategies.append(strategy)
-            logger.info("strategy_loaded", name=sc.name)
 
         self._event_bus.subscribe("market_discovered", self._on_market_discovered)
         self._event_bus.subscribe("market_removed", self._on_market_removed)
@@ -209,85 +376,110 @@ class Bot:
                 await self._backfill_task
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            await self._scanner.stop()
-        except Exception:
-            pass
-        try:
-            await self._ws_manager.stop()
-        except Exception:
-            pass
-        try:
-            await self._exchange_feed.stop()
-        except Exception:
-            pass
-        try:
-            await self._client.close()
-        except Exception:
-            pass
+        for coro, name in [
+            (self._scanner.stop(), "scanner"),
+            (self._ws_manager.stop(), "ws_manager"),
+            (self._exchange_feed.stop(), "exchange_feed"),
+            (self._client.close(), "client"),
+            (self._features_logger.stop(), "features_logger"),
+            (self._storage.close(), "storage"),
+        ]:
+            try:
+                await coro
+            except Exception as e:
+                logger.error("stop_err", component=name, error=str(e))
         if self._backfill_client:
             try:
                 await self._backfill_client.aclose()
             except Exception:
                 pass
-        try:
-            await self._features_logger.stop()
-        except Exception:
-            pass
-        try:
-            await self._storage.close()
-        except Exception:
-            pass
         logger.info("bot_stopped")
 
+    # ═════════════════════════════════════════════════════════════════
+    #  EVENT HANDLERS
+    # ═════════════════════════════════════════════════════════════════
+
     async def _on_order_filled(self, order: Order, **kwargs) -> None:
-        self._position_manager.update_from_fill(order)
-        if not order.strategy.startswith("exit_") and not order.strategy.startswith("auto_exit"):
-            self._last_trade_time = time.time()
-
-        if order.avg_fill_price > 0 and order.filled_size > 0:
-            portfolio = self._position_manager.get_portfolio()
-            self._circuit_breaker.record_trade_result(portfolio.daily_pnl)
-
         try:
-            from polybot.dashboard.app import log_trade
-            log_trade({
-                "market_id": order.market_id, "side": order.side.value,
-                "price": order.avg_fill_price, "size": order.filled_size,
-                "strategy": order.strategy, "order_id": order.order_id,
-                "target_price": order.price,
-            })
-        except ImportError:
-            pass
+            self._position_manager.update_from_fill(order)
+            if not order.strategy.startswith("exit_") and not order.strategy.startswith("auto_exit"):
+                self._last_trade_time = time.time()
+
+            if order.avg_fill_price > 0 and order.filled_size > 0:
+                portfolio = self._position_manager.get_portfolio()
+                self._circuit_breaker.record_trade_result(portfolio.daily_pnl)
+
+            try:
+                from polybot.dashboard.app import log_trade
+                log_trade({
+                    "market_id": order.market_id,
+                    "side": order.side.value,
+                    "price": order.avg_fill_price,
+                    "size": order.filled_size,
+                    "strategy": order.strategy,
+                    "order_id": order.order_id,
+                    "target_price": order.price,
+                })
+            except (ImportError, Exception) as e:
+                logger.debug("dashboard_log_trade_err", error=str(e))
+        except Exception as e:
+            logger.error("on_order_filled_err", error=str(e), error_type=type(e).__name__)
 
     async def _on_market_discovered(self, market) -> None:
-        self._data_pipeline.register_market(market)
-        for token_id in market.token_ids:
-            await self._ws_manager.subscribe_market(token_id)
-        logger.info("market_sub", id=market.id[:16], q=market.question[:50])
+        try:
+            self._data_pipeline.register_market(market)
+            for token_id in market.token_ids:
+                try:
+                    await self._ws_manager.subscribe_market(token_id)
+                except Exception as e:
+                    logger.warning("ws_subscribe_err", token_id=token_id[:16], error=str(e))
+            logger.info("market_sub", id=market.id[:16], q=market.question[:50])
+        except Exception as e:
+            logger.error("on_market_discovered_err", error=str(e))
 
     async def _on_market_removed(self, market_id: str, **kwargs) -> None:
-        if market_id not in self._backfilled:
-            self._pending_settlement[market_id] = time.time()
+        try:
+            if market_id not in self._backfilled:
+                self._pending_settlement[market_id] = time.time()
+            self._data_pipeline.unregister_market(market_id)
+        except Exception as e:
+            logger.warning("on_market_removed_err", error=str(e))
+
+    # ═════════════════════════════════════════════════════════════════
+    #  HELPERS
+    # ═════════════════════════════════════════════════════════════════
 
     def _market_time_remaining(self, market) -> float:
-        now = datetime.utcnow()
-        end = market.end_date.replace(tzinfo=None) if market.end_date.tzinfo else market.end_date
-        return (end - now).total_seconds()
+        try:
+            now = datetime.utcnow()
+            end = market.end_date
+            if getattr(end, "tzinfo", None) is not None:
+                end = end.replace(tzinfo=None)
+            return (end - now).total_seconds()
+        except Exception:
+            return 0.0
 
-    async def _execute_exit(self, pos) -> None:
-        close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
-        close_order = Order(
-            market_id=pos.market_id, token_id=pos.token_id,
-            side=close_side, price=pos.current_price, size=pos.size,
-            order_type=OrderType.LIMIT, strategy=f"exit_{pos.strategy}",
-        )
-        saved_time = self._last_trade_time
-        self._last_trade_time = 0
-        portfolio = self._position_manager.get_portfolio()
-        result = await self._execution_engine.execute_order(close_order, portfolio)
-        self._last_trade_time = saved_time
-        return result
+    async def _execute_exit(self, pos):
+        try:
+            close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+            close_order = Order(
+                market_id=pos.market_id,
+                token_id=pos.token_id,
+                side=close_side,
+                price=pos.current_price if pos.current_price > 0 else pos.avg_entry_price,
+                size=pos.size,
+                order_type=OrderType.LIMIT,
+                strategy=f"exit_{pos.strategy}",
+            )
+            saved_time = self._last_trade_time
+            self._last_trade_time = 0
+            portfolio = self._position_manager.get_portfolio()
+            result = await self._execution_engine.execute_order(close_order, portfolio)
+            self._last_trade_time = saved_time
+            return result
+        except Exception as e:
+            logger.error("execute_exit_err", market=pos.market_id[:16], error=str(e))
+            return None
 
     async def _fetch_orderbook_throttled(self, market_id: str, token_id: str) -> bool:
         now = time.time()
@@ -311,6 +503,10 @@ class Bot:
                 )
             return False
 
+    # ═════════════════════════════════════════════════════════════════
+    #  TRADING LOOP
+    # ═════════════════════════════════════════════════════════════════
+
     async def _trading_loop(self) -> None:
         cycle_count = 0
 
@@ -324,197 +520,264 @@ class Bot:
                     continue
 
                 if self._config.is_live and cycle_count % 30 == 0:
-                    bal = await self._client.get_balance()
-                    if bal > 0:
-                        self._wallet_balance = bal
+                    try:
+                        bal = await self._client.get_balance()
+                        if bal > 0:
+                            self._wallet_balance = bal
+                    except Exception as e:
+                        logger.debug("balance_refresh_err", error=str(e))
 
                 min_interval = self._config.risk.min_trade_interval_seconds
                 since_last = time.time() - self._last_trade_time
                 in_cooldown = since_last < min_interval and self._last_trade_time > 0
 
                 active_markets = self._scanner.active_markets
-                sorted_markets = sorted(
-                    active_markets.items(),
-                    key=lambda x: self._market_time_remaining(x[1]),
-                    reverse=True,
-                )
+                try:
+                    sorted_markets = sorted(
+                        active_markets.items(),
+                        key=lambda x: self._market_time_remaining(x[1]),
+                        reverse=True,
+                    )
+                except Exception as e:
+                    logger.warning("market_sort_err", error=str(e))
+                    sorted_markets = list(active_markets.items())
 
                 traded_this_cycle = False
                 btc_feed = self._exchange_feed.get_feed("BTC")
 
                 for market_id, market in sorted_markets:
-                    time_left = self._market_time_remaining(market)
-
-                    # Auto-close expiring positions
-                    if time_left < 30:
-                        for p in list(self._position_manager.get_portfolio().positions):
-                            if p.market_id == market_id:
-                                logger.info(
-                                    "auto_close",
-                                    m=market_id[:12],
-                                    t=round(time_left),
-                                    pnl=round(p.unrealized_pnl, 4),
-                                )
-                                await self._execute_exit(p)
-                        continue
-
-                    if time_left < 60:
-                        continue
-
-                    if market.token_ids:
-                        await self._fetch_orderbook_throttled(market_id, market.token_ids[0])
-
-                    snapshot = self._data_pipeline.get_snapshot(market_id)
-                    if not snapshot:
-                        now = time.time()
-                        last_warn = self._no_snapshot_warn.get(market_id, 0.0)
-                        if now - last_warn > _NO_SNAPSHOT_WARN_INTERVAL:
-                            self._no_snapshot_warn[market_id] = now
-                            ob_fails = self._ob_fail_count.get(market_id, 0)
-                            logger.warning(
-                                "no_snapshot",
-                                m=market_id[:12],
-                                ob_fails=ob_fails,
-                                hint="Check CLOB orderbook API or token_id validity",
-                            )
-                        continue
-
-                    self._position_manager.update_prices(market_id, snapshot.orderbook.mid_price)
-
-                    # ── FEATURE LOGGING ───────────────────────────────────
                     try:
-                        await self._features_logger.log_snapshot(
-                            market_id=market_id,
-                            snapshot=snapshot,
-                            btc_feed=btc_feed,
-                            time_remaining=time_left,
-                        )
-                    except Exception as e:
-                        logger.debug("feat_log_err", m=market_id[:12], error=str(e))
+                        time_left = self._market_time_remaining(market)
 
-                    if in_cooldown or traded_this_cycle:
-                        continue
+                        if time_left < 30:
+                            try:
+                                for p in list(self._position_manager.get_portfolio().positions):
+                                    if p.market_id == market_id:
+                                        logger.info(
+                                            "auto_close",
+                                            m=market_id[:12],
+                                            t=round(time_left),
+                                            pnl=round(p.unrealized_pnl, 4),
+                                        )
+                                        await self._execute_exit(p)
+                            except Exception as e:
+                                logger.warning("auto_close_err", m=market_id[:12], error=str(e))
+                            continue
 
-                    # ── STRATEGY EVALUATION ───────────────────────────────
-                    signals = []
-                    for strategy in self._strategies:
+                        if time_left < 60:
+                            continue
+
+                        if market.token_ids:
+                            await self._fetch_orderbook_throttled(market_id, market.token_ids[0])
+
+                        snapshot = None
                         try:
-                            sig = await strategy.evaluate(snapshot)
-                            if sig:
-                                signals.append(sig)
-                                logger.info(
-                                    "signal",
-                                    s=sig.strategy,
-                                    d=sig.direction.value,
-                                    c=round(sig.confidence, 3),
-                                    m=market_id[:12],
-                                    t=round(time_left),
-                                    r=sig.reason[:100],
-                                )
-                                try:
-                                    from polybot.dashboard.app import log_signal
-                                    log_signal({
-                                        "market_id": sig.market_id,
-                                        "strategy": sig.strategy,
-                                        "direction": sig.direction.value,
-                                        "confidence": round(sig.confidence, 3),
-                                        "reason": sig.reason,
-                                        "target_price": round(sig.target_price, 4),
-                                        "size_pct": round(sig.size_pct, 4),
-                                    })
-                                except ImportError:
-                                    pass
+                            snapshot = self._data_pipeline.get_snapshot(market_id)
                         except Exception as e:
-                            logger.debug("strat_err", s=strategy.name, e=str(e))
+                            logger.debug("snapshot_err", m=market_id[:12], error=str(e))
 
-                    final_signals = self._aggregator.aggregate(signals)
-                    for sig in final_signals:
-                        portfolio = self._position_manager.get_portfolio()
-                        balance = self._wallet_balance if self._wallet_balance > 0 else DEFAULT_PAPER_BALANCE
-                        order_type = (
-                            OrderType.GTC
-                            if sig.metadata.get("is_maker_only") or sig.metadata.get("is_market_maker")
-                            else OrderType.LIMIT
+                        if not snapshot:
+                            now = time.time()
+                            last_warn = self._no_snapshot_warn.get(market_id, 0.0)
+                            if now - last_warn > _NO_SNAPSHOT_WARN_INTERVAL:
+                                self._no_snapshot_warn[market_id] = now
+                                ob_fails = self._ob_fail_count.get(market_id, 0)
+                                logger.warning(
+                                    "no_snapshot",
+                                    m=market_id[:12],
+                                    ob_fails=ob_fails,
+                                    hint="Check CLOB orderbook API or token_id validity",
+                                )
+                            continue
+
+                        try:
+                            self._position_manager.update_prices(
+                                market_id, snapshot.orderbook.mid_price
+                            )
+                        except Exception as e:
+                            logger.debug("update_prices_err", m=market_id[:12], error=str(e))
+
+                        try:
+                            await self._features_logger.log_snapshot(
+                                market_id=market_id,
+                                snapshot=snapshot,
+                                btc_feed=btc_feed,
+                                time_remaining=time_left,
+                            )
+                        except Exception as e:
+                            logger.debug("feat_log_err", m=market_id[:12], error=str(e))
+
+                        if in_cooldown or traded_this_cycle:
+                            continue
+
+                        signals = []
+                        for strategy in self._strategies:
+                            try:
+                                sig = await strategy.evaluate(snapshot)
+                                if sig:
+                                    signals.append(sig)
+                                    logger.info(
+                                        "signal",
+                                        s=sig.strategy,
+                                        d=sig.direction.value,
+                                        c=round(sig.confidence, 3),
+                                        m=market_id[:12],
+                                        t=round(time_left),
+                                        r=sig.reason[:100],
+                                    )
+                                    try:
+                                        from polybot.dashboard.app import log_signal
+                                        log_signal({
+                                            "market_id": sig.market_id,
+                                            "strategy": sig.strategy,
+                                            "direction": sig.direction.value,
+                                            "confidence": round(sig.confidence, 3),
+                                            "reason": sig.reason,
+                                            "target_price": round(sig.target_price, 4),
+                                            "size_pct": round(sig.size_pct, 4),
+                                        })
+                                    except (ImportError, Exception):
+                                        pass
+                            except Exception as e:
+                                logger.debug(
+                                    "strat_err",
+                                    s=getattr(strategy, "name", "?"),
+                                    e=str(e),
+                                )
+
+                        try:
+                            final_signals = self._aggregator.aggregate(signals)
+                        except Exception as e:
+                            logger.warning("aggregate_err", error=str(e))
+                            final_signals = []
+
+                        for sig in final_signals:
+                            try:
+                                portfolio = self._position_manager.get_portfolio()
+                                balance = (
+                                    self._wallet_balance
+                                    if self._wallet_balance > 0
+                                    else DEFAULT_PAPER_BALANCE
+                                )
+                                order_type = (
+                                    OrderType.GTC
+                                    if sig.metadata.get("is_maker_only")
+                                    or sig.metadata.get("is_market_maker")
+                                    else OrderType.LIMIT
+                                )
+                                order = Order(
+                                    market_id=sig.market_id,
+                                    token_id=market.token_ids[0] if market.token_ids else "",
+                                    side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
+                                    price=sig.target_price,
+                                    size=sig.size_pct * balance,
+                                    order_type=order_type,
+                                    strategy=sig.strategy,
+                                )
+                                order.size *= self._circuit_breaker.size_multiplier
+                                filled = await self._execution_engine.execute_order(order, portfolio)
+                                if filled.filled_size > 0:
+                                    traded_this_cycle = True
+                                try:
+                                    await self._storage.save_order({
+                                        "order_id": filled.order_id,
+                                        "market_id": filled.market_id,
+                                        "token_id": filled.token_id,
+                                        "side": filled.side.value,
+                                        "price": filled.price,
+                                        "size": filled.size,
+                                        "order_type": filled.order_type.value,
+                                        "status": filled.status.value,
+                                        "strategy": filled.strategy,
+                                        "signal_id": filled.signal_id,
+                                        "filled_size": filled.filled_size,
+                                        "avg_fill_price": filled.avg_fill_price,
+                                        "created_at": filled.created_at.isoformat(),
+                                        "updated_at": filled.created_at.isoformat(),
+                                    })
+                                except Exception as e:
+                                    logger.warning("save_order_err", error=str(e))
+                            except Exception as e:
+                                logger.error("signal_execution_err", error=str(e))
+
+                    except Exception as e:
+                        logger.error(
+                            "market_cycle_err",
+                            m=market_id[:16],
+                            error=str(e),
+                            error_type=type(e).__name__,
                         )
-                        order = Order(
-                            market_id=sig.market_id,
-                            token_id=market.token_ids[0] if market.token_ids else "",
-                            side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
-                            price=sig.target_price,
-                            size=sig.size_pct * balance,
-                            order_type=order_type,
-                            strategy=sig.strategy,
-                        )
-                        order.size *= self._circuit_breaker.size_multiplier
-                        filled = await self._execution_engine.execute_order(order, portfolio)
-                        if filled.filled_size > 0:
-                            traded_this_cycle = True
-                        await self._storage.save_order({
-                            "order_id": filled.order_id,
-                            "market_id": filled.market_id,
-                            "token_id": filled.token_id,
-                            "side": filled.side.value,
-                            "price": filled.price,
-                            "size": filled.size,
-                            "order_type": filled.order_type.value,
-                            "status": filled.status.value,
-                            "strategy": filled.strategy,
-                            "signal_id": filled.signal_id,
-                            "filled_size": filled.filled_size,
-                            "avg_fill_price": filled.avg_fill_price,
-                            "created_at": filled.created_at.isoformat(),
-                            "updated_at": filled.created_at.isoformat(),
-                        })
+                        continue
 
                 # Stop-loss / strategy-specific exits
-                exits = self._position_manager.check_exits()
+                try:
+                    exits = self._position_manager.check_exits()
+                except Exception as e:
+                    logger.warning("check_exits_err", error=str(e))
+                    exits = []
+
                 for exit_signal in exits:
-                    pos = exit_signal.position
-                    logger.info(
-                        "exit_exec",
-                        m=pos.market_id[:12],
-                        reason=exit_signal.reason[:60],
-                        pnl=round(pos.unrealized_pnl, 4),
-                    )
-                    await self._execute_exit(pos)
+                    try:
+                        pos = exit_signal.position
+                        logger.info(
+                            "exit_exec",
+                            m=pos.market_id[:12],
+                            reason=exit_signal.reason[:60],
+                            pnl=round(pos.unrealized_pnl, 4),
+                        )
+                        await self._execute_exit(pos)
+                    except Exception as e:
+                        logger.error("exit_exec_err", error=str(e))
 
                 if cycle_count % 10 == 0:
-                    portfolio = self._position_manager.get_portfolio()
-                    portfolio.balance = self._wallet_balance
-                    await self._storage.save_pnl_snapshot({
-                        "timestamp": asyncio.get_event_loop().time(),
-                        "realized_pnl": portfolio.realized_pnl,
-                        "unrealized_pnl": portfolio.unrealized_pnl,
-                        "total_exposure": portfolio.total_exposure,
-                        "num_positions": len(portfolio.positions),
-                    })
+                    try:
+                        portfolio = self._position_manager.get_portfolio()
+                        portfolio.balance = self._wallet_balance
+                        await self._storage.save_pnl_snapshot({
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "realized_pnl": portfolio.realized_pnl,
+                            "unrealized_pnl": portfolio.unrealized_pnl,
+                            "total_exposure": portfolio.total_exposure,
+                            "num_positions": len(portfolio.positions),
+                        })
+                    except Exception as e:
+                        logger.debug("pnl_snapshot_err", error=str(e))
 
                 if cycle_count % 60 == 0 and btc_feed:
-                    logger.info(
-                        "feed_diag",
-                        btc=round(btc_feed.last_price, 2),
-                        tps=round(btc_feed.ticks_per_second, 1),
-                        ticks=len(btc_feed.ticks),
-                        micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
-                        markets=len(active_markets),
-                        positions=len(self._position_manager.get_portfolio().positions),
-                        feat_rows=self._features_logger.rows_written,
-                    )
+                    try:
+                        logger.info(
+                            "feed_diag",
+                            btc=round(btc_feed.last_price, 2),
+                            tps=round(btc_feed.ticks_per_second, 1),
+                            ticks=len(btc_feed.ticks),
+                            micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
+                            markets=len(active_markets),
+                            positions=len(self._position_manager.get_portfolio().positions),
+                            feat_rows=self._features_logger.rows_written,
+                        )
+                    except Exception:
+                        pass
 
                 elapsed = time.time() - cycle_start
                 await asyncio.sleep(max(1.0 - elapsed, 0.1))
 
             except Exception as e:
-                logger.error("loop_error", error=str(e))
-                self._circuit_breaker.record_api_error()
+                logger.error(
+                    "loop_error",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                try:
+                    self._circuit_breaker.record_api_error()
+                except Exception:
+                    pass
                 await asyncio.sleep(3)
 
-    # ──────────────────────────────────────────────────────────────────
-    #  Settlement backfill — mark settled_up for ended markets
-    # ──────────────────────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════
+    #  SETTLEMENT BACKFILL
+    # ═════════════════════════════════════════════════════════════════
 
     async def _settlement_backfill_loop(self) -> None:
-        """Every N seconds, query Gamma for resolution status of recently-ended markets."""
         while self._running:
             try:
                 await asyncio.sleep(_SETTLEMENT_BACKFILL_INTERVAL)
@@ -522,19 +785,23 @@ class Bot:
                     continue
 
                 now = time.time()
-                # Only process markets that have been pending for >=30s (resolution delay)
-                ready = [mid for mid, ts in self._pending_settlement.items() if now - ts >= 30.0]
+                ready = [
+                    mid for mid, ts in list(self._pending_settlement.items())
+                    if now - ts >= 30.0
+                ]
                 for market_id in ready:
-                    settled = await self._query_market_settlement(market_id)
-                    if settled is not None:
-                        await self._features_logger.backfill_settlement(market_id, settled)
-                        self._backfilled.add(market_id)
-                        self._pending_settlement.pop(market_id, None)
-                    else:
-                        # Still unresolved — retry next cycle, unless it's been >10 min
-                        if now - self._pending_settlement[market_id] > 600.0:
-                            logger.warning("backfill_giveup", m=market_id[:16])
+                    try:
+                        settled = await self._query_market_settlement(market_id)
+                        if settled is not None:
+                            await self._features_logger.backfill_settlement(market_id, settled)
+                            self._backfilled.add(market_id)
                             self._pending_settlement.pop(market_id, None)
+                        else:
+                            if now - self._pending_settlement.get(market_id, now) > 600.0:
+                                logger.warning("backfill_giveup", m=market_id[:16])
+                                self._pending_settlement.pop(market_id, None)
+                    except Exception as e:
+                        logger.debug("backfill_one_err", m=market_id[:16], error=str(e))
 
             except asyncio.CancelledError:
                 break
@@ -542,7 +809,6 @@ class Bot:
                 logger.error("backfill_loop_err", error=str(e))
 
     async def _query_market_settlement(self, market_id: str) -> int | None:
-        """Return 1 if Yes resolved, 0 if No resolved, None if still pending."""
         if self._backfill_client is None:
             return None
         try:
@@ -591,6 +857,7 @@ def cli() -> None:
     parser = argparse.ArgumentParser(description="Polymarket Trading Bot")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--mode", choices=["paper", "live"])
+    parser.add_argument("--skip-validation", action="store_true")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -612,10 +879,26 @@ def cli() -> None:
         bot._running = False
 
     signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    try:
+        signal.signal(signal.SIGTERM, handle_signal)
+    except (ValueError, AttributeError):
+        pass
+
+    async def main_async():
+        if not args.skip_validation:
+            ok, errors = await bot.validate_system()
+            if not ok:
+                for err in errors:
+                    print(f"[x] {err}")
+                try:
+                    await bot.stop()
+                except Exception:
+                    pass
+                return
+        await bot.start()
 
     try:
-        loop.run_until_complete(bot.start())
+        loop.run_until_complete(main_async())
     except KeyboardInterrupt:
         pass
     finally:
@@ -629,7 +912,10 @@ def cli() -> None:
         for t in pending:
             t.cancel()
         if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
         loop.close()
 
 
