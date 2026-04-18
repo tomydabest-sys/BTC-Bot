@@ -21,25 +21,39 @@ scanner:
 
 strategies:
   enabled:
+    # ── PRIMARY STRATEGY (new) ───────────────────────────────────
+    - name: "overshoot_reversion"
+      weight: 1.0
+      params:
+        min_poly_burst: 0.025         # 2.5c Polymarket burst minimum
+        min_overshoot: 0.020          # 2.0c overshoot vs GBM fair
+        max_overshoot: 0.120          # cap — beyond = news event
+        min_time_remaining: 90.0      # need runway for reversion
+        min_poly_mid: 0.25
+        max_poly_mid: 0.75
+        max_spread: 0.030             # 3c max spread at entry
+        min_btc_move_confirm: 0.0005  # 0.05% BTC confirmation
+        size_pct: 0.05
+        confidence_floor: 0.55
+        window_seconds: 300.0
+        exchange_symbol: "BTC"
+
+    # ── LEGACY STRATEGIES (kept for comparison) ──────────────────
     - name: "latency_arb"
       weight: 1.0
       params:
-        # Relaxed from 0.01 — tight BTC 5-min markets need lower threshold
         min_gap_pct: 0.008
         max_gap_pct: 0.25
-        # Relaxed from 0.002 — catches more moves in ranging conditions
         min_exchange_move_pct: 0.0015
         fee_buffer_pct: 0.003
         size_pct: 0.04
         confidence_floor: 0.55
         exchange_symbol: "BTC"
-        # Micro-lag predictor: extrapolates BTC 500ms forward
         enable_micro_lag: true
 
     - name: "momentum_lag"
       weight: 1.0
       params:
-        # Relaxed from 0.002/0.004 — BTC was ranging 0.15-0.37% during dead period
         min_move_30s_pct: 0.0015
         min_move_60s_pct: 0.0025
         min_gap_pct: 0.008
@@ -65,7 +79,6 @@ risk:
   max_portfolio_exposure: 150
   max_positions: 5
   max_daily_loss: 25
-  # Reduced from 8s — allows faster re-entry on different markets
   min_trade_interval_seconds: 5
   max_order_size: 20
   max_slippage_pct: 5.0
