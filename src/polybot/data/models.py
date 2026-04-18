@@ -19,8 +19,8 @@ class Direction(str, Enum):
 
 class OrderType(str, Enum):
     LIMIT = "LIMIT"
-    FOK = "FOK"  # Fill or Kill
-    GTC = "GTC"  # Good Till Cancelled
+    FOK = "FOK"
+    GTC = "GTC"
 
 
 class OrderStatus(str, Enum):
@@ -118,6 +118,9 @@ class MarketSnapshot:
     volume_profile: dict = field(default_factory=dict)
     volatility_1h: float = 0.0
     price_history: list[float] = field(default_factory=list)
+    # Polymarket mid-price deltas — populated by DataPipeline
+    poly_move_5s: float = 0.0
+    poly_move_30s: float = 0.0
 
 
 @dataclass
@@ -228,4 +231,4 @@ class RiskCheckResult:
 class ExitSignal:
     position: Position
     reason: str
-    urgency: str = "normal"  # "normal" or "immediate"
+    urgency: str = "normal"
