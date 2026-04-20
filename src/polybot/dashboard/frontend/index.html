@@ -203,7 +203,7 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
       <div class="hero-stat">
         <div class="stat-label">PROFIT FACTOR</div>
         <div class="stat-value" id="o-profitFactor">—</div>
-        <div class="stat-sub">>1.5 = good</div>
+        <div class="stat-sub">&gt;1.5 = good</div>
       </div>
       <div class="hero-stat">
         <div class="stat-label">EXPECTANCY</div>
@@ -234,7 +234,7 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
       <div class="grid grid-4">
         <div class="stat"><div class="stat-label">TOTAL TRADES</div><div class="stat-value" id="e-trades">0</div></div>
         <div class="stat"><div class="stat-label">WIN RATE</div><div class="stat-value" id="e-winrate">—</div><div class="stat-sub" id="e-winrate-sub"></div></div>
-        <div class="stat"><div class="stat-label">PROFIT FACTOR</div><div class="stat-value" id="e-pf">—</div><div class="stat-sub">>1.5 = good</div></div>
+        <div class="stat"><div class="stat-label">PROFIT FACTOR</div><div class="stat-value" id="e-pf">—</div><div class="stat-sub">&gt;1.5 = good</div></div>
         <div class="stat"><div class="stat-label">EXPECTANCY</div><div class="stat-value" id="e-exp">—</div><div class="stat-sub">avg per trade</div></div>
       </div>
     </div>
@@ -260,7 +260,7 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
           <div class="stat"><div class="stat-label">BREAKEVEN</div><div class="stat-value" id="e-be">—</div></div>
         </div>
         <div style="margin-top:14px;padding:12px;background:var(--bg-2);border-radius:var(--radius-sm);font-size:0.78rem;color:var(--t2);line-height:1.5">
-          <strong style="color:var(--t1)">Reading the numbers:</strong> Profit factor >1.5 with positive expectancy and Sharpe-like >1.0 suggests real edge. Below 50 trades, treat as preliminary — variance dominates.
+          <strong style="color:var(--t1)">Reading the numbers:</strong> Profit factor &gt;1.5 with positive expectancy and Sharpe-like &gt;1.0 suggests real edge. Below 50 trades, treat as preliminary — variance dominates.
         </div>
       </div>
     </div>
@@ -528,6 +528,23 @@ function updateDdChart(curve) {
   ddChart.update('none');
 }
 
+// --- BTC price extraction (fixed) -----------------------------------------
+// /api/exchange-prices returns: { prices: { BTC: { price: N, change_60s, ... } } }
+// We must drill down to .price — not stringify the whole object.
+function extractBtcPrice(payload) {
+  if (!payload) return 0;
+  const feeds = payload.prices || payload;
+  if (!feeds) return 0;
+  const btcEntry = feeds.BTC;
+  if (btcEntry === undefined || btcEntry === null) return 0;
+  // Handle both shapes: { BTC: { price: N } } (current) or { BTC: N } (legacy)
+  if (typeof btcEntry === 'number') return btcEntry;
+  if (typeof btcEntry === 'object' && typeof btcEntry.price === 'number') {
+    return btcEntry.price;
+  }
+  return 0;
+}
+
 async function refreshAll() {
   const [analytics, status, prices, portfolio] = await Promise.all([
     fetchJSON('/api/analytics'),
@@ -545,10 +562,10 @@ async function refreshAll() {
     document.getElementById('pulseEl').style.background = status.running ? 'var(--green)' : 'var(--red)';
   }
 
-  if (prices) {
-    const btc = (prices.prices && prices.prices.BTC) || prices.BTC || 0;
-    document.getElementById('btcPrice').textContent = btc ? '$' + btc.toLocaleString(undefined, {maximumFractionDigits: 0}) : '—';
-  }
+  const btc = extractBtcPrice(prices);
+  document.getElementById('btcPrice').textContent = btc
+    ? '$' + btc.toLocaleString(undefined, { maximumFractionDigits: 0 })
+    : '—';
 
   if (portfolio) {
     document.getElementById('r-exposure').textContent = '$' + (portfolio.total_exposure || 0).toFixed(0);
