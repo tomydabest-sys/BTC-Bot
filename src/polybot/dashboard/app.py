@@ -1,7 +1,11 @@
-"""FastAPI dashboard for the Polymarket trading bot."""
-from __future__ import annotations
+"""FastAPI dashboard for the Polymarket trading bot.
 
-from polybot.dashboard.analytics import get_full_analytics
+Fixes:
+- HTML served with explicit UTF-8 encoding and charset declaration (prevents
+  the "â€"" / "Â·" mojibake on Windows when read_text() defaults to cp1252).
+- Robust handling of _bot being None in WebSocket push loop.
+"""
+from __future__ import annotations
 
 import asyncio
 import json
@@ -11,45 +15,39 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import structlog
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
-import structlog
+from polybot.dashboard.analytics import get_full_analytics
 
 logger = structlog.get_logger()
 
-# The bot instance is set by the launcher
 _bot = None
 _trade_log: list[dict] = []
 _signal_log: list[dict] = []
 
 MAX_LOG_SIZE = 500
 
-# --- Terminal log streaming ---
 _terminal_clients: list[WebSocket] = []
 _terminal_buffer: deque[str] = deque(maxlen=500)
 
 
 class WebSocketLogHandler(logging.Handler):
-    """Captures Python log records and pushes them to terminal WebSocket clients."""
-
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
             _terminal_buffer.append(msg)
-            # Schedule broadcast (non-blocking)
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(_broadcast_terminal(msg))
             except RuntimeError:
-                pass  # No running loop yet
+                pass
         except Exception:
             pass
 
 
 async def _broadcast_terminal(line: str) -> None:
-    """Send a log line to all terminal WebSocket clients."""
     if not _terminal_clients:
         return
     disconnected = []
@@ -75,13 +73,10 @@ def get_bot():
 
 app = FastAPI(title="PolyBot Dashboard", version="1.0.0")
 
-
-# --- WebSocket connections for real-time updates ---
 _ws_clients: list[WebSocket] = []
 
 
 async def broadcast(data: dict) -> None:
-    """Broadcast JSON data to all connected WebSocket clients."""
     message = json.dumps(data, default=str)
     disconnected = []
     for ws in _ws_clients:
@@ -90,10 +85,9 @@ async def broadcast(data: dict) -> None:
         except Exception:
             disconnected.append(ws)
     for ws in disconnected:
-        _ws_clients.remove(ws)
+        if ws in _ws_clients:
+            _ws_clients.remove(ws)
 
-
-# --- REST API Endpoints ---
 
 @app.get("/api/status")
 async def get_status() -> dict:
@@ -184,7 +178,8 @@ async def get_strategies() -> dict:
         "available": list(
             {"mean_reversion", "momentum", "latency_arb", "momentum_lag",
              "volatility_breakout", "dual_direction_arb", "market_maker",
-             "monte_carlo", "calibration_edge", "maker_edge"}
+             "monte_carlo", "calibration_edge", "maker_edge",
+             "overshoot_reversion"}
         ),
     }
 
@@ -253,14 +248,15 @@ async def get_trades() -> dict:
 async def get_signals() -> dict:
     return {"signals": _signal_log[-100:], "total": len(_signal_log)}
 
+
 @app.get("/api/analytics")
 async def api_analytics():
-    """Comprehensive trade analytics: edge, signal quality, risk metrics."""
-    db_path = "./data/bot.db"  # Adjust if your data dir differs
+    db_path = "./data/bot.db"
     try:
         return get_full_analytics(db_path)
     except Exception as e:
         return {"error": str(e), "edge": {}, "signal_analysis": {}, "risk": {}}
+
 
 @app.post("/api/bot/stop")
 async def stop_bot() -> dict:
@@ -271,15 +267,13 @@ async def stop_bot() -> dict:
     return {"status": "not_running"}
 
 
-# --- WebSocket for live updates ---
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     _ws_clients.append(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
+            await websocket.receive_text()
     except WebSocketDisconnect:
         if websocket in _ws_clients:
             _ws_clients.remove(websocket)
@@ -287,10 +281,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/terminal")
 async def terminal_websocket(websocket: WebSocket) -> None:
-    """Stream bot logs to an xterm.js terminal in the dashboard."""
     await websocket.accept()
     _terminal_clients.append(websocket)
-    # Send buffered history so new clients see recent logs
     for line in _terminal_buffer:
         try:
             await websocket.send_text(json.dumps({"type": "log", "data": line}))
@@ -304,10 +296,7 @@ async def terminal_websocket(websocket: WebSocket) -> None:
             _terminal_clients.remove(websocket)
 
 
-# --- Background task to push updates ---
-
 async def _push_updates_loop() -> None:
-    """Periodically push state to all connected WebSocket clients."""
     while True:
         try:
             bot = get_bot()
@@ -320,7 +309,6 @@ async def _push_updates_loop() -> None:
                         "change_60s": round(feed.price_change_pct(60) * 100, 3),
                         "momentum": round(feed.momentum_score() * 100, 3),
                     }
-
                 await broadcast({
                     "type": "update",
                     "timestamp": datetime.utcnow().isoformat(),
@@ -346,25 +334,34 @@ async def startup_event() -> None:
     asyncio.create_task(_push_updates_loop())
 
 
-# --- Serve the frontend ---
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard() -> HTMLResponse:
+    """Serve the dashboard HTML with explicit UTF-8 encoding.
+
+    Windows Path.read_text() defaults to cp1252, which corrupts em-dashes
+    and middle-dots ("—" → "â€"", "·" → "Â·"). Reading and declaring UTF-8
+    fixes the mojibake.
+    """
     html_path = Path(__file__).parent / "frontend" / "index.html"
     if html_path.exists():
-        return HTMLResponse(content=html_path.read_text())
-    return HTMLResponse(content="<h1>Dashboard frontend not found</h1>")
+        content = html_path.read_text(encoding="utf-8")
+        return HTMLResponse(
+            content=content,
+            media_type="text/html; charset=utf-8",
+        )
+    return HTMLResponse(
+        content="<h1>Dashboard frontend not found</h1>",
+        media_type="text/html; charset=utf-8",
+    )
 
 
 def log_trade(trade_data: dict) -> None:
-    """Called by the bot to record trades for the dashboard."""
     _trade_log.append({**trade_data, "timestamp": datetime.utcnow().isoformat()})
     if len(_trade_log) > MAX_LOG_SIZE:
         _trade_log.pop(0)
 
 
 def log_signal(signal_data: dict) -> None:
-    """Called by the bot to record signals for the dashboard."""
     _signal_log.append({**signal_data, "timestamp": datetime.utcnow().isoformat()})
     if len(_signal_log) > MAX_LOG_SIZE:
         _signal_log.pop(0)
