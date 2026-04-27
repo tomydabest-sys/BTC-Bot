@@ -1,10 +1,13 @@
 """Entry point — BTC Up/Down trading bot.
 
-Hardened:
-- validate_system() runs before the trading loop.
-- Inner-loop try/except around update_prices, feature logging, and exit execution.
-- Timestamps for pnl_history are proper ISO strings.
-- Dictionary iteration uses defensive list() copies.
+Major changes in this rewrite:
+1. Per-market cooldown (was: global 5s cooldown; now: 2s per (strategy, market))
+2. Multiple trades per cycle (was: 1 globally; now: up to max_trades_per_cycle, ≤1 per market)
+3. 500ms trading loop (was: 1000ms) — doubles signal opportunity
+4. Decision log integration (boundary_decay added; latency_arb / momentum_lag removed)
+5. High-confidence cooldown override
+6. STRATEGY_REGISTRY no longer auto-imports the killed strategies, but they remain
+   in the strategies/ folder for git history
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from polybot.data.models import Order, OrderType, Side
 from polybot.data.pipeline import DataPipeline
 from polybot.data.storage import Storage
 from polybot.data.websocket import WebSocketManager
+from polybot.diagnostics import decision_log
 from polybot.events import EventBus
 from polybot.execution.engine import ExecutionEngine
 from polybot.monitoring.alerts import AlertManager, LogChannel
@@ -41,33 +45,50 @@ from polybot.risk.manager import RiskManager
 from polybot.scanner.scanner import MarketScanner
 from polybot.strategies.aggregator import StrategyAggregator
 from polybot.strategies.base import BaseStrategy
+from polybot.strategies.boundary_decay import BoundaryDecayStrategy
 from polybot.strategies.calibration_edge import CalibrationEdgeStrategy
 from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
-from polybot.strategies.latency_arb import LatencyArbStrategy
 from polybot.strategies.maker_edge import MakerEdgeStrategy
 from polybot.strategies.market_maker import MarketMakerStrategy
 from polybot.strategies.mean_reversion import MeanReversionStrategy
 from polybot.strategies.momentum import MomentumStrategy
-from polybot.strategies.momentum_lag import MomentumLagStrategy
 from polybot.strategies.monte_carlo import MonteCarloStrategy
 from polybot.strategies.overshoot_reversion import OvershootReversionStrategy
 from polybot.strategies.volatility_breakout import VolatilityBreakoutStrategy
 
+# DELIBERATELY NOT IMPORTED (set enabled: false in config):
+# - LatencyArbStrategy: uneconomic post-Feb-2026 dynamic-fee rollout
+# - MomentumLagStrategy: overlaps overshoot_reversion
+# These files remain in strategies/ for git history.
+
 logger = structlog.get_logger()
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
+    # Active strategies
+    "overshoot_reversion": OvershootReversionStrategy,
+    "boundary_decay": BoundaryDecayStrategy,
+    "dual_direction_arb": DualDirectionArbStrategy,
+    "maker_edge": MakerEdgeStrategy,
+    # Legacy / available strategies
     "mean_reversion": MeanReversionStrategy,
     "momentum": MomentumStrategy,
-    "latency_arb": LatencyArbStrategy,
-    "momentum_lag": MomentumLagStrategy,
     "volatility_breakout": VolatilityBreakoutStrategy,
-    "dual_direction_arb": DualDirectionArbStrategy,
     "market_maker": MarketMakerStrategy,
     "monte_carlo": MonteCarloStrategy,
     "calibration_edge": CalibrationEdgeStrategy,
-    "maker_edge": MakerEdgeStrategy,
-    "overshoot_reversion": OvershootReversionStrategy,
 }
+
+# Lazy-import the killed strategies only if config explicitly references them.
+# This way, the registry still resolves them but we don't import unless needed.
+def _lazy_import_killed(name: str) -> type[BaseStrategy] | None:
+    if name == "latency_arb":
+        from polybot.strategies.latency_arb import LatencyArbStrategy
+        return LatencyArbStrategy
+    if name == "momentum_lag":
+        from polybot.strategies.momentum_lag import MomentumLagStrategy
+        return MomentumLagStrategy
+    return None
+
 
 DEFAULT_PAPER_BALANCE = 500.0
 _NO_SNAPSHOT_WARN_INTERVAL = 60.0
@@ -82,7 +103,8 @@ class Bot:
         self._config = config
         self._running = False
         self._wallet_balance = 0.0
-        self._last_trade_time = 0.0
+        # Per-(strategy, market_id) last-trade timestamps for new cooldown logic
+        self._last_trade_times: dict[tuple[str, str], float] = {}
         self._orderbook_cache: dict[str, float] = {}
         self._no_snapshot_warn: dict[str, float] = {}
         self._ob_fail_count: dict[str, int] = {}
@@ -119,10 +141,18 @@ class Bot:
         self._aggregator = StrategyAggregator(
             min_confidence=config.strategies.aggregation.min_confidence,
             conflict_resolution=config.strategies.aggregation.conflict_resolution,
+            strategy_weights=config.strategies.aggregation.strategy_weights,
+            min_net_score=config.strategies.aggregation.min_net_score,
         )
         self._backfill_client: httpx.AsyncClient | None = None
         self._backfill_task: asyncio.Task | None = None
         self._services_started = False
+
+        # Configure decision log
+        decision_log.configure(
+            path=config.decision_log.path,
+            flush_every=config.decision_log.flush_every,
+        )
 
     @staticmethod
     def _safe_env(env_var: str) -> str:
@@ -154,16 +184,10 @@ class Bot:
     def features_logger(self): return self._features_logger
 
     # ═════════════════════════════════════════════════════════════════
-    #  STARTUP VALIDATION
+    #  STARTUP VALIDATION (unchanged; quoted from original)
     # ═════════════════════════════════════════════════════════════════
 
     async def validate_system(self) -> tuple[bool, list[str]]:
-        """Run pre-flight checks. Returns (ok, errors).
-
-        On success: all resources remain initialised and ready for start().
-        On failure: returns a list of human-readable errors, and stop() can be
-        called to tear everything down cleanly.
-        """
         errors: list[str] = []
 
         print("\n" + "=" * 60)
@@ -196,7 +220,7 @@ class Bot:
             errors.append(f"Storage initialisation failed: {type(e).__name__}: {e}")
             return False, errors
 
-        # 3. Features DB (features.db) — verify table exists and is writable
+        # 3. Features DB (features.db)
         print("  [3/6] Features DB (features.db) ......... ", end="", flush=True)
         try:
             await self._features_logger.start()
@@ -207,7 +231,7 @@ class Bot:
             errors.append(f"Features logger failed: {type(e).__name__}: {e}")
             return False, errors
 
-        # 4. HTTP clients + exchange feed (Binance WS)
+        # 4. HTTP clients + exchange feed
         print("  [4/6] Exchange feed (Binance WS) ........ ", end="", flush=True)
         try:
             await self._client.start()
@@ -235,12 +259,12 @@ class Bot:
             errors.append(f"Exchange feed failed: {type(e).__name__}: {e}")
             return False, errors
 
-        # 5. Strategies instantiate without error
+        # 5. Strategies instantiate
         print("  [5/6] Strategies ........................ ", end="", flush=True)
         try:
             self._strategies = []
             for sc in self._config.strategies.enabled:
-                cls = STRATEGY_REGISTRY.get(sc.name)
+                cls = STRATEGY_REGISTRY.get(sc.name) or _lazy_import_killed(sc.name)
                 if cls is None:
                     raise RuntimeError(
                         f"Strategy {sc.name!r} is not registered. "
@@ -271,7 +295,7 @@ class Bot:
             errors.append(f"Strategy init failed: {type(e).__name__}: {e}")
             return False, errors
 
-        # 6. Market scan (at least one BTC up/down market discovered)
+        # 6. Market scan
         print("  [6/6] Market scan ....................... ", end="", flush=True)
         try:
             markets = await asyncio.wait_for(
@@ -311,7 +335,6 @@ class Bot:
     async def start(self) -> None:
         logger.info("bot_starting", name=self._config.bot.name, mode=self._config.bot.mode)
 
-        # If validate_system() already ran, services are up and strategies loaded.
         if not self._services_started:
             await self._storage.initialize()
             await self._features_logger.start()
@@ -321,7 +344,7 @@ class Bot:
                 self._backfill_client = httpx.AsyncClient(timeout=10.0)
 
             for sc in self._config.strategies.enabled:
-                cls = STRATEGY_REGISTRY.get(sc.name)
+                cls = STRATEGY_REGISTRY.get(sc.name) or _lazy_import_killed(sc.name)
                 if not cls:
                     logger.warning("strategy_not_found", name=sc.name)
                     continue
@@ -360,7 +383,13 @@ class Bot:
         self._backfill_task = asyncio.create_task(self._settlement_backfill_loop())
 
         self._running = True
-        logger.info("bot_started", strategies=[s.name for s in self._strategies])
+        logger.info(
+            "bot_started",
+            strategies=[s.name for s in self._strategies],
+            loop_interval_ms=self._config.execution.loop_interval_ms,
+            cooldown_s=self._config.risk.min_trade_interval_seconds,
+            cooldown_per_market=self._config.execution.cooldown_per_market,
+        )
         await self._trading_loop()
 
     async def stop(self) -> None:
@@ -393,6 +422,13 @@ class Bot:
                 await self._backfill_client.aclose()
             except Exception:
                 pass
+
+        # Flush decision log
+        try:
+            decision_log.shutdown()
+        except Exception:
+            pass
+
         logger.info("bot_stopped")
 
     # ═════════════════════════════════════════════════════════════════
@@ -402,8 +438,10 @@ class Bot:
     async def _on_order_filled(self, order: Order, **kwargs) -> None:
         try:
             self._position_manager.update_from_fill(order)
+            # Stamp the per-(strategy, market) cooldown
             if not order.strategy.startswith("exit_") and not order.strategy.startswith("auto_exit"):
-                self._last_trade_time = time.time()
+                key = (order.strategy, order.market_id)
+                self._last_trade_times[key] = time.time()
 
             if order.avg_fill_price > 0 and order.filled_size > 0:
                 portfolio = self._position_manager.get_portfolio()
@@ -459,6 +497,43 @@ class Bot:
         except Exception:
             return 0.0
 
+    def _cooldown_ok(
+        self,
+        strategy: str,
+        market_id: str,
+        confidence: float,
+    ) -> tuple[bool, str]:
+        """Check per-market or global cooldown.
+
+        Returns (allowed, reason). High-confidence signals can override the
+        cooldown after high_conf_override_after_s seconds.
+        """
+        cfg = self._config
+        cooldown_s = cfg.risk.min_trade_interval_seconds
+        per_market = cfg.execution.cooldown_per_market
+
+        if per_market:
+            key = (strategy, market_id)
+        else:
+            key = ("__global__", "__global__")
+
+        last = self._last_trade_times.get(key, 0.0)
+        if last == 0.0:
+            return True, "ok"
+
+        elapsed = time.time() - last
+        if elapsed >= cooldown_s:
+            return True, "ok"
+
+        # High-confidence override
+        if (
+            elapsed >= cfg.execution.high_conf_override_after_s
+            and confidence >= cfg.execution.high_conf_override_threshold
+        ):
+            return True, "high_conf_override"
+
+        return False, f"cooldown ({elapsed:.1f}s < {cooldown_s}s)"
+
     async def _execute_exit(self, pos):
         try:
             close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
@@ -471,11 +546,8 @@ class Bot:
                 order_type=OrderType.LIMIT,
                 strategy=f"exit_{pos.strategy}",
             )
-            saved_time = self._last_trade_time
-            self._last_trade_time = 0
             portfolio = self._position_manager.get_portfolio()
             result = await self._execution_engine.execute_order(close_order, portfolio)
-            self._last_trade_time = saved_time
             return result
         except Exception as e:
             logger.error("execute_exit_err", market=pos.market_id[:16], error=str(e))
@@ -504,11 +576,14 @@ class Bot:
             return False
 
     # ═════════════════════════════════════════════════════════════════
-    #  TRADING LOOP
+    #  TRADING LOOP — multi-trade per cycle, per-market cooldown
     # ═════════════════════════════════════════════════════════════════
 
     async def _trading_loop(self) -> None:
         cycle_count = 0
+        loop_interval_s = self._config.execution.loop_interval_ms / 1000.0
+        max_per_cycle = self._config.execution.max_trades_per_cycle
+        max_per_market_per_cycle = self._config.execution.max_trades_per_market_per_cycle
 
         while self._running:
             try:
@@ -527,10 +602,6 @@ class Bot:
                     except Exception as e:
                         logger.debug("balance_refresh_err", error=str(e))
 
-                min_interval = self._config.risk.min_trade_interval_seconds
-                since_last = time.time() - self._last_trade_time
-                in_cooldown = since_last < min_interval and self._last_trade_time > 0
-
                 active_markets = self._scanner.active_markets
                 try:
                     sorted_markets = sorted(
@@ -542,14 +613,18 @@ class Bot:
                     logger.warning("market_sort_err", error=str(e))
                     sorted_markets = list(active_markets.items())
 
-                traded_this_cycle = False
                 btc_feed = self._exchange_feed.get_feed("BTC")
+
+                # Phase 1: gather all candidate signals across all markets
+                all_candidates: list[tuple] = []  # (market, market_id, signal)
+                auto_close_threshold = self._config.execution.auto_close_before_expiry_s
 
                 for market_id, market in sorted_markets:
                     try:
                         time_left = self._market_time_remaining(market)
 
-                        if time_left < 30:
+                        # Auto-close near expiry
+                        if time_left < auto_close_threshold:
                             try:
                                 for p in list(self._position_manager.get_portfolio().positions):
                                     if p.market_id == market_id:
@@ -564,6 +639,7 @@ class Bot:
                                 logger.warning("auto_close_err", m=market_id[:12], error=str(e))
                             continue
 
+                        # Skip if no time for a meaningful trade
                         if time_left < 60:
                             continue
 
@@ -607,37 +683,13 @@ class Bot:
                         except Exception as e:
                             logger.debug("feat_log_err", m=market_id[:12], error=str(e))
 
-                        if in_cooldown or traded_this_cycle:
-                            continue
-
+                        # Run all strategies on this market
                         signals = []
                         for strategy in self._strategies:
                             try:
                                 sig = await strategy.evaluate(snapshot)
                                 if sig:
                                     signals.append(sig)
-                                    logger.info(
-                                        "signal",
-                                        s=sig.strategy,
-                                        d=sig.direction.value,
-                                        c=round(sig.confidence, 3),
-                                        m=market_id[:12],
-                                        t=round(time_left),
-                                        r=sig.reason[:100],
-                                    )
-                                    try:
-                                        from polybot.dashboard.app import log_signal
-                                        log_signal({
-                                            "market_id": sig.market_id,
-                                            "strategy": sig.strategy,
-                                            "direction": sig.direction.value,
-                                            "confidence": round(sig.confidence, 3),
-                                            "reason": sig.reason,
-                                            "target_price": round(sig.target_price, 4),
-                                            "size_pct": round(sig.size_pct, 4),
-                                        })
-                                    except (ImportError, Exception):
-                                        pass
                             except Exception as e:
                                 logger.debug(
                                     "strat_err",
@@ -645,6 +697,7 @@ class Bot:
                                     e=str(e),
                                 )
 
+                        # Aggregate per-market signals
                         try:
                             final_signals = self._aggregator.aggregate(signals)
                         except Exception as e:
@@ -652,53 +705,7 @@ class Bot:
                             final_signals = []
 
                         for sig in final_signals:
-                            try:
-                                portfolio = self._position_manager.get_portfolio()
-                                balance = (
-                                    self._wallet_balance
-                                    if self._wallet_balance > 0
-                                    else DEFAULT_PAPER_BALANCE
-                                )
-                                order_type = (
-                                    OrderType.GTC
-                                    if sig.metadata.get("is_maker_only")
-                                    or sig.metadata.get("is_market_maker")
-                                    else OrderType.LIMIT
-                                )
-                                order = Order(
-                                    market_id=sig.market_id,
-                                    token_id=market.token_ids[0] if market.token_ids else "",
-                                    side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
-                                    price=sig.target_price,
-                                    size=sig.size_pct * balance,
-                                    order_type=order_type,
-                                    strategy=sig.strategy,
-                                )
-                                order.size *= self._circuit_breaker.size_multiplier
-                                filled = await self._execution_engine.execute_order(order, portfolio)
-                                if filled.filled_size > 0:
-                                    traded_this_cycle = True
-                                try:
-                                    await self._storage.save_order({
-                                        "order_id": filled.order_id,
-                                        "market_id": filled.market_id,
-                                        "token_id": filled.token_id,
-                                        "side": filled.side.value,
-                                        "price": filled.price,
-                                        "size": filled.size,
-                                        "order_type": filled.order_type.value,
-                                        "status": filled.status.value,
-                                        "strategy": filled.strategy,
-                                        "signal_id": filled.signal_id,
-                                        "filled_size": filled.filled_size,
-                                        "avg_fill_price": filled.avg_fill_price,
-                                        "created_at": filled.created_at.isoformat(),
-                                        "updated_at": filled.created_at.isoformat(),
-                                    })
-                                except Exception as e:
-                                    logger.warning("save_order_err", error=str(e))
-                            except Exception as e:
-                                logger.error("signal_execution_err", error=str(e))
+                            all_candidates.append((market, market_id, sig))
 
                     except Exception as e:
                         logger.error(
@@ -708,6 +715,121 @@ class Bot:
                             error_type=type(e).__name__,
                         )
                         continue
+
+                # Phase 2: rank candidates globally and execute up to budget
+                # Score = confidence × (edge_bps if available)
+                def _score(item) -> float:
+                    sig = item[2]
+                    edge = sig.metadata.get("edge_bps", 0.0) if sig.metadata else 0.0
+                    return sig.confidence * max(edge, 1.0)
+
+                all_candidates.sort(key=_score, reverse=True)
+
+                seen_markets: set[str] = set()
+                trades_placed = 0
+
+                for market, market_id, sig in all_candidates:
+                    if trades_placed >= max_per_cycle:
+                        break
+                    if max_per_market_per_cycle and market_id in seen_markets:
+                        continue
+
+                    # Cooldown check
+                    ok, cd_reason = self._cooldown_ok(
+                        sig.strategy, market_id, sig.confidence
+                    )
+                    if not ok:
+                        logger.debug(
+                            "cooldown_block",
+                            s=sig.strategy,
+                            m=market_id[:12],
+                            r=cd_reason,
+                        )
+                        continue
+
+                    # Execute
+                    try:
+                        portfolio = self._position_manager.get_portfolio()
+                        balance = (
+                            self._wallet_balance
+                            if self._wallet_balance > 0
+                            else DEFAULT_PAPER_BALANCE
+                        )
+                        order_type = (
+                            OrderType.GTC
+                            if sig.metadata.get("is_maker_only")
+                            or sig.metadata.get("is_market_maker")
+                            else OrderType.LIMIT
+                        )
+                        order = Order(
+                            market_id=sig.market_id,
+                            token_id=market.token_ids[0] if market.token_ids else "",
+                            side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
+                            price=sig.target_price,
+                            size=sig.size_pct * balance,
+                            order_type=order_type,
+                            strategy=sig.strategy,
+                        )
+                        order.size *= self._circuit_breaker.size_multiplier
+
+                        # Apply per-timeframe cap if configured
+                        try:
+                            tf = self._scanner.get_timeframe(market_id) or ""
+                            tf_cap = self._config.risk.per_timeframe_cap_pct.get(tf)
+                            if tf_cap is not None:
+                                cap_usd = self._config.risk.bankroll_usd * tf_cap
+                                if order.size * order.price > cap_usd:
+                                    new_size = cap_usd / max(order.price, 0.01)
+                                    logger.info(
+                                        "size_capped_by_timeframe",
+                                        m=market_id[:12],
+                                        tf=tf,
+                                        old_notional=order.size * order.price,
+                                        new_notional=new_size * order.price,
+                                    )
+                                    order.size = new_size
+                        except Exception as e:
+                            logger.debug("tf_cap_err", error=str(e))
+
+                        filled = await self._execution_engine.execute_order(order, portfolio)
+                        if filled.filled_size > 0:
+                            trades_placed += 1
+                            seen_markets.add(market_id)
+                            try:
+                                from polybot.dashboard.app import log_signal
+                                log_signal({
+                                    "market_id": sig.market_id,
+                                    "strategy": sig.strategy,
+                                    "direction": sig.direction.value,
+                                    "confidence": round(sig.confidence, 3),
+                                    "reason": sig.reason,
+                                    "target_price": round(sig.target_price, 4),
+                                    "size_pct": round(sig.size_pct, 4),
+                                })
+                            except (ImportError, Exception):
+                                pass
+
+                        try:
+                            await self._storage.save_order({
+                                "order_id": filled.order_id,
+                                "market_id": filled.market_id,
+                                "token_id": filled.token_id,
+                                "side": filled.side.value,
+                                "price": filled.price,
+                                "size": filled.size,
+                                "order_type": filled.order_type.value,
+                                "status": filled.status.value,
+                                "strategy": filled.strategy,
+                                "signal_id": filled.signal_id,
+                                "filled_size": filled.filled_size,
+                                "avg_fill_price": filled.avg_fill_price,
+                                "created_at": filled.created_at.isoformat(),
+                                "updated_at": filled.created_at.isoformat(),
+                            })
+                        except Exception as e:
+                            logger.warning("save_order_err", error=str(e))
+                    except Exception as e:
+                        logger.error("signal_execution_err", error=str(e))
 
                 # Stop-loss / strategy-specific exits
                 try:
@@ -743,23 +865,28 @@ class Bot:
                     except Exception as e:
                         logger.debug("pnl_snapshot_err", error=str(e))
 
-                if cycle_count % 60 == 0 and btc_feed:
-                    try:
-                        logger.info(
-                            "feed_diag",
-                            btc=round(btc_feed.last_price, 2),
-                            tps=round(btc_feed.ticks_per_second, 1),
-                            ticks=len(btc_feed.ticks),
-                            micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
-                            markets=len(active_markets),
-                            positions=len(self._position_manager.get_portfolio().positions),
-                            feat_rows=self._features_logger.rows_written,
-                        )
-                    except Exception:
-                        pass
+                # Periodic diagnostics including block-reason summary
+                if cycle_count % 60 == 0:
+                    if btc_feed:
+                        try:
+                            from polybot.diagnostics.decision_log import block_summary
+                            top_blocks = block_summary(top_n=8)
+                            logger.info(
+                                "feed_diag",
+                                btc=round(btc_feed.last_price, 2),
+                                tps=round(btc_feed.ticks_per_second, 1),
+                                ticks=len(btc_feed.ticks),
+                                micro_mom=round(btc_feed.micro_momentum() * 10000, 2),
+                                markets=len(active_markets),
+                                positions=len(self._position_manager.get_portfolio().positions),
+                                feat_rows=self._features_logger.rows_written,
+                                top_blocks=top_blocks,
+                            )
+                        except Exception:
+                            pass
 
                 elapsed = time.time() - cycle_start
-                await asyncio.sleep(max(1.0 - elapsed, 0.1))
+                await asyncio.sleep(max(loop_interval_s - elapsed, 0.05))
 
             except Exception as e:
                 logger.error(
@@ -774,7 +901,7 @@ class Bot:
                 await asyncio.sleep(3)
 
     # ═════════════════════════════════════════════════════════════════
-    #  SETTLEMENT BACKFILL
+    #  SETTLEMENT BACKFILL (unchanged from original)
     # ═════════════════════════════════════════════════════════════════
 
     async def _settlement_backfill_loop(self) -> None:
