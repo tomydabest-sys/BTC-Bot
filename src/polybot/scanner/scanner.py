@@ -1,4 +1,4 @@
-"""Market discovery and filtering — BTC Up/Down markets only."""
+"""Market discovery and filtering — BTC Up/Down markets, all timeframes."""
 
 from __future__ import annotations
 
@@ -15,10 +15,12 @@ from polybot.events import EventBus
 
 logger = structlog.get_logger()
 
+# Match "Bitcoin Up or Down" with any case/spacing
 BTC_UPDOWN_PATTERN = re.compile(
     r"bitcoin\s+up\s+or\s+down", re.IGNORECASE
 )
 
+# "12:30AM-12:45AM" embedded time-range — used to infer 5/15-min windows
 TIME_WINDOW_PATTERN = re.compile(
     r"(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
     re.IGNORECASE,
@@ -30,6 +32,7 @@ def is_btc_updown_market(question: str) -> bool:
 
 
 def estimate_window_minutes(question: str) -> int | None:
+    """Parse '12:30AM-12:45AM' style time-range to compute window length."""
     match = TIME_WINDOW_PATTERN.search(question)
     if not match:
         return None
@@ -54,27 +57,66 @@ def estimate_window_minutes(question: str) -> int | None:
 
 
 def classify_btc_market(question: str) -> str | None:
+    """Classify a Bitcoin Up/Down market into a timeframe code.
+
+    Handles real Polymarket title patterns:
+    - 5m / 15m: have embedded time-range (e.g. "12:30AM-12:45AM ET")
+    - 1h: title contains "hour" or "hourly"
+    - 4h: title contains "4 hour" or "4h"
+    - daily: title contains "today" or just a date with no time-range
+
+    Returns None if not a Bitcoin Up/Down market.
+    """
     if not is_btc_updown_market(question):
         return None
 
-    window = estimate_window_minutes(question)
-    if window is None:
-        return "unknown"
+    q_lower = question.lower()
 
-    if window <= 5:
-        return "5m"
-    elif window <= 15:
-        return "15m"
-    elif window <= 60:
-        return "1h"
-    elif window <= 240:
+    # Hourly first (matches "hour" before "4 hour" sub-match would)
+    if "4 hour" in q_lower or "4-hour" in q_lower or "4h" in q_lower:
         return "4h"
-    else:
+    if "1 hour" in q_lower or "1-hour" in q_lower or "hourly" in q_lower:
+        return "1h"
+
+    # Time-range present → 5m or 15m
+    window = estimate_window_minutes(question)
+    if window is not None:
+        if window <= 5:
+            return "5m"
+        elif window <= 15:
+            return "15m"
+        elif window <= 60:
+            return "1h"
+        elif window <= 240:
+            return "4h"
+        else:
+            return "daily"
+
+    # No time-range, no hour keywords → assume daily
+    if "today" in q_lower or "tomorrow" in q_lower:
         return "daily"
+
+    # Last resort
+    return "daily"
+
+
+# Map any user-specified timeframe label to canonical code
+_TIMEFRAME_ALIASES: dict[str, str] = {
+    "5 min": "5m", "5m": "5m", "5min": "5m",
+    "15 min": "15m", "15m": "15m", "15min": "15m",
+    "1 hour": "1h", "1h": "1h", "1hr": "1h", "60m": "1h", "hourly": "1h",
+    "4 hour": "4h", "4h": "4h", "4hr": "4h", "240m": "4h",
+    "daily": "daily", "1d": "daily", "1day": "daily", "day": "daily",
+}
+
+
+def normalize_timeframe(tf: str) -> str:
+    """Map any timeframe label to canonical code (5m, 15m, 1h, 4h, daily)."""
+    return _TIMEFRAME_ALIASES.get(tf.lower().strip(), tf.lower().strip())
 
 
 class MarketScanner:
-    """Periodically discovers and filters BTC Up/Down markets only."""
+    """Periodically discovers and filters BTC Up/Down markets across all timeframes."""
 
     def __init__(
         self,
@@ -112,10 +154,13 @@ class MarketScanner:
             await asyncio.sleep(self._config.interval_seconds)
 
     async def _scan(self) -> None:
-        logger.info("scanning_btc_updown_markets")
+        logger.info("scanning_btc_updown_markets",
+                    timeframes=self._config.btc_timeframes)
         all_markets = await self._client.get_markets(active=True)
 
         btc_markets = []
+        allowed_timeframes = self._get_allowed_timeframes()
+
         for market in all_markets:
             timeframe = classify_btc_market(market.question)
             if timeframe is None:
@@ -124,7 +169,6 @@ class MarketScanner:
             if not self._passes_quality_filters(market):
                 continue
 
-            allowed_timeframes = self._get_allowed_timeframes()
             if allowed_timeframes and timeframe not in allowed_timeframes:
                 continue
 
@@ -196,12 +240,4 @@ class MarketScanner:
         raw = getattr(self._config, "btc_timeframes", None)
         if not raw:
             return None
-
-        mapping = {
-            "5 min": "5m", "5m": "5m", "5min": "5m",
-            "15 min": "15m", "15m": "15m", "15min": "15m",
-            "1 hour": "1h", "1h": "1h", "1hr": "1h", "60m": "1h",
-            "4 hour": "4h", "4h": "4h", "4hr": "4h", "240m": "4h",
-            "daily": "daily", "1d": "daily",
-        }
-        return {mapping.get(t.lower().strip(), t.lower().strip()) for t in raw}
+        return {normalize_timeframe(t) for t in raw}
