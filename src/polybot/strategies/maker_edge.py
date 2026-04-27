@@ -1,16 +1,18 @@
-"""Dual-direction arbitrage — guaranteed profit when Yes + No < $1.
+"""Maker edge — passive liquidity provision.
 
-Inspired by the gabagool wallet pattern: buy both Yes and No on a binary
-market when the combined cost is less than $1. One side always resolves to
-$1, guaranteeing profit equal to ($1 - total_cost) minus fees.
+Posts limit orders inside the bid-ask spread to capture spread + Polymarket
+maker rebate. Maker fee on Polymarket is ~0% with daily USDC rebate of
+20-25% of taker fees on liquid markets (per Polymarket docs).
 
-Refinements vs original:
-1. min_profit_pct lowered to 0.5% (was 1%) — realistic post-fee retail edge
-2. Anti-stale-book defense: require recent trade activity within 30s on
-   both sides (eliminates ~80% of false positives from CLOB book lag)
-3. Decision-log integration: every code path emits a canonical reason
-4. Atomic-fill awareness: encodes legs_max_age_ms in metadata for the
-   execution engine to enforce
+Avellaneda-Stoikov-lite quoting:
+    bid = mid - max(quote_offset, spread/2 - epsilon) - skew*inventory
+    ask = mid + max(quote_offset, spread/2 - epsilon) + skew*inventory
+
+We emit ONE signal per call, choosing the side that improves our inventory
+position (reduces |inventory|) when we already hold a position; otherwise
+we alternate by toggling on book imbalance.
+
+Decision-log emit on every code path.
 """
 
 from __future__ import annotations
@@ -20,39 +22,52 @@ from datetime import datetime
 
 import structlog
 
-from polybot.data.models import Direction, MarketSnapshot, Signal, Side
+from polybot.data.models import Direction, MarketSnapshot, Signal
 from polybot.diagnostics.decision_log import BlockReason, emit
 from polybot.strategies.base import BaseStrategy
 
 logger = structlog.get_logger()
 
 
-class DualDirectionArbStrategy(BaseStrategy):
-    """Detects and exploits Yes + No < $1 arbitrage opportunities."""
+class MakerEdgeStrategy(BaseStrategy):
+    """Posts inside-spread quotes to capture spread + maker rebate."""
 
     def __init__(
         self,
-        min_profit_pct: float = 0.005,
-        max_total_cost: float = 0.985,
-        min_liquidity_each_side: float = 5.0,
-        size_pct: float = 0.06,
-        require_recent_trade_seconds: float = 30.0,
-        legs_max_age_ms: int = 500,
+        min_spread: float = 0.015,
+        quote_offset: float = 0.005,
+        max_inventory: float = 0.20,
+        inventory_skew: float = 0.5,
+        size_pct: float = 0.04,
+        time_of_day_filter: bool = True,
+        volume_boost_threshold: float = 5000.0,
+        confidence_floor: float = 0.55,
     ) -> None:
-        self._min_profit_pct = float(min_profit_pct)
-        self._max_total_cost = float(max_total_cost)
-        self._min_liquidity = float(min_liquidity_each_side)
+        self._min_spread = float(min_spread)
+        self._quote_offset = float(quote_offset)
+        self._max_inventory = float(max_inventory)
+        self._inventory_skew = float(inventory_skew)
         self._size_pct = float(size_pct)
-        self._require_recent_trade_s = float(require_recent_trade_seconds)
-        self._legs_max_age_ms = int(legs_max_age_ms)
+        self._time_of_day_filter = bool(time_of_day_filter)
+        self._volume_boost_threshold = float(volume_boost_threshold)
+        self._confidence_floor = float(confidence_floor)
+        # Track per-market net inventory (+long YES, -short YES). Updated
+        # opportunistically by the bot when fills happen — for now it stays
+        # zero so we alternate purely on book imbalance.
+        self._inventory: dict[str, float] = {}
 
     @property
     def name(self) -> str:
-        return "dual_direction_arb"
+        return "maker_edge"
+
+    def update_inventory(self, market_id: str, delta_yes: float) -> None:
+        """Hook for the bot to inform us of fills (positive=long YES)."""
+        self._inventory[market_id] = self._inventory.get(market_id, 0.0) + delta_yes
 
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
         cycle_id = f"{int(time.time() * 1000) % 100000:05d}"
         market_id = snapshot.market.id
+        ob = snapshot.orderbook
 
         common: dict = {
             "cycle_id": cycle_id,
@@ -61,10 +76,10 @@ class DualDirectionArbStrategy(BaseStrategy):
             "timeframe": "",
             "binance_px": 0.0,
             "fair_value": 0.0,
-            "mid": 0.0,
-            "best_bid": 0.0,
-            "best_ask": 0.0,
-            "spread_bps": 0.0,
+            "mid": ob.mid_price,
+            "best_bid": ob.best_bid,
+            "best_ask": ob.best_ask,
+            "spread_bps": ob.spread * 10000,
             "edge_bps": 0.0,
             "confidence": 0.0,
             "decision": "BLOCKED",
@@ -78,151 +93,156 @@ class DualDirectionArbStrategy(BaseStrategy):
             "size_usd": 0.0,
         }
 
-        # ── Sanity: binary market with 2 outcomes ────────────────────
-        if len(snapshot.market.outcomes) != 2 or len(snapshot.market.token_ids) < 2:
-            common["reason"] = BlockReason.NO_SIGNAL
-            emit(**common)
-            return None
-
-        ob = snapshot.orderbook
-        common["mid"] = ob.mid_price
-        common["best_bid"] = ob.best_bid
-        common["best_ask"] = ob.best_ask
-        common["spread_bps"] = ob.spread * 10000
-
-        # Time remaining — useful diagnostic
+        # Time remaining
         try:
             now_dt = datetime.utcnow()
             end = snapshot.market.end_date
             if getattr(end, "tzinfo", None) is not None:
                 end = end.replace(tzinfo=None)
-            common["time_to_expiry_s"] = (end - now_dt).total_seconds()
+            t_rem = (end - now_dt).total_seconds()
+            common["time_to_expiry_s"] = t_rem
         except Exception:
-            pass
+            t_rem = 999.0
+
+        # Don't quote in last 30s — adverse selection peaks near expiry
+        if t_rem < 30.0:
+            common["reason"] = BlockReason.TIME_REMAINING_TOO_LOW
+            emit(**common)
+            return None
 
         if ob.best_bid <= 0 or ob.best_ask >= 1.0:
             common["reason"] = BlockReason.INVALID_BOOK
             emit(**common)
             return None
 
-        # ── Anti-stale-book defense ──────────────────────────────────
-        # Require at least one trade within the last require_recent_trade_s.
-        # The CLOB orderbook can lag the true book; without this filter we
-        # frequently see Yes+No < $1 that's purely a stale-book artifact.
-        if snapshot.recent_trades:
-            now_dt = datetime.utcnow()
-            most_recent_age = float("inf")
-            for t in snapshot.recent_trades:
-                ts = t.timestamp
-                if getattr(ts, "tzinfo", None) is not None:
-                    ts = ts.replace(tzinfo=None)
-                age = (now_dt - ts).total_seconds()
-                if age >= 0:
-                    most_recent_age = min(most_recent_age, age)
-            if most_recent_age > self._require_recent_trade_s:
-                common["reason"] = BlockReason.STALE_ORDERBOOK
-                emit(**common)
-                return None
+        spread = ob.spread
+        if spread < self._min_spread:
+            common["reason"] = BlockReason.SPREAD_TOO_NARROW
+            emit(**common)
+            return None
+
+        mid = ob.mid_price
+        # Skip extreme price bands — single-sided books, low liquidity
+        if mid < 0.10 or mid > 0.90:
+            common["reason"] = BlockReason.OUTSIDE_PRICE_BAND
+            emit(**common)
+            return None
+
+        # Volume gate: only quote on markets with at least some volume so we
+        # don't post into stale books.
+        if snapshot.market.volume_24h < self._volume_boost_threshold * 0.1:
+            common["reason"] = BlockReason.SPREAD_TOO_NARROW  # proxy for no flow
+            emit(**common)
+            return None
+
+        # ── Inventory-aware side selection ───────────────────────────
+        inventory = self._inventory.get(market_id, 0.0)
+        # If long, prefer SELL (post ask); if short, prefer BUY (post bid).
+        # If flat, follow book imbalance toward the heavier side.
+        imbalance = ob.book_imbalance  # +1 bid-heavy, -1 ask-heavy
+
+        if inventory > self._max_inventory * 0.5:
+            direction = Direction.SELL
+            outcome = "Yes"  # Selling YES = posting an ask
+        elif inventory < -self._max_inventory * 0.5:
+            direction = Direction.BUY
+            outcome = "Yes"
+        elif imbalance > 0.15:
+            # Bid-heavy → mid likely to drift up → post bid (we want to BUY low)
+            direction = Direction.BUY
+            outcome = "Yes"
+        elif imbalance < -0.15:
+            direction = Direction.SELL
+            outcome = "Yes"
         else:
-            # No trade history at all → likely stale or new market
-            common["reason"] = BlockReason.STALE_ORDERBOOK
+            # Flat market, flat inventory → skip
+            common["reason"] = BlockReason.NO_SIGNAL
             emit(**common)
             return None
 
-        # ── Pair cost calculation ────────────────────────────────────
-        # We have orderbook for one side (Yes). For binary market:
-        #   No_ask ≈ 1 - Yes_bid  (the implied ask on No)
-        yes_ask = ob.best_ask
-        yes_bid = ob.best_bid
-        no_implied_ask = 1.0 - yes_bid
-
-        total_cost = yes_ask + no_implied_ask
-        common["fair_value"] = 1.0 - total_cost  # gross profit per share
-
-        if total_cost >= self._max_total_cost:
-            common["reason"] = BlockReason.BELOW_MIN_EDGE
+        # ── Inventory cap check ──────────────────────────────────────
+        if direction == Direction.BUY and inventory >= self._max_inventory:
+            common["reason"] = BlockReason.POSITION_CAP
+            emit(**common)
+            return None
+        if direction == Direction.SELL and inventory <= -self._max_inventory:
+            common["reason"] = BlockReason.POSITION_CAP
             emit(**common)
             return None
 
-        profit_per_share = 1.0 - total_cost
-        profit_pct = profit_per_share / total_cost if total_cost > 0 else 0
-        edge_bps = profit_pct * 10000
+        # ── Quote price (Avellaneda-Stoikov-lite) ────────────────────
+        skew_adj = self._inventory_skew * (inventory / max(self._max_inventory, 1e-9))
+        half_spread = max(self._quote_offset, spread / 2.0 - 0.001)
+        if direction == Direction.BUY:
+            target_price = max(0.01, mid - half_spread - 0.005 * skew_adj)
+        else:
+            target_price = min(0.99, mid + half_spread + 0.005 * skew_adj)
+
+        # Snap to tick (0.01 generally; 0.001 in extremes)
+        tick = 0.001 if (mid < 0.04 or mid > 0.96) else 0.01
+        target_price = round(target_price / tick) * tick
+
+        # ── Edge estimate: half-spread captured if filled at this price ──
+        # Maker rebate ≈ 0% nominal; the edge is the spread we capture if the
+        # opposite-side flow eventually crosses us.
+        edge = half_spread  # cents per share
+        edge_bps = edge * 10000
         common["edge_bps"] = edge_bps
 
-        if profit_pct < self._min_profit_pct:
-            common["reason"] = BlockReason.BELOW_MIN_EDGE
-            emit(**common)
-            return None
-
-        # ── Liquidity check both sides ───────────────────────────────
-        ask_depth = ob.ask_depth
-        bid_depth = ob.bid_depth
-        if ask_depth < self._min_liquidity or bid_depth < self._min_liquidity:
-            common["reason"] = BlockReason.INSUFFICIENT_BALANCE
-            emit(**common)
-            return None
-
-        # ── Build signal ─────────────────────────────────────────────
-        # This strategy's signal represents BUY-BOTH-SIDES; the execution
-        # engine inspects metadata.is_dual_direction to place the second leg.
-        confidence = min(profit_pct / (self._min_profit_pct * 5), 1.0)
-        confidence = max(confidence, 0.7)  # high floor — near-riskless
+        confidence = max(self._confidence_floor, min(0.85, 0.4 + edge * 4 + abs(imbalance) * 0.2))
         common["confidence"] = confidence
-        common["decision"] = Direction.BUY.value
+        common["fair_value"] = mid  # for maker, "fair" ≈ mid
+        common["decision"] = direction.value
         common["reason"] = BlockReason.OK
 
         emit(**common, extra={
-            "yes_ask": yes_ask,
-            "no_implied_ask": no_implied_ask,
-            "total_cost": total_cost,
-            "profit_per_share": profit_per_share,
-            "profit_pct": profit_pct,
+            "inventory": inventory,
+            "imbalance": imbalance,
+            "half_spread": half_spread,
+            "target_price": target_price,
         })
 
         logger.info(
-            "dual_direction_signal",
+            "maker_signal",
             m=market_id[:12],
-            yes_ask=round(yes_ask, 4),
-            no_imp=round(no_implied_ask, 4),
-            cost=round(total_cost, 4),
-            profit_pct=round(profit_pct, 4),
+            dir=direction.value,
+            target=round(target_price, 4),
+            mid=round(mid, 4),
+            spread=round(spread, 4),
+            inv=round(inventory, 3),
             conf=round(confidence, 3),
         )
 
         return Signal(
-            market_id=snapshot.market.id,
+            market_id=market_id,
             strategy=self.name,
-            direction=Direction.BUY,
-            outcome="Yes",
-            target_price=yes_ask,
+            direction=direction,
+            outcome=outcome,
+            target_price=target_price,
             confidence=confidence,
-            size_pct=self._size_pct,
+            size_pct=self._size_pct * confidence,
             reason=(
-                f"Dual-direction arb: Yes@{yes_ask:.4f} + No@{no_implied_ask:.4f} "
-                f"= {total_cost:.4f} (profit {profit_pct:.2%}, {edge_bps:.0f} bps)"
+                f"Maker quote {direction.value}@{target_price:.4f} "
+                f"mid={mid:.4f} spread={spread:.4f} inv={inventory:+.3f}"
             ),
             metadata={
-                "yes_ask": yes_ask,
-                "no_implied_ask": no_implied_ask,
-                "total_cost": total_cost,
-                "profit_per_share": profit_per_share,
-                "profit_pct": profit_pct,
-                "is_dual_direction": True,
-                "legs_max_age_ms": self._legs_max_age_ms,
-                "no_token_id": (
-                    snapshot.market.token_ids[1]
-                    if len(snapshot.market.token_ids) > 1
-                    else ""
-                ),
+                "is_maker_only": True,
+                "is_market_maker": True,
+                "fair_value": mid,
+                "edge_bps": edge_bps,
+                "inventory": inventory,
+                "imbalance": imbalance,
             },
         )
 
     def get_params(self) -> dict:
         return {
-            "min_profit_pct": self._min_profit_pct,
-            "max_total_cost": self._max_total_cost,
-            "min_liquidity_each_side": self._min_liquidity,
+            "min_spread": self._min_spread,
+            "quote_offset": self._quote_offset,
+            "max_inventory": self._max_inventory,
+            "inventory_skew": self._inventory_skew,
             "size_pct": self._size_pct,
-            "require_recent_trade_seconds": self._require_recent_trade_s,
-            "legs_max_age_ms": self._legs_max_age_ms,
+            "time_of_day_filter": self._time_of_day_filter,
+            "volume_boost_threshold": self._volume_boost_threshold,
+            "confidence_floor": self._confidence_floor,
         }
