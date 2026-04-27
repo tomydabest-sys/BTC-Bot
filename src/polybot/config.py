@@ -22,16 +22,16 @@ class WalletConfig(BaseModel):
 
 
 class ScannerConfig(BaseModel):
-    interval_seconds: int = 300
-    min_volume_24h: float = 10000
-    min_liquidity: float = 5000
-    max_spread_pct: float = 5.0
+    interval_seconds: int = 30
+    min_volume_24h: float = 0
+    min_liquidity: float = 10
+    max_spread_pct: float = 30.0
     categories_allowlist: list[str] = Field(default_factory=list)
     categories_blocklist: list[str] = Field(default_factory=list)
-    resolution_window_days: list[int] = Field(default_factory=lambda: [1, 30])
+    resolution_window_days: list[int] = Field(default_factory=lambda: [0, 7])
     btc_updown_only: bool = True
     btc_timeframes: list[str] = Field(
-        default_factory=lambda: ["5 min", "15 min", "1 hour", "4 hour"]
+        default_factory=lambda: ["5 min", "15 min", "1 hour", "4 hour", "daily"]
     )
 
 
@@ -42,8 +42,10 @@ class StrategyItemConfig(BaseModel):
 
 
 class AggregationConfig(BaseModel):
-    min_confidence: float = 0.5
-    conflict_resolution: str = "skip"
+    min_confidence: float = 0.40
+    conflict_resolution: str = "weighted_vote"
+    strategy_weights: dict[str, float] = Field(default_factory=dict)
+    min_net_score: float = 0.30
 
 
 class StrategiesConfig(BaseModel):
@@ -52,28 +54,50 @@ class StrategiesConfig(BaseModel):
 
 
 class CircuitBreakerConfig(BaseModel):
-    consecutive_losses_pause: int = 3
+    consecutive_losses_pause: int = 8
     consecutive_losses_size_reduction: float = 0.5
-    api_errors_per_minute_pause: int = 5
-    ws_disconnect_cancel_seconds: int = 120
+    api_errors_per_minute_pause: int = 15
+    ws_disconnect_cancel_seconds: int = 30
 
 
 class RiskConfig(BaseModel):
-    max_position_size: float = 500
-    max_portfolio_exposure: float = 5000
-    max_positions: int = 10
-    max_daily_loss: float = 250
-    min_trade_interval_seconds: int = 30
-    max_order_size: float = 200
-    max_slippage_pct: float = 2.0
+    max_position_size: float = 30
+    max_portfolio_exposure: float = 150
+    max_positions: int = 6
+    max_daily_loss: float = 25
+    min_trade_interval_seconds: int = 2
+    max_order_size: float = 20
+    max_slippage_pct: float = 5.0
+    # Kelly sizing
+    bankroll_usd: float = 500
+    kelly_fraction: float = 0.25
+    hard_cap_pct: float = 0.06
+    edge_floor_bps: float = 10
+    per_timeframe_cap_pct: dict[str, float] = Field(
+        default_factory=lambda: {
+            "5m": 0.02,
+            "15m": 0.03,
+            "1h": 0.05,
+            "4h": 0.06,
+            "daily": 0.06,
+        }
+    )
     circuit_breakers: CircuitBreakerConfig = CircuitBreakerConfig()
 
 
 class ExecutionConfig(BaseModel):
     rate_limit_per_second: int = 5
-    order_ttl_seconds: int = 300
-    retry_attempts: int = 3
-    retry_backoff_seconds: list[int] = Field(default_factory=lambda: [1, 2, 4])
+    order_ttl_seconds: int = 15
+    retry_attempts: int = 1
+    retry_backoff_seconds: list[int] = Field(default_factory=lambda: [1])
+    # Trading-loop tuning (new)
+    loop_interval_ms: int = 500
+    max_trades_per_cycle: int = 6
+    max_trades_per_market_per_cycle: int = 1
+    cooldown_per_market: bool = True
+    high_conf_override_after_s: float = 1.0
+    high_conf_override_threshold: float = 0.85
+    auto_close_before_expiry_s: int = 20
 
 
 class AlertsConfig(BaseModel):
@@ -88,6 +112,12 @@ class MonitoringConfig(BaseModel):
     daily_summary_hour: int = 18
 
 
+class DecisionLogConfig(BaseModel):
+    """NEW: structured decision log configuration."""
+    path: str = "logs/decisions.jsonl"
+    flush_every: int = 25
+
+
 class Config(BaseModel):
     bot: BotConfig = BotConfig()
     wallet: WalletConfig = WalletConfig()
@@ -96,6 +126,7 @@ class Config(BaseModel):
     risk: RiskConfig = RiskConfig()
     execution: ExecutionConfig = ExecutionConfig()
     monitoring: MonitoringConfig = MonitoringConfig()
+    decision_log: DecisionLogConfig = DecisionLogConfig()
 
     @property
     def is_live(self) -> bool:
@@ -108,7 +139,7 @@ def load_config(path: str = "config.yaml") -> Config:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     if raw is None:
