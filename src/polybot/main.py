@@ -36,8 +36,10 @@ from polybot.data.pipeline import DataPipeline
 from polybot.data.storage import Storage
 from polybot.data.websocket import WebSocketManager
 from polybot.diagnostics import decision_log
+from polybot.diagnostics.decision_log import BlockReason, emit as emit_decision
 from polybot.events import EventBus
 from polybot.execution.engine import ExecutionEngine
+from polybot.health_monitor import HealthMonitor
 from polybot.monitoring.alerts import AlertManager, LogChannel
 from polybot.positions.manager import PositionManager
 from polybot.risk.circuit_breaker import CircuitBreaker
@@ -153,6 +155,13 @@ class Bot:
             path=config.decision_log.path,
             flush_every=config.decision_log.flush_every,
         )
+
+        # Health monitor — catches silent feed stalls
+        self._health = HealthMonitor()
+        self._health.configure_threshold("binance_btc", 5.0)
+        self._health.configure_threshold("polymarket_book", 30.0)
+        self._health.configure_threshold("scanner", 120.0)
+        self._stale_feed_warned: float = 0.0
 
     @staticmethod
     def _safe_env(env_var: str) -> str:
@@ -562,6 +571,7 @@ class Bot:
             self._data_pipeline.ingest_orderbook(market_id, ob)
             self._orderbook_cache[market_id] = now
             self._ob_fail_count[market_id] = 0
+            self._health.stamp("polymarket_book")
             return True
         except Exception as e:
             fails = self._ob_fail_count.get(market_id, 0) + 1
@@ -592,6 +602,36 @@ class Bot:
 
                 if not self._circuit_breaker.is_trading_allowed:
                     await asyncio.sleep(3)
+                    continue
+
+                # ── Pre-flight: feed health ──────────────────────────
+                btc_feed_now = self._exchange_feed.get_feed("BTC")
+                if btc_feed_now is not None and btc_feed_now.last_price > 0 and not btc_feed_now.is_stale:
+                    self._health.stamp("binance_btc")
+                if self._scanner.active_markets:
+                    self._health.stamp("scanner")
+
+                if self._health.stale("binance_btc"):
+                    now_ts = time.time()
+                    if now_ts - self._stale_feed_warned > 30:
+                        self._stale_feed_warned = now_ts
+                        logger.warning(
+                            "feed_stale_skip_cycle",
+                            feed="binance_btc",
+                            age_s=round(self._health.age_s("binance_btc"), 1),
+                        )
+                    try:
+                        emit_decision(
+                            cycle_id=f"{cycle_count:06d}",
+                            strategy="loop",
+                            market_id="",
+                            decision="BLOCKED",
+                            reason=BlockReason.FEED_STALE,
+                            extra={"feed": "binance_btc"},
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(loop_interval_s)
                     continue
 
                 if self._config.is_live and cycle_count % 30 == 0:
@@ -755,6 +795,49 @@ class Bot:
                             if self._wallet_balance > 0
                             else DEFAULT_PAPER_BALANCE
                         )
+
+                        # Pre-trade risk gate (also emits a decision-log line on block)
+                        tf = self._scanner.get_timeframe(market_id) or ""
+                        ok_open, open_reason = self._risk_manager.can_open_position(
+                            portfolio, sig, timeframe=tf,
+                        )
+                        if not ok_open:
+                            logger.debug(
+                                "risk_block",
+                                m=market_id[:12],
+                                strat=sig.strategy,
+                                reason=open_reason,
+                            )
+                            continue
+
+                        # Quarter-Kelly sizing (decays to legacy size_pct if metadata
+                        # is missing fair_value/edge_bps)
+                        sizing = self._risk_manager.kelly_size_for_signal(
+                            sig, bankroll=balance, timeframe=tf,
+                        )
+                        if sizing.size_usd <= 0:
+                            try:
+                                emit_decision(
+                                    cycle_id=f"{cycle_count:06d}",
+                                    strategy=f"sizing({sig.strategy})",
+                                    market_id=market_id,
+                                    timeframe=tf,
+                                    confidence=sig.confidence,
+                                    edge_bps=(sig.metadata or {}).get("edge_bps", 0.0),
+                                    decision="BLOCKED",
+                                    reason=BlockReason.BELOW_MIN_EDGE,
+                                    extra={
+                                        "capped_by": sizing.capped_by,
+                                        "notes": sizing.notes,
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            continue
+
+                        # Convert dollar notional to share size at limit price
+                        share_size = sizing.size_usd / max(sig.target_price, 0.01)
+
                         order_type = (
                             OrderType.GTC
                             if sig.metadata.get("is_maker_only")
@@ -766,30 +849,11 @@ class Bot:
                             token_id=market.token_ids[0] if market.token_ids else "",
                             side=Side.BUY if sig.direction.value == "BUY" else Side.SELL,
                             price=sig.target_price,
-                            size=sig.size_pct * balance,
+                            size=share_size,
                             order_type=order_type,
                             strategy=sig.strategy,
                         )
                         order.size *= self._circuit_breaker.size_multiplier
-
-                        # Apply per-timeframe cap if configured
-                        try:
-                            tf = self._scanner.get_timeframe(market_id) or ""
-                            tf_cap = self._config.risk.per_timeframe_cap_pct.get(tf)
-                            if tf_cap is not None:
-                                cap_usd = self._config.risk.bankroll_usd * tf_cap
-                                if order.size * order.price > cap_usd:
-                                    new_size = cap_usd / max(order.price, 0.01)
-                                    logger.info(
-                                        "size_capped_by_timeframe",
-                                        m=market_id[:12],
-                                        tf=tf,
-                                        old_notional=order.size * order.price,
-                                        new_notional=new_size * order.price,
-                                    )
-                                    order.size = new_size
-                        except Exception as e:
-                            logger.debug("tf_cap_err", error=str(e))
 
                         filled = await self._execution_engine.execute_order(order, portfolio)
                         if filled.filled_size > 0:

@@ -33,6 +33,11 @@ class OrderStatus(str, Enum):
     EXPIRED = "EXPIRED"
 
 
+class PositionStatus(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
 class AlertLevel(str, Enum):
     INFO = "INFO"
     WARNING = "WARNING"
@@ -175,20 +180,21 @@ class Fill:
 class Position:
     market_id: str
     token_id: str
-    outcome: str
     side: Side
     size: float
     avg_entry_price: float
+    outcome: str = ""
     current_price: float = 0.0
     opened_at: datetime = field(default_factory=datetime.utcnow)
     strategy: str = ""
+    status: PositionStatus = PositionStatus.OPEN
+    unrealized_pnl: float = 0.0
 
     @property
     def notional(self) -> float:
         return self.size * self.avg_entry_price
 
-    @property
-    def unrealized_pnl(self) -> float:
+    def compute_unrealized_pnl(self) -> float:
         if self.side == Side.BUY:
             return self.size * (self.current_price - self.avg_entry_price)
         return self.size * (self.avg_entry_price - self.current_price)
