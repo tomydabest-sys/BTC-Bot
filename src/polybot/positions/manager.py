@@ -1,21 +1,30 @@
-"""Position tracking and P&L management.
+"""Position tracking and exit logic.
 
-Adds strategy-aware exit logic for `overshoot_reversion` (take-profit on small
-retrace + time-based timeout). Existing stop-loss behaviour preserved.
+Strategy-specific exit rules:
+- overshoot_reversion: TP at 1.2¢ favourable move OR 120s timeout OR 2¢ stop
+- boundary_decay     : HOLD TO EXPIRY (auto-close handles <20s window)
+                        — boundary trades are near-certainty; don't TP early
+- dual_direction_arb : Both legs held to expiry (one always pays $1)
+- maker_edge         : Inventory neutralisation by re-quote, no time exit here
+- Default fallback   : 5% stop, 10% TP, 5-minute timeout
+
+This rewrite adds an explicit dispatch by strategy name, so adding a new
+strategy means adding a `_exits_for_<name>()` method, not editing the trunk.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import structlog
 
 from polybot.data.models import (
-    ExitSignal,
     Order,
-    OrderStatus,
     Portfolio,
     Position,
+    PositionStatus,
     Side,
 )
 from polybot.events import EventBus
@@ -23,170 +32,254 @@ from polybot.events import EventBus
 logger = structlog.get_logger()
 
 
-# Overshoot reversion exit parameters
-OVERSHOOT_TP_MOVE = 0.012          # Entry-direction mid move >= 1.2c → take profit
-OVERSHOOT_TIMEOUT_SECONDS = 120.0  # Hard timeout
-OVERSHOOT_SL_MOVE = 0.030          # Against-us mid move >= 3c → cut early (ahead of PnL stop)
+@dataclass
+class ExitSignal:
+    position: Position
+    reason: str
 
 
 class PositionManager:
-    """Tracks open positions and computes P&L."""
+    """Tracks open positions, computes unrealised P&L, generates exit signals."""
 
     def __init__(self, event_bus: EventBus) -> None:
         self._event_bus = event_bus
-        self._positions: dict[str, Position] = {}
-        self._realized_pnl = 0.0
-        self._daily_pnl = 0.0
-        self._daily_reset_date: str = ""
+        self._portfolio = Portfolio()
+        self._position_open_ts: dict[str, float] = {}
+
+    @property
+    def portfolio(self) -> Portfolio:
+        return self._portfolio
 
     def get_portfolio(self) -> Portfolio:
-        self._maybe_reset_daily()
-        return Portfolio(
-            positions=list(self._positions.values()),
-            realized_pnl=self._realized_pnl,
-            daily_pnl=self._daily_pnl,
-        )
+        return self._portfolio
+
+    # ─────────────────────────────────────────────────────────────────
+    #  Fill handling
+    # ─────────────────────────────────────────────────────────────────
 
     def update_from_fill(self, order: Order) -> None:
-        if order.status != OrderStatus.FILLED:
+        """Update positions from a filled order.
+
+        Resilient to partial fills, re-fills, and exit orders (whose strategy
+        name starts with 'exit_' or 'auto_exit').
+        """
+        if order.filled_size <= 0:
             return
 
-        market_id = order.market_id
-        existing = self._positions.get(market_id)
+        is_exit = order.strategy.startswith("exit_") or order.strategy.startswith("auto_exit")
 
-        if existing and existing.side != order.side:
-            close_size = min(existing.size, order.filled_size)
-            if order.side == Side.SELL:
-                pnl = close_size * (order.avg_fill_price - existing.avg_entry_price)
-            else:
-                pnl = close_size * (existing.avg_entry_price - order.avg_fill_price)
+        # Find existing position by (market_id, token_id, side)
+        # Exit orders have side opposite to position side
+        target_side = order.side
+        if is_exit:
+            target_side = Side.SELL if order.side == Side.BUY else Side.BUY
 
-            self._realized_pnl += pnl
-            self._daily_pnl += pnl
+        existing = None
+        for p in self._portfolio.positions:
+            if p.market_id == order.market_id and p.token_id == order.token_id and p.side == target_side:
+                existing = p
+                break
 
+        if is_exit and existing is not None:
+            # Close (or reduce) the position
+            close_size = min(order.filled_size, existing.size)
+            pnl = self._compute_realised_pnl(existing, order.avg_fill_price, close_size)
+            self._portfolio.realized_pnl += pnl
+            self._portfolio.daily_pnl += pnl
             existing.size -= close_size
-            if existing.size <= 0.001:
-                del self._positions[market_id]
+            if existing.size <= 1e-9:
+                existing.status = PositionStatus.CLOSED
+                self._portfolio.positions.remove(existing)
+                self._position_open_ts.pop(_pos_key(existing), None)
                 logger.info(
                     "position_closed",
-                    market=market_id,
-                    pnl=pnl,
-                    strategy=existing.strategy,
+                    m=existing.market_id[:12],
+                    pnl=round(pnl, 4),
+                    strat=existing.strategy,
                 )
             else:
                 logger.info(
                     "position_reduced",
-                    market=market_id,
-                    remaining=existing.size,
-                    pnl=pnl,
+                    m=existing.market_id[:12],
+                    new_size=round(existing.size, 4),
+                    pnl=round(pnl, 4),
                 )
-        elif existing and existing.side == order.side:
-            total_cost = (existing.size * existing.avg_entry_price) + (
-                order.filled_size * order.avg_fill_price
-            )
-            existing.size += order.filled_size
-            existing.avg_entry_price = total_cost / existing.size
-            logger.info(
-                "position_increased",
-                market=market_id,
-                new_size=existing.size,
-                avg_entry=existing.avg_entry_price,
-            )
-        else:
-            self._positions[market_id] = Position(
-                market_id=market_id,
+            return
+
+        # Open or add to position
+        if existing is None:
+            pos = Position(
+                market_id=order.market_id,
                 token_id=order.token_id,
-                outcome="Yes" if order.side == Side.BUY else "No",
                 side=order.side,
                 size=order.filled_size,
                 avg_entry_price=order.avg_fill_price,
+                current_price=order.avg_fill_price,
                 strategy=order.strategy,
+                status=PositionStatus.OPEN,
+                opened_at=datetime.utcnow(),
             )
+            self._portfolio.positions.append(pos)
+            self._position_open_ts[_pos_key(pos)] = time.time()
             logger.info(
                 "position_opened",
-                market=market_id,
-                side=order.side,
-                size=order.filled_size,
-                price=order.avg_fill_price,
-                strategy=order.strategy,
+                m=pos.market_id[:12],
+                side=pos.side.value,
+                px=round(pos.avg_entry_price, 4),
+                sz=round(pos.size, 4),
+                strat=pos.strategy,
             )
+        else:
+            # Add to existing — recompute weighted avg entry
+            total_size = existing.size + order.filled_size
+            if total_size > 0:
+                existing.avg_entry_price = (
+                    existing.avg_entry_price * existing.size
+                    + order.avg_fill_price * order.filled_size
+                ) / total_size
+                existing.size = total_size
+                logger.info(
+                    "position_increased",
+                    m=existing.market_id[:12],
+                    new_size=round(existing.size, 4),
+                    new_avg=round(existing.avg_entry_price, 4),
+                )
 
     def update_prices(self, market_id: str, current_price: float) -> None:
-        if market_id in self._positions:
-            self._positions[market_id].current_price = current_price
+        """Mark-to-market all positions in this market."""
+        for p in self._portfolio.positions:
+            if p.market_id == market_id:
+                p.current_price = current_price
+                p.unrealized_pnl = self._compute_unrealised_pnl(p)
 
-    def check_exits(self, stop_loss_pct: float = 0.05) -> list[ExitSignal]:
-        """Check stop-loss + strategy-specific exit conditions."""
-        exits: list[ExitSignal] = []
-        now = datetime.utcnow()
+    # ─────────────────────────────────────────────────────────────────
+    #  Exit logic
+    # ─────────────────────────────────────────────────────────────────
 
-        for pos in self._positions.values():
-            if pos.current_price == 0:
+    def check_exits(self) -> list[ExitSignal]:
+        """Return exit signals for any open position whose exit rule fires."""
+        out: list[ExitSignal] = []
+        for p in list(self._portfolio.positions):
+            if p.status != PositionStatus.OPEN:
                 continue
+            try:
+                exit_reason = self._exit_reason_for(p)
+            except Exception as e:
+                logger.warning(
+                    "exit_check_err",
+                    m=p.market_id[:12],
+                    strat=p.strategy,
+                    error=str(e),
+                )
+                continue
+            if exit_reason:
+                out.append(ExitSignal(position=p, reason=exit_reason))
+        return out
 
-            # ── Universal stop-loss ──────────────────────────────
-            if pos.notional > 0:
-                loss_pct = -pos.unrealized_pnl / pos.notional
-                if loss_pct > stop_loss_pct:
-                    exits.append(
-                        ExitSignal(
-                            position=pos,
-                            reason=f"Stop-loss triggered: {loss_pct:.1%} loss",
-                            urgency="immediate",
-                        )
-                    )
-                    continue
+    def _exit_reason_for(self, p: Position) -> str | None:
+        """Dispatch to strategy-specific exit logic."""
+        strat = (p.strategy or "").lower()
 
-            # ── Overshoot reversion strategy-specific exits ──────
-            strategy = (pos.strategy or "").lower()
-            if strategy.startswith("overshoot_reversion"):
-                exit_signal = self._check_overshoot_exit(pos, now)
-                if exit_signal is not None:
-                    exits.append(exit_signal)
-                    continue
+        if "boundary_decay" in strat:
+            return self._exits_for_boundary_decay(p)
+        if "dual_direction" in strat:
+            return self._exits_for_dual_direction(p)
+        if "overshoot_reversion" in strat:
+            return self._exits_for_overshoot_reversion(p)
+        if "maker_edge" in strat:
+            return self._exits_for_maker_edge(p)
 
-        return exits
+        return self._exits_for_default(p)
 
-    def _check_overshoot_exit(
-        self, pos: Position, now: datetime
-    ) -> ExitSignal | None:
-        """Strategy-specific exit for overshoot_reversion positions."""
-        opened_at = pos.opened_at
-        if getattr(opened_at, "tzinfo", None) is not None:
-            opened_at = opened_at.replace(tzinfo=None)
-        age = (now - opened_at).total_seconds()
+    # ─── Strategy-specific exit rules ────────────────────────────────
 
-        direction_sign = 1.0 if pos.side == Side.BUY else -1.0
-        mid_move = (pos.current_price - pos.avg_entry_price) * direction_sign
+    def _exits_for_boundary_decay(self, p: Position) -> str | None:
+        """Boundary decay positions: HOLD TO EXPIRY.
 
-        # Take profit — reverted in our favour
-        if mid_move >= OVERSHOOT_TP_MOVE:
-            return ExitSignal(
-                position=pos,
-                reason=f"overshoot_tp mid_move={mid_move:+.4f}",
-                urgency="normal",
-            )
+        These trades are near-certainty terminal payoffs. The expected value
+        of holding to resolution exceeds any TP target the position might
+        cross during the final minute. The auto-close logic in main._trading_loop
+        handles closing within 20s of expiry.
 
-        # Adverse move — cut before the 5% PnL stop triggers
-        if mid_move <= -OVERSHOOT_SL_MOVE:
-            return ExitSignal(
-                position=pos,
-                reason=f"overshoot_sl mid_move={mid_move:+.4f}",
-                urgency="immediate",
-            )
+        We only exit early on a hard catastrophic stop (≥10% adverse), which
+        signals the BTC underlying has reversed through the strike.
+        """
+        unrealised_pct = self._unrealised_pct(p)
+        if unrealised_pct <= -0.10:
+            return f"boundary_hard_stop ({unrealised_pct:.2%})"
+        return None
+
+    def _exits_for_dual_direction(self, p: Position) -> str | None:
+        """Dual-direction arb: both legs held to expiry. No early exit."""
+        return None
+
+    def _exits_for_overshoot_reversion(self, p: Position) -> str | None:
+        """Overshoot reversion: TP on reversion, timeout, hard stop."""
+        # Hard stop
+        if p.unrealized_pnl <= -0.02 * (p.avg_entry_price * p.size):
+            return f"overshoot_hard_stop ({p.unrealized_pnl:.4f})"
+
+        # TP at 1.2¢ favourable price move
+        if p.side == Side.BUY:
+            move = p.current_price - p.avg_entry_price
+        else:
+            move = p.avg_entry_price - p.current_price
+        if move >= 0.012:
+            return f"overshoot_tp ({move:+.4f})"
 
         # Timeout
-        if age >= OVERSHOOT_TIMEOUT_SECONDS:
-            return ExitSignal(
-                position=pos,
-                reason=f"overshoot_timeout age={age:.0f}s mid_move={mid_move:+.4f}",
-                urgency="normal",
-            )
+        opened = self._position_open_ts.get(_pos_key(p), 0.0)
+        if opened > 0 and (time.time() - opened) >= 120:
+            return "overshoot_timeout (120s)"
 
         return None
 
-    def _maybe_reset_daily(self) -> None:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        if today != self._daily_reset_date:
-            self._daily_pnl = 0.0
-            self._daily_reset_date = today
+    def _exits_for_maker_edge(self, p: Position) -> str | None:
+        """Maker positions: rebalance via re-quote, not via this path.
+
+        We only exit on extreme adverse selection or end-of-window.
+        """
+        unrealised_pct = self._unrealised_pct(p)
+        if unrealised_pct <= -0.05:
+            return f"maker_adverse_selection ({unrealised_pct:.2%})"
+        return None
+
+    def _exits_for_default(self, p: Position) -> str | None:
+        """Default fallback for any strategy not explicitly handled."""
+        unrealised_pct = self._unrealised_pct(p)
+        if unrealised_pct <= -0.05:
+            return f"default_stop ({unrealised_pct:.2%})"
+        if unrealised_pct >= 0.10:
+            return f"default_tp ({unrealised_pct:.2%})"
+        opened = self._position_open_ts.get(_pos_key(p), 0.0)
+        if opened > 0 and (time.time() - opened) >= 300:
+            return "default_timeout (5min)"
+        return None
+
+    # ─────────────────────────────────────────────────────────────────
+    #  P&L math
+    # ─────────────────────────────────────────────────────────────────
+
+    def _compute_realised_pnl(
+        self, position: Position, exit_price: float, close_size: float,
+    ) -> float:
+        if position.side == Side.BUY:
+            return (exit_price - position.avg_entry_price) * close_size
+        else:
+            return (position.avg_entry_price - exit_price) * close_size
+
+    def _compute_unrealised_pnl(self, p: Position) -> float:
+        if p.side == Side.BUY:
+            return (p.current_price - p.avg_entry_price) * p.size
+        else:
+            return (p.avg_entry_price - p.current_price) * p.size
+
+    def _unrealised_pct(self, p: Position) -> float:
+        notional = p.avg_entry_price * p.size
+        if notional <= 0:
+            return 0.0
+        return p.unrealized_pnl / notional
+
+
+def _pos_key(p: Position) -> str:
+    return f"{p.market_id}:{p.token_id}:{p.side.value}"
