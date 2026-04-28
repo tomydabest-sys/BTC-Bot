@@ -1,42 +1,13 @@
 """Structured per-cycle decision log + block-reason counter.
 
-This is the highest-leverage diagnostic change in the bot. Every strategy's
-evaluate() call must end with a call to emit(), even when no signal is produced.
-This gives you a single JSONL stream where every cycle has exactly one row per
-(strategy, market) pair, with a canonical reason for every decision.
-
-Usage from a strategy:
-    from polybot.diagnostics.decision_log import emit, BlockReason, block_counter
-
-    emit(
-        cycle_id=cycle_id,
-        strategy=self.name,
-        market_id=market.id,
-        timeframe="5m",
-        binance_px=binance_price,
-        fair_value=fair,
-        mid=mid,
-        best_bid=ob.best_bid,
-        best_ask=ob.best_ask,
-        spread_bps=ob.spread * 10000,
-        edge_bps=edge * 10000,
-        confidence=confidence,
-        decision="BUY",  # or "SELL", "BLOCKED", "NO_SIGNAL"
-        reason=BlockReason.OK,  # or any other BlockReason
-        time_to_expiry_s=t_rem,
-        ob_age_ms=ob_age_ms,
-        btc_move_5s=btc_move_5s,
-        btc_move_30s=btc_move_30s,
-        btc_move_60s=btc_move_60s,
-        poly_burst_5s=poly_burst,
-        size_usd=size_usd,
-        kelly_f=kelly_f,
-    )
-
-Read with:
-    import pandas as pd
-    df = pd.read_json("logs/decisions.jsonl", lines=True)
-    print(df[df.decision != "BUY"].reason.value_counts(normalize=True))
+PATCHED FROM ORIGINAL:
+1. Added 9 new BlockReason codes for diagnosing zero-trade scenarios:
+   POLY_FEED_NEVER_ARRIVED, BTC_FEED_NOT_SUBSCRIBED, ORDERBOOK_TOO_LATE,
+   MARKET_TOO_NEW, MID_NOT_MOVING, SIZED_TO_ZERO, KELLY_NEGATIVE,
+   AGG_DROPPED_LOW_CONF, AGG_CONFLICT_ABSTAIN
+2. Added FORCE_TRADE flag and relax() helper for §7D force-trade mode
+3. Added stage-numbered overshoot block reasons (OVR_01..OVR_07) for
+   strategy-level lifecycle visibility in analyze.py output
 """
 
 from __future__ import annotations
@@ -50,18 +21,38 @@ from pathlib import Path
 from typing import Any
 
 
-class BlockReason:
-    """Canonical reasons for every decision-pipeline outcome.
+# ─────────────────────────────────────────────────────────────────────────────
+#  FORCE-TRADE MODE (§7D)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Every emit() call must use exactly one of these strings. This makes the
-    block_counter histogram unambiguous and the value_counts() output a
-    single-glance diagnostic.
+FORCE_TRADE = os.environ.get("BOT_FORCE_TRADE") == "1"
+
+
+def relax(value: float, factor: float = 0.5, floor: float | None = None) -> float:
+    """Halve gates when in force-trade mode.
+
+    Usage in strategies:
+        if abs(poly_burst) < relax(self._min_poly_burst, 0.5, floor=0.001):
+            return self._block(BlockReason.NO_BURST, ...)
     """
+    if not FORCE_TRADE:
+        return value
+    out = value * factor
+    return max(out, floor) if floor is not None else out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BlockReason — canonical decision-log reason codes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class BlockReason:
+    """Canonical reasons for every decision-pipeline outcome."""
 
     OK = "ok"
     NO_SIGNAL = "no_signal"
 
-    # Threshold gates
+    # ── Threshold gates ──
     BELOW_MIN_EDGE = "below_min_edge"
     BELOW_MIN_CONFIDENCE = "below_min_confidence"
     BELOW_MIN_NET_SIGNAL = "below_min_net_signal"
@@ -75,11 +66,11 @@ class BlockReason:
     SPREAD_TOO_NARROW = "spread_too_narrow"
     FEE_EXCEEDS_EDGE = "fee_exceeds_edge"
 
-    # Time gates
+    # ── Time gates ──
     TIME_REMAINING_TOO_LOW = "time_remaining_too_low"
     TIME_REMAINING_TOO_HIGH = "time_remaining_too_high"
 
-    # Execution gates
+    # ── Execution gates ──
     COOLDOWN = "cooldown"
     RISK_BLOCK = "risk_block"
     POSITION_CAP = "position_cap"
@@ -87,7 +78,7 @@ class BlockReason:
     KILL_SWITCH = "kill_switch"
     DAILY_LOSS_HALT = "daily_loss_halt"
 
-    # Data quality gates
+    # ── Data quality gates ──
     STALE_ORDERBOOK = "stale_orderbook"
     EMPTY_ORDERBOOK = "empty_orderbook"
     FEED_WARMING = "feed_warming"
@@ -95,21 +86,44 @@ class BlockReason:
     INVALID_BOOK = "invalid_book"
     NO_FEED = "no_feed"
 
-    # Direction / consistency gates
+    # ── Direction / consistency gates ──
     WRONG_DIRECTION = "wrong_direction"
     DIRECTION_CONFLICT = "direction_conflict"
     MOMENTUM_CONFLICT = "momentum_conflict"
     BURST_NOT_BTC_DRIVEN = "burst_not_btc_driven"
 
-    # Misc
+    # ── Misc ──
     AGGREGATOR_DROPPED = "aggregator_dropped"
     BTC_VOL_ZERO = "btc_vol_zero"
     BTC_FEED_INVALID = "btc_feed_invalid"
 
+    # ── NEW: Data freshness diagnostics ──
+    POLY_FEED_NEVER_ARRIVED = "poly_feed_never_arrived"
+    BTC_FEED_NOT_SUBSCRIBED = "btc_feed_not_subscribed"
+    ORDERBOOK_TOO_LATE = "orderbook_too_late"
+    MARKET_TOO_NEW = "market_too_new"
+    MID_NOT_MOVING = "mid_not_moving"
 
-# Process-wide block-reason counter. Reset between cycles is intentional;
-# this is meant to accumulate over the bot's lifetime so you can run
-# `block_counter.most_common(10)` at any point.
+    # ── NEW: Sizing diagnostics ──
+    SIZED_TO_ZERO = "sized_to_zero"
+    KELLY_NEGATIVE = "kelly_negative"
+
+    # ── NEW: Aggregator-specific (split out from generic LOW_CONFIDENCE) ──
+    AGG_DROPPED_LOW_CONF = "agg_dropped_low_conf"
+    AGG_CONFLICT_ABSTAIN = "agg_conflict_abstain"
+
+    # ── NEW: Stage-numbered overshoot lifecycle (sortable in analyze.py) ──
+    OVR_01_FEED_WARMING = "ovr_01_feed_warming"
+    OVR_02_TIME_RANGE = "ovr_02_time_range"
+    OVR_03_BOOK_INVALID = "ovr_03_book_invalid"
+    OVR_04_BTC_MOVE = "ovr_04_btc_move"
+    OVR_05_NO_BURST = "ovr_05_no_burst"
+    OVR_06_DIRECTION = "ovr_06_direction"
+    OVR_07_OVERSHOOT_RANGE = "ovr_07_overshoot_range"
+    OVR_08_EDGE = "ovr_08_edge"
+
+
+# Process-wide block-reason counter
 block_counter: Counter[str] = Counter()
 
 
@@ -119,12 +133,7 @@ block_counter: Counter[str] = Counter()
 
 
 class _DecisionLogger:
-    """Writes one JSON line per emit() call.
-
-    Lazy file open; rotates daily based on UTC date. Thread-safe enough for
-    asyncio (single writer per process). Uses os.fsync semantics on flush
-    every N writes to bound data loss to ~N decisions on crash.
-    """
+    """Writes one JSON line per emit() call with daily rotation."""
 
     def __init__(
         self,
@@ -149,16 +158,11 @@ class _DecisionLogger:
                     pass
                 self._fh = None
             self._current_date = today
-            # Rotate yesterday's log if it exists
             base = Path(self._path)
             if base.exists() and self._current_date:
                 rotated = base.with_name(f"{base.stem}.{self._current_date}{base.suffix}")
-                # Only rotate if not already rotated today (e.g. on restart)
                 if not rotated.exists():
                     try:
-                        # We rename the existing file to yesterday's date if it
-                        # has any content from before midnight UTC.
-                        # Simple heuristic: rotate if last-modified is before UTC midnight today.
                         import os as _os
                         from datetime import timezone as _tz
                         mtime = datetime.fromtimestamp(_os.path.getmtime(base), tz=_tz.utc)
@@ -188,7 +192,6 @@ class _DecisionLogger:
                 fh.flush()
                 self._writes_since_flush = 0
         except Exception:
-            # Logging must never break the trading loop.
             pass
 
     def close(self) -> None:
@@ -214,7 +217,6 @@ _logger = _DecisionLogger(path=_LOG_PATH)
 
 
 def configure(path: str | None = None, flush_every: int = 25) -> None:
-    """Reconfigure the singleton decision logger (path, flush cadence)."""
     global _logger
     _logger.close()
     _logger = _DecisionLogger(
@@ -224,7 +226,6 @@ def configure(path: str | None = None, flush_every: int = 25) -> None:
 
 
 def shutdown() -> None:
-    """Flush and close the decision log. Call from bot.stop()."""
     _logger.close()
 
 
@@ -259,7 +260,7 @@ def emit(
     kelly_f: float = 0.0,
     extra: dict | None = None,
 ) -> None:
-    """Emit one decision-log line. Always called once per (strategy, market) per cycle."""
+    """Emit one decision-log line."""
     block_counter[reason] += 1
     payload = {
         "ts": time.time(),
@@ -286,9 +287,9 @@ def emit(
         "poly_burst_5s": _round(poly_burst_5s, 5),
         "size_usd": _round(size_usd, 2),
         "kelly_f": _round(kelly_f, 4),
+        "force_trade": FORCE_TRADE,
     }
     if extra:
-        # Don't let extra fields clobber canonical ones
         for k, v in extra.items():
             if k not in payload:
                 payload[k] = v
@@ -303,10 +304,8 @@ def _round(v: float, digits: int) -> float:
 
 
 def block_summary(top_n: int = 15) -> dict[str, int]:
-    """Return the most common block reasons. Call this from the dashboard."""
     return dict(block_counter.most_common(top_n))
 
 
 def reset_counter() -> None:
-    """Reset the block-reason counter. Use sparingly — most useful in tests."""
     block_counter.clear()
