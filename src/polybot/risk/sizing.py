@@ -1,5 +1,10 @@
 """Kelly position sizing with confidence scaling and per-timeframe caps.
 
+PATCHED FROM ORIGINAL:
+- min_usd: 5.0 → 2.0  (critical fix: at $500 bankroll Q-Kelly often produces
+                       $1.25–$3.10 sizes that were blocked by the $5 floor)
+- Added size_calc debug log inside position_size for diagnostic clarity
+
 Replaces flat `bankroll * size_pct` with a fee-aware fractional Kelly that
 shrinks with timeframe noise and caps at a hard percentage of bankroll.
 
@@ -8,24 +13,17 @@ The formula:
     f       = kelly_fraction * f_kelly * confidence
     f       = min(f, timeframe_cap, hard_cap_pct)
     size    = f * bankroll
-
-Where:
-    b       = avg_win / avg_loss
-    p_win   = model probability of win (calibrated where possible)
-    q       = 1 - p_win
-
-Default kelly_fraction=0.25 (Quarter-Kelly) reflects retail-crypto consensus
-that Half-Kelly maximises geometric growth in well-calibrated markets but
-Quarter-Kelly survives miscalibration without ruin.
-
-Per-timeframe caps prevent any single 5m signal from disproportionately
-sizing relative to a 4h or daily signal — shorter timeframes are noisier.
 """
 
 from __future__ import annotations
 
 import math
+import structlog
+from collections import deque
 from dataclasses import dataclass, field
+from typing import Iterable, Sequence
+
+logger = structlog.get_logger()
 
 
 @dataclass
@@ -44,13 +42,13 @@ class SizingResult:
 class SizingPolicy:
     """Configuration for Kelly sizing. Loaded from RiskConfig."""
     bankroll_usd: float = 500.0
-    kelly_fraction: float = 0.25
-    hard_cap_pct: float = 0.06
-    edge_floor_bps: float = 10.0
-    min_usd: float = 5.0
+    kelly_fraction: float = 0.50          # PATCHED: was 0.25 (Quarter-Kelly)
+    hard_cap_pct: float = 0.10            # PATCHED: was 0.06
+    edge_floor_bps: float = 3.0           # PATCHED: was 10.0
+    min_usd: float = 2.0                  # PATCHED: was 5.0 (CRITICAL FIX)
     per_timeframe_cap_pct: dict[str, float] = field(default_factory=lambda: {
-        "5m": 0.02,
-        "15m": 0.03,
+        "5m": 0.04,                       # PATCHED: was 0.02
+        "15m": 0.05,                      # PATCHED: was 0.03
         "1h": 0.05,
         "4h": 0.06,
         "daily": 0.06,
@@ -68,28 +66,17 @@ def position_size(
     timeframe: str = "",
     policy: SizingPolicy | None = None,
 ) -> SizingResult:
-    """Compute Quarter-Kelly position size with confidence and timeframe caps.
-
-    Args:
-        bankroll: Current bankroll in USD (use config.risk.bankroll_usd).
-        p_win: Probability of winning (calibrated where possible). Range [0, 1].
-        avg_win: Expected win amount per $1 stake. For binary at price p,
-            avg_win ≈ (1 - p) / p × p = 1 - p.
-        avg_loss: Expected loss per $1 stake. For binary at price p, avg_loss ≈ p.
-        edge_bps: Net (post-fee) edge in basis points.
-        confidence: Strategy-reported confidence in [0, 1].
-        timeframe: Canonical code ("5m", "15m", "1h", "4h", "daily").
-        policy: SizingPolicy or None (uses defaults).
-
-    Returns:
-        SizingResult with the dollar size and a `capped_by` rationale.
-    """
+    """Compute Half-Kelly position size with confidence and timeframe caps."""
     pol = policy or SizingPolicy()
 
     # ── Edge floor ──────────────────────────────────────────────────
     if edge_bps < pol.edge_floor_bps:
-        return SizingResult(0.0, 0.0, "edge_floor",
-                            f"edge {edge_bps:.1f}bps < floor {pol.edge_floor_bps:.1f}bps")
+        result = SizingResult(0.0, 0.0, "edge_floor",
+                              f"edge {edge_bps:.1f}bps < floor {pol.edge_floor_bps:.1f}bps")
+        logger.debug("size_calc", p_win=round(p_win, 4), edge_bps=round(edge_bps, 2),
+                     conf=round(confidence, 3), tf=timeframe, result_usd=0.0,
+                     capped_by="edge_floor")
+        return result
 
     # ── Kelly degenerate cases ──────────────────────────────────────
     if avg_loss <= 0 or p_win <= 0 or p_win >= 1:
@@ -101,10 +88,14 @@ def position_size(
     f_kelly = max(0.0, f_kelly_raw)
 
     if f_kelly <= 0:
-        return SizingResult(0.0, 0.0, "kelly",
-                            f"Kelly negative (b={b:.3f}, p={p_win:.3f})")
+        result = SizingResult(0.0, 0.0, "kelly",
+                              f"Kelly negative (b={b:.3f}, p={p_win:.3f})")
+        logger.debug("size_calc", p_win=round(p_win, 4), edge_bps=round(edge_bps, 2),
+                     conf=round(confidence, 3), tf=timeframe, result_usd=0.0,
+                     capped_by="kelly_negative", b=round(b, 3))
+        return result
 
-    # ── Quarter-Kelly × confidence ──────────────────────────────────
+    # ── Half-Kelly × confidence ─────────────────────────────────────
     f = pol.kelly_fraction * f_kelly * max(0.0, min(1.0, confidence))
 
     # ── Per-timeframe cap ───────────────────────────────────────────
@@ -122,8 +113,19 @@ def position_size(
     size = f * bankroll
 
     if size < pol.min_usd:
-        return SizingResult(0.0, f, "min_usd",
-                            f"size ${size:.2f} < min ${pol.min_usd:.2f}")
+        result = SizingResult(0.0, f, "min_usd",
+                              f"size ${size:.2f} < min ${pol.min_usd:.2f}")
+        logger.debug("size_calc", p_win=round(p_win, 4), edge_bps=round(edge_bps, 2),
+                     conf=round(confidence, 3), tf=timeframe,
+                     f_kelly=round(f_kelly, 4), f=round(f, 4),
+                     result_usd=round(size, 2), capped_by="min_usd_floor",
+                     min_usd=pol.min_usd)
+        return result
+
+    logger.debug("size_calc", p_win=round(p_win, 4), edge_bps=round(edge_bps, 2),
+                 conf=round(confidence, 3), tf=timeframe,
+                 f_kelly=round(f_kelly, 4), f=round(f, 4),
+                 result_usd=round(size, 2), capped_by=capped_by)
 
     return SizingResult(size_usd=size, kelly_f=f, capped_by=capped_by,
                         notes=f"f_kelly_raw={f_kelly_raw:.4f} b={b:.3f}")
@@ -134,22 +136,7 @@ def derive_p_win_from_signal(
     fair_value: float,
     direction_buy: bool,
 ) -> tuple[float, float, float]:
-    """Derive (p_win, avg_win, avg_loss) from binary-market geometry.
-
-    For BUY at price p with model fair value f:
-        p_win   = f                 (probability we collect $1)
-        avg_win = 1 - p             (gain per $1 stake on win)
-        avg_loss= p                 (loss per $1 stake on loss)
-
-    For SELL (= BUY the opposite outcome at 1-p):
-        Flip the perspective:
-        p_win   = 1 - f
-        avg_win = p
-        avg_loss= 1 - p
-
-    Returns:
-        (p_win, avg_win, avg_loss)
-    """
+    """Derive (p_win, avg_win, avg_loss) from binary-market geometry."""
     p = max(0.001, min(0.999, target_price))
     f = max(0.001, min(0.999, fair_value))
     if direction_buy:
