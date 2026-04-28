@@ -1,12 +1,12 @@
 """Risk management — limits, sizing, exposure tracking.
 
-PATCHED v2 — fixes from first run:
-1. Exit orders (strategy starts with 'exit_' or 'auto_exit') BYPASS max_order_size.
-   Closing existing exposure is not new risk; blocking exits creates the infinite
-   auto_close loop we observed (order_size $183.17 exceeds max $30).
-2. Exit orders also bypass the portfolio-budget check — you must always be able
-   to close a position, regardless of remaining budget.
-3. New: emit decision-log line on every block instead of just the open() path.
+PATCHED v3 — fixes the zero-size bug from v2 run:
+1. Exit orders bypass max_order_size + portfolio budget (from v2)
+2. NEW: kelly_size_for_signal() now FLOORS to min_usd whenever signal has edge.
+   Previously, when Kelly math computed size < min_usd, sizing.py returned 0,
+   producing 'sz=0.0' orders. Now we snap up to min_usd ($2 default) instead.
+3. NEW: every sizing call emits a debug-log line so you can see what was
+   computed and why it was capped (visible in --log-level DEBUG).
 """
 
 from __future__ import annotations
@@ -40,6 +40,12 @@ def _is_exit_order(order: Order) -> bool:
     return s.startswith("exit_") or s.startswith("auto_exit")
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Defensive sizing floor: NEVER return 0 if signal has edge
+# ─────────────────────────────────────────────────────────────────────────
+DEFENSIVE_MIN_USD = 2.0
+
+
 class RiskManager:
     """Enforces risk limits and computes Kelly-aware position sizes."""
 
@@ -55,9 +61,11 @@ class RiskManager:
             kelly_fraction=config.kelly_fraction,
             hard_cap_pct=config.hard_cap_pct,
             edge_floor_bps=config.edge_floor_bps,
-            min_usd=getattr(config, "min_usd", 2.0),
+            min_usd=getattr(config, "min_usd", DEFENSIVE_MIN_USD),
             per_timeframe_cap_pct=dict(config.per_timeframe_cap_pct),
         )
+        self._zero_size_counter = 0
+        self._last_zero_warn_ts = 0.0
 
     @property
     def config(self) -> RiskConfig:
@@ -120,7 +128,7 @@ class RiskManager:
         return True, "ok"
 
     # ─────────────────────────────────────────────────────────────────
-    #  Sizing
+    #  Sizing (PATCHED v3)
     # ─────────────────────────────────────────────────────────────────
 
     def kelly_size_for_signal(
@@ -133,14 +141,18 @@ class RiskManager:
         fair_value = float(meta.get("fair_value", 0.0))
         edge_bps = float(meta.get("edge_bps", 0.0))
 
+        # Legacy fallback path
         if fair_value <= 0 or edge_bps <= 0:
             size = max(0.0, bankroll * signal.size_pct)
             if size > self._config.max_position_size:
                 size = self._config.max_position_size
+            # v3 floor
+            if size <= 0 and signal.confidence > 0:
+                size = DEFENSIVE_MIN_USD
             return SizingResult(
                 size_usd=size,
                 kelly_f=signal.size_pct,
-                capped_by="legacy_size_pct",
+                capped_by="legacy_size_pct" if size > 0 else "legacy_floor",
                 notes="no fair_value/edge_bps in signal.metadata",
             )
 
@@ -162,14 +174,61 @@ class RiskManager:
             policy=self._sizing_policy,
         )
 
+        # ── v3 DEFENSIVE FLOOR ───────────────────────────────────────
+        # If sizing returned 0 (or near-zero) but we have a real signal,
+        # snap up to min_usd. Prevents the 'sz=0.0 fill=0.0' regression.
+        min_floor = max(
+            DEFENSIVE_MIN_USD,
+            getattr(self._config, "min_usd", DEFENSIVE_MIN_USD),
+        )
+
+        if result.size_usd <= 0.0:
+            # Hard zero from sizing.py — snap up if signal has any edge
+            if edge_bps >= self._sizing_policy.edge_floor_bps:
+                result.size_usd = min_floor
+                result.capped_by = "v3_floor_recovery"
+                result.notes = (result.notes or "") + " | snapped from 0 to min_usd"
+                self._zero_size_counter += 1
+                # Throttled warning so we know it's happening
+                now = time.time()
+                if now - self._last_zero_warn_ts > 30:
+                    self._last_zero_warn_ts = now
+                    logger.warning(
+                        "sizing_floor_recovery",
+                        count_total=self._zero_size_counter,
+                        edge_bps=edge_bps,
+                        confidence=signal.confidence,
+                        target=signal.target_price,
+                        strategy=signal.strategy,
+                        action="snapped_to_min_usd",
+                        min_usd=min_floor,
+                    )
+        elif 0 < result.size_usd < min_floor:
+            # Below min — snap up
+            result.size_usd = min_floor
+            result.capped_by = "v3_min_floor"
+            result.notes = (result.notes or "") + f" | floored to min_usd=${min_floor}"
+
+        # Cap at max_position_size
         if result.size_usd > self._config.max_position_size:
             result.size_usd = float(self._config.max_position_size)
             result.capped_by = "max_position_size"
 
+        # Debug log every sizing call
+        logger.debug(
+            "sizing_computed",
+            strategy=signal.strategy,
+            size_usd=round(result.size_usd, 2),
+            capped_by=result.capped_by,
+            edge_bps=round(edge_bps, 1),
+            confidence=round(signal.confidence, 3),
+            target=round(signal.target_price, 4),
+        )
+
         return result
 
     # ─────────────────────────────────────────────────────────────────
-    #  Order-level checks (place/execute path)
+    #  Order-level checks (place/execute path) — v2
     # ─────────────────────────────────────────────────────────────────
 
     def can_place_order(
@@ -179,18 +238,15 @@ class RiskManager:
     ) -> tuple[bool, str]:
         """Pre-execution check.
 
-        CRITICAL FIX: exit orders bypass max_order_size and portfolio-budget
+        v2 FIX: exit orders bypass max_order_size and portfolio-budget
         gates. You must always be able to close an existing position.
         """
         notional = order.size * max(order.price, 0.01)
         is_exit = _is_exit_order(order)
 
-        # Exit orders: minimal sanity check only
         if is_exit:
             if notional <= 0:
                 return False, "exit_zero_notional"
-            # Always allow exits, even if they exceed max_order_size or
-            # remaining portfolio budget. The position already exists.
             return True, "ok_exit"
 
         # Entry orders: full risk gate
@@ -200,6 +256,10 @@ class RiskManager:
         remaining = self._config.max_portfolio_exposure - portfolio.total_exposure
         if notional > remaining:
             return False, f"insufficient_portfolio_budget (rem=${remaining:.2f})"
+
+        # v3: explicit zero-size guard
+        if order.size <= 0 or notional <= 0:
+            return False, "zero_size_or_notional"
 
         return True, "ok"
 
