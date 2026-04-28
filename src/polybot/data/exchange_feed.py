@@ -1,11 +1,11 @@
 """Real-time crypto price feeds via WebSocket for minimum latency.
 
-Binance WebSocket bookTicker stream delivers price ticks in ~50ms.
-This version fixes the keepalive timeout issue by:
-1. Aggressive ping_interval (10s) and ping_timeout (10s)
-2. Stale-feed watchdog: forces reconnect if no ticks for 15s
-3. Faster reconnect backoff (0.5s base, 10s max)
-4. Better exception handling — never let the WS task die silently
+PATCHED FROM ORIGINAL:
+1. Multi-endpoint fallback for Binance: tries .com → .us → futures
+   if connection fails (handles Windows firewall / corporate proxy / geo-block)
+2. Logs every connect attempt with exception class for diagnostic clarity
+3. REST fallback to Coinbase widened to also poll Binance REST
+   if all WS endpoints fail
 """
 
 from __future__ import annotations
@@ -59,7 +59,6 @@ class PriceFeedState:
 
     @property
     def is_stale(self) -> bool:
-        """True if no tick received in the last 15 seconds."""
         if self.last_update == 0:
             return False
         return (time.time() - self.last_update) > 15.0
@@ -142,7 +141,6 @@ class PriceFeedState:
         return sum(changes)
 
     def micro_momentum(self) -> float:
-        """Sub-second momentum: weighted 200ms/500ms/1s/2s changes."""
         changes = []
         for ms, weight in [(200, 0.4), (500, 0.3), (1000, 0.2), (2000, 0.1)]:
             pct = self.price_change_since(ms / 1000.0)
@@ -151,20 +149,21 @@ class PriceFeedState:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BINANCE WEBSOCKET STREAM (with keepalive fix)
+#  BINANCE WEBSOCKET STREAM (with multi-endpoint fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class BinanceWebSocketFeed:
-    """Connects to Binance bookTicker stream with proper keepalive handling.
+# Endpoints tried in order. .us works in geo-restricted regions; futures works
+# even when spot is blocked by some firewalls.
+BINANCE_ENDPOINTS = [
+    "wss://stream.binance.com:9443/stream",
+    "wss://stream.binance.us:9443/stream",
+    "wss://fstream.binance.com/stream",
+]
 
-    Fixes from previous version:
-    - ping_interval=10s (was 20s) — Binance can drop idle connections
-    - ping_timeout=10s — fail fast on dead connections
-    - close_timeout=5s — don't hang on disconnect
-    - Stale-feed watchdog: force reconnect if no ticks for 15s
-    - Reconnect backoff: 0.5s base, 10s max (was 1s/30s)
-    """
+
+class BinanceWebSocketFeed:
+    """Connects to Binance bookTicker stream with fallback endpoints."""
 
     def __init__(self, symbols: list[str], feeds: dict[str, PriceFeedState]) -> None:
         self._symbols = symbols
@@ -175,6 +174,7 @@ class BinanceWebSocketFeed:
         self._reconnect_delay = 0.5
         self._force_reconnect = asyncio.Event()
         self._connect_count = 0
+        self._endpoint_idx = 0
 
         self._symbol_map = {
             "btcusdt": "BTC",
@@ -215,11 +215,11 @@ class BinanceWebSocketFeed:
                 streams.append(f"{binance_sym}@bookTicker")
         if not streams:
             return ""
-        return f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+        endpoint = BINANCE_ENDPOINTS[self._endpoint_idx % len(BINANCE_ENDPOINTS)]
+        return f"{endpoint}?streams={'/'.join(streams)}"
 
     async def _watchdog_loop(self) -> None:
-        """Monitors feed freshness. Forces reconnect if BTC feed goes stale."""
-        await asyncio.sleep(20)  # Grace period on startup
+        await asyncio.sleep(20)
         while self._running:
             try:
                 await asyncio.sleep(5)
@@ -241,15 +241,23 @@ class BinanceWebSocketFeed:
         import websockets
         from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
-        url = self._build_stream_url()
-        if not url:
-            logger.error("binance_ws_no_symbols")
-            return
+        consecutive_failures_per_endpoint: dict[int, int] = {}
 
         while self._running:
             self._connect_count += 1
+            url = self._build_stream_url()
+            if not url:
+                logger.error("binance_ws_no_symbols")
+                return
+
+            current_endpoint = BINANCE_ENDPOINTS[self._endpoint_idx % len(BINANCE_ENDPOINTS)]
             try:
-                # Aggressive keepalive: ping every 10s, fail if no pong in 10s
+                logger.info(
+                    "binance_ws_connecting",
+                    endpoint=current_endpoint,
+                    attempt=self._connect_count,
+                    endpoint_idx=self._endpoint_idx,
+                )
                 async with websockets.connect(
                     url,
                     ping_interval=10,
@@ -259,13 +267,13 @@ class BinanceWebSocketFeed:
                 ) as ws:
                     self._reconnect_delay = 0.5
                     self._force_reconnect.clear()
+                    consecutive_failures_per_endpoint[self._endpoint_idx] = 0
                     logger.info(
                         "binance_ws_connected",
+                        endpoint=current_endpoint,
                         symbols=self._symbols,
-                        connect_num=self._connect_count,
                     )
 
-                    # Read messages with watchdog interrupt
                     receive_task = asyncio.create_task(self._receive_loop(ws))
                     reconnect_task = asyncio.create_task(self._force_reconnect.wait())
 
@@ -281,23 +289,42 @@ class BinanceWebSocketFeed:
                         except (asyncio.CancelledError, Exception):
                             pass
 
-                    # If reconnect was forced, log it
-                    if self._force_reconnect.is_set():
-                        logger.info("binance_ws_force_reconnect_triggered")
-
             except (ConnectionClosed, ConnectionClosedError) as e:
-                logger.warning("binance_ws_disconnected", code=getattr(e, "code", None))
+                logger.warning("binance_ws_disconnected",
+                               endpoint=current_endpoint,
+                               code=getattr(e, "code", None))
+                consecutive_failures_per_endpoint[self._endpoint_idx] = (
+                    consecutive_failures_per_endpoint.get(self._endpoint_idx, 0) + 1
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("binance_ws_error", error=str(e), error_type=type(e).__name__)
+                logger.error(
+                    "binance_ws_error",
+                    endpoint=current_endpoint,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                consecutive_failures_per_endpoint[self._endpoint_idx] = (
+                    consecutive_failures_per_endpoint.get(self._endpoint_idx, 0) + 1
+                )
+
+            # If this endpoint has failed 3 times in a row, rotate to next
+            if consecutive_failures_per_endpoint.get(self._endpoint_idx, 0) >= 3:
+                old_idx = self._endpoint_idx
+                self._endpoint_idx = (self._endpoint_idx + 1) % len(BINANCE_ENDPOINTS)
+                logger.warning(
+                    "binance_ws_rotating_endpoint",
+                    from_endpoint=BINANCE_ENDPOINTS[old_idx],
+                    to_endpoint=BINANCE_ENDPOINTS[self._endpoint_idx],
+                )
+                consecutive_failures_per_endpoint[self._endpoint_idx] = 0
 
             if self._running:
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 1.5, 10.0)
 
     async def _receive_loop(self, ws) -> None:
-        """Read messages from the websocket and process ticks."""
         async for raw_msg in ws:
             if not self._running:
                 break
@@ -332,18 +359,29 @@ class BinanceWebSocketFeed:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  COINBASE REST FALLBACK
+#  REST FALLBACK (polls multiple sources at 5 Hz)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class CoinbaseRestFallback:
-    """Polls Coinbase every 2s as a backup price source."""
+class RestFallbackFeed:
+    """Polls REST endpoints when WS feeds are stale.
 
+    Sources tried in order:
+      1. Binance REST: api.binance.com /api/v3/ticker/bookTicker
+      2. Binance.us REST: api.binance.us
+      3. Coinbase: api.coinbase.com
+    """
+
+    BINANCE_REST_URLS = [
+        "https://api.binance.com/api/v3/ticker/bookTicker?symbol={pair}",
+        "https://api.binance.us/api/v3/ticker/bookTicker?symbol={pair}",
+    ]
     COINBASE_URL = "https://api.coinbase.com/v2/prices/{pair}/spot"
-    SYMBOL_MAP = {
-        "BTC": "BTC-USD", "ETH": "ETH-USD",
-        "SOL": "SOL-USD", "XRP": "XRP-USD",
-    }
+
+    BINANCE_PAIR_MAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT",
+                       "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+    COINBASE_PAIR_MAP = {"BTC": "BTC-USD", "ETH": "ETH-USD",
+                        "SOL": "SOL-USD", "XRP": "XRP-USD"}
 
     def __init__(self, symbols: list[str], feeds: dict[str, PriceFeedState]) -> None:
         self._symbols = symbols
@@ -351,6 +389,7 @@ class CoinbaseRestFallback:
         self._client: httpx.AsyncClient | None = None
         self._running = False
         self._task: asyncio.Task | None = None
+        self._working_endpoint_idx: int = 0  # 0=binance.com, 1=binance.us, 2=coinbase
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(timeout=5.0)
@@ -372,31 +411,67 @@ class CoinbaseRestFallback:
         while self._running:
             try:
                 for sym in self._symbols:
-                    pair = self.SYMBOL_MAP.get(sym)
-                    if not pair:
+                    feed = self._feeds[sym]
+                    # Only use REST if WS feed is stale or empty
+                    if not feed.is_stale and feed.last_update > 0:
                         continue
-                    try:
-                        url = self.COINBASE_URL.format(pair=pair)
-                        resp = await self._client.get(url)
-                        if resp.status_code == 200:
-                            price = float(resp.json().get("data", {}).get("amount", 0))
-                            if price > 0:
-                                # Only use Coinbase if Binance feed is stale
-                                feed = self._feeds[sym]
-                                if feed.is_stale or feed.last_update == 0:
-                                    tick = ExchangeTick(
-                                        symbol=sym, price=price,
-                                        timestamp=time.time(), source="coinbase",
-                                    )
-                                    feed.add_tick(tick)
-                    except Exception:
-                        pass
-                await asyncio.sleep(2.0)
+
+                    price = await self._fetch_price(sym)
+                    if price > 0:
+                        tick = ExchangeTick(
+                            symbol=sym, price=price,
+                            timestamp=time.time(),
+                            source=f"rest_{self._working_endpoint_idx}",
+                        )
+                        feed.add_tick(tick)
+                await asyncio.sleep(0.2)  # 5 Hz polling
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.debug("coinbase_poll_error", error=str(e))
-                await asyncio.sleep(2.0)
+                logger.debug("rest_poll_error", error=str(e))
+                await asyncio.sleep(1.0)
+
+    async def _fetch_price(self, sym: str) -> float:
+        # Try the last working endpoint first
+        for offset in range(3):
+            idx = (self._working_endpoint_idx + offset) % 3
+            try:
+                if idx == 0:
+                    pair = self.BINANCE_PAIR_MAP.get(sym)
+                    if not pair:
+                        continue
+                    url = self.BINANCE_REST_URLS[0].format(pair=pair)
+                    resp = await self._client.get(url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        bid, ask = float(data["bidPrice"]), float(data["askPrice"])
+                        self._working_endpoint_idx = idx
+                        return (bid + ask) / 2.0
+                elif idx == 1:
+                    pair = self.BINANCE_PAIR_MAP.get(sym)
+                    if not pair:
+                        continue
+                    url = self.BINANCE_REST_URLS[1].format(pair=pair)
+                    resp = await self._client.get(url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        bid, ask = float(data["bidPrice"]), float(data["askPrice"])
+                        self._working_endpoint_idx = idx
+                        return (bid + ask) / 2.0
+                elif idx == 2:
+                    pair = self.COINBASE_PAIR_MAP.get(sym)
+                    if not pair:
+                        continue
+                    url = self.COINBASE_URL.format(pair=pair)
+                    resp = await self._client.get(url)
+                    if resp.status_code == 200:
+                        price = float(resp.json().get("data", {}).get("amount", 0))
+                        if price > 0:
+                            self._working_endpoint_idx = idx
+                            return price
+            except Exception:
+                continue
+        return 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,7 +480,7 @@ class CoinbaseRestFallback:
 
 
 class ExchangePriceFeed:
-    """Aggregates real-time prices. Primary: Binance WS. Fallback: Coinbase REST."""
+    """Aggregates real-time prices from WS + REST fallback."""
 
     def __init__(self, symbols: list[str] | None = None, poll_interval: float = 0.5) -> None:
         self._symbols = symbols or ["BTC", "ETH", "SOL", "XRP"]
@@ -413,7 +488,7 @@ class ExchangePriceFeed:
         self._feeds: dict[str, PriceFeedState] = {s: PriceFeedState() for s in self._symbols}
 
         self._binance_ws = BinanceWebSocketFeed(self._symbols, self._feeds)
-        self._coinbase_rest = CoinbaseRestFallback(self._symbols, self._feeds)
+        self._rest_fallback = RestFallbackFeed(self._symbols, self._feeds)
 
     @property
     def feeds(self) -> dict[str, PriceFeedState]:
@@ -428,15 +503,14 @@ class ExchangePriceFeed:
 
     async def start(self) -> None:
         await self._binance_ws.start()
-        await self._coinbase_rest.start()
+        await self._rest_fallback.start()
         logger.info(
             "exchange_feed_started",
             symbols=self._symbols,
-            primary="binance_ws",
-            fallback="coinbase_rest",
-            keepalive="10s ping, 15s stale watchdog",
+            primary="binance_ws_with_fallback",
+            secondary="rest_5hz",
         )
 
     async def stop(self) -> None:
         await self._binance_ws.stop()
-        await self._coinbase_rest.stop()
+        await self._rest_fallback.stop()
