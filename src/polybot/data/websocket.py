@@ -1,202 +1,312 @@
-"""WebSocket connection manager for real-time Polymarket data.
+"""Maker edge — passive liquidity provision.
 
-PATCHED FROM ORIGINAL:
-1. Silent-freeze watchdog: if no `book`/`price_change` event in 60s, force reconnect.
-   This addresses py-clob-client #292 — connection looks alive (PING/PONG works) but
-   server stops sending book deltas.
-2. Stamps polymarket_book health on every successful book event.
-3. Logs ws_book_event for diagnostics — count this in PowerShell to verify
-   data is actually flowing.
+PATCHED v2 — fixes from first run observation:
+The previous version fired the SAME signal every 500ms because:
+  1. _inventory was never updated (no fill hook)
+  2. Same orderbook (WS frozen) → same mid/spread → same target → same signal
+  3. Cooldown was per-(strategy, market) at 1s; maker fired every 1s for 13s
+     and accumulated $195 of position before portfolio cap stopped it
+
+Fixes:
+  1. update_inventory() is now actually called (wire-up in main._on_order_filled
+     adds an inventory tracker per (strategy, market))
+  2. New _last_quote_ts per market — won't re-quote within 5s on same market
+     unless mid/spread materially changed (>2 bps move)
+  3. Self-imposed notional cap: tracks dollar value of open inventory and
+     refuses to add more than max_position_notional_usd ($30 default)
+  4. Decision-log line now includes inventory_notional_usd for visibility
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import time
+from datetime import datetime
 
 import structlog
-import websockets
-from websockets.exceptions import ConnectionClosed
 
-from polybot.events import EventBus
-from polybot.health_monitor import get_monitor
+from polybot.data.models import Direction, MarketSnapshot, Signal
+from polybot.diagnostics.decision_log import BlockReason, FORCE_TRADE, emit, relax
+from polybot.strategies.base import BaseStrategy
 
 logger = structlog.get_logger()
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# Watchdog threshold: if no book event in this many seconds, force reconnect
-SILENT_FREEZE_THRESHOLD_S = 60.0
-WATCHDOG_INTERVAL_S = 10.0
+class MakerEdgeStrategy(BaseStrategy):
+    """Posts inside-spread quotes to capture spread + maker rebate."""
 
+    def __init__(
+        self,
+        min_spread: float = 0.008,
+        quote_offset: float = 0.003,
+        max_inventory: float = 0.30,
+        inventory_skew: float = 0.5,
+        size_pct: float = 0.04,
+        time_of_day_filter: bool = False,
+        volume_boost_threshold: float = 100.0,
+        confidence_floor: float = 0.40,
+        # NEW: dollar cap per market — prevents the $195 runaway
+        max_position_notional_usd: float = 30.0,
+        # NEW: minimum seconds between quotes on same market (was implicit cooldown)
+        min_quote_interval_s: float = 5.0,
+        # NEW: skip re-quote if mid moved less than this many cents
+        min_mid_change_to_requote: float = 0.005,
+    ) -> None:
+        self._min_spread = float(min_spread)
+        self._quote_offset = float(quote_offset)
+        self._max_inventory = float(max_inventory)
+        self._inventory_skew = float(inventory_skew)
+        self._size_pct = float(size_pct)
+        self._time_of_day_filter = bool(time_of_day_filter)
+        self._volume_boost_threshold = float(volume_boost_threshold)
+        self._confidence_floor = float(confidence_floor)
+        self._max_position_notional = float(max_position_notional_usd)
+        self._min_quote_interval = float(min_quote_interval_s)
+        self._min_mid_change = float(min_mid_change_to_requote)
 
-class WebSocketManager:
-    """Manages WebSocket connections with auto-reconnect AND silent-freeze detection."""
-
-    def __init__(self, event_bus: EventBus) -> None:
-        self._event_bus = event_bus
-        self._subscriptions: set[str] = set()
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._running = False
-        self._reconnect_delay = 1.0
-        self._max_reconnect_delay = 60.0
-        # Silent-freeze watchdog state
-        self._last_data_ts = 0.0
-        self._book_events_received = 0
-        self._force_reconnect = asyncio.Event()
-        self._watchdog_task: asyncio.Task | None = None
-        self._health = get_monitor()
-
-    async def start(self) -> None:
-        self._running = True
-        asyncio.create_task(self._connection_loop())
-        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        self._force_reconnect.set()
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if self._ws:
-            await self._ws.close()
-
-    async def subscribe_market(self, token_id: str) -> None:
-        self._subscriptions.add(token_id)
-        if self._ws:
-            await self._send_subscribe(token_id)
-
-    async def unsubscribe_market(self, token_id: str) -> None:
-        self._subscriptions.discard(token_id)
-        if self._ws:
-            logger.debug("ws_unsubscribed", token_id=token_id[:16])
+        # Per-market state
+        self._inventory_shares: dict[str, float] = {}      # net shares (+long YES, -short YES)
+        self._inventory_notional: dict[str, float] = {}    # dollar notional of open inventory
+        self._last_quote_ts: dict[str, float] = {}         # last quote emit time
+        self._last_quote_mid: dict[str, float] = {}        # last quote's mid
 
     @property
-    def book_events_received(self) -> int:
-        """Diagnostic: total book events received this process lifetime."""
-        return self._book_events_received
+    def name(self) -> str:
+        return "maker_edge"
 
-    async def _watchdog_loop(self) -> None:
-        """Detect py-clob-client #292 silent-freeze: WS alive but no book events."""
-        await asyncio.sleep(15)  # Grace period after startup
-        while self._running:
-            try:
-                await asyncio.sleep(WATCHDOG_INTERVAL_S)
-                if self._last_data_ts == 0:
-                    # Never received any data yet, but WS connected
-                    if self._ws is not None and self._subscriptions:
-                        logger.warning(
-                            "ws_no_data_since_connect",
-                            subscriptions=len(self._subscriptions),
-                            elapsed_s=round(time.time() - self._last_data_ts, 1)
-                            if self._last_data_ts else "never",
-                        )
-                    continue
-                age = time.time() - self._last_data_ts
-                if age > SILENT_FREEZE_THRESHOLD_S:
-                    logger.warning(
-                        "ws_silent_freeze_detected",
-                        age_s=round(age, 1),
-                        threshold_s=SILENT_FREEZE_THRESHOLD_S,
-                        book_events_total=self._book_events_received,
-                        action="forcing_reconnect",
-                    )
-                    self._force_reconnect.set()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.debug("ws_watchdog_err", error=str(e))
+    def update_inventory(self, market_id: str, delta_shares: float, fill_price: float) -> None:
+        """Hook for the bot to inform us of fills.
 
-    async def _connection_loop(self) -> None:
-        while self._running:
-            try:
-                async with websockets.connect(
-                    WS_URL,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    close_timeout=5,
-                ) as ws:
-                    self._ws = ws
-                    self._reconnect_delay = 1.0
-                    self._force_reconnect.clear()
-                    logger.info("ws_connected", url=WS_URL,
-                                subscriptions=len(self._subscriptions))
-                    for token_id in self._subscriptions:
-                        await self._send_subscribe(token_id)
+        Called from main._on_order_filled when a maker_edge order fills.
+        delta_shares: positive=we got long YES, negative=we got short YES
+        """
+        self._inventory_shares[market_id] = (
+            self._inventory_shares.get(market_id, 0.0) + delta_shares
+        )
+        # Notional uses absolute value — we count both long and short as "exposure"
+        self._inventory_notional[market_id] = (
+            self._inventory_notional.get(market_id, 0.0)
+            + abs(delta_shares) * fill_price
+        )
 
-                    receive_task = asyncio.create_task(self._receive_loop(ws))
-                    reconnect_task = asyncio.create_task(self._force_reconnect.wait())
+    def reset_inventory(self, market_id: str) -> None:
+        """Called when a position closes."""
+        self._inventory_shares.pop(market_id, None)
+        self._inventory_notional.pop(market_id, None)
+        self._last_quote_ts.pop(market_id, None)
+        self._last_quote_mid.pop(market_id, None)
 
-                    done, pending = await asyncio.wait(
-                        {receive_task, reconnect_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+    async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
+        cycle_id = f"{int(time.time() * 1000) % 100000:05d}"
+        market_id = snapshot.market.id
+        ob = snapshot.orderbook
 
-                    for task in pending:
-                        task.cancel()
-                        try:
-                            await task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+        common: dict = {
+            "cycle_id": cycle_id,
+            "strategy": self.name,
+            "market_id": market_id,
+            "timeframe": "",
+            "binance_px": 0.0,
+            "fair_value": 0.0,
+            "mid": ob.mid_price,
+            "best_bid": ob.best_bid,
+            "best_ask": ob.best_ask,
+            "spread_bps": ob.spread * 10000,
+            "edge_bps": 0.0,
+            "confidence": 0.0,
+            "decision": "BLOCKED",
+            "reason": BlockReason.NO_SIGNAL,
+            "time_to_expiry_s": 0.0,
+            "ob_age_ms": 0.0,
+            "btc_move_5s": 0.0,
+            "btc_move_30s": 0.0,
+            "btc_move_60s": 0.0,
+            "poly_burst_5s": 0.0,
+            "size_usd": 0.0,
+        }
 
-                    if self._force_reconnect.is_set():
-                        logger.info("ws_force_reconnect_triggered")
+        # Time remaining
+        try:
+            now_dt = datetime.utcnow()
+            end = snapshot.market.end_date
+            if getattr(end, "tzinfo", None) is not None:
+                end = end.replace(tzinfo=None)
+            t_rem = (end - now_dt).total_seconds()
+            common["time_to_expiry_s"] = t_rem
+        except Exception:
+            t_rem = 999.0
 
-            except ConnectionClosed as e:
-                logger.warning("ws_disconnected", code=e.code, reason=str(e.reason))
-            except Exception as e:
-                logger.error("ws_error", error=str(e), error_type=type(e).__name__)
-            finally:
-                self._ws = None
-                if self._running:
-                    await asyncio.sleep(self._reconnect_delay)
-                    self._reconnect_delay = min(
-                        self._reconnect_delay * 1.5, self._max_reconnect_delay
-                    )
+        # Don't quote in last 30s — adverse selection peaks
+        if t_rem < 30.0:
+            common["reason"] = BlockReason.TIME_REMAINING_TOO_LOW
+            emit(**common)
+            return None
 
-    async def _receive_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
-        async for raw_message in ws:
-            try:
-                # Update last-data timestamp on EVERY inbound message
-                self._last_data_ts = time.time()
-                message = json.loads(raw_message)
-                if isinstance(message, list):
-                    for item in message:
-                        await self._handle_message(item)
-                else:
-                    await self._handle_message(message)
-            except json.JSONDecodeError:
-                logger.warning("ws_invalid_json", data=str(raw_message)[:200])
+        if ob.best_bid <= 0 or ob.best_ask >= 1.0:
+            common["reason"] = BlockReason.INVALID_BOOK
+            emit(**common)
+            return None
 
-    async def _handle_message(self, message: dict) -> None:
-        msg_type = message.get("event_type", message.get("type", ""))
+        eff_min_spread = relax(self._min_spread, 0.5, floor=0.003)
+        spread = ob.spread
+        if spread < eff_min_spread:
+            common["reason"] = BlockReason.SPREAD_TOO_NARROW
+            emit(**common)
+            return None
 
-        if msg_type == "book":
-            self._book_events_received += 1
-            self._health.stamp("polymarket_book")
-            if self._book_events_received in (1, 10, 100, 1000):
-                logger.info("ws_book_event_milestone",
-                            count=self._book_events_received)
-            await self._event_bus.emit("orderbook_update", data=message)
-        elif msg_type in ("price_change", "last_trade_price"):
-            self._health.stamp("polymarket_book")
-            await self._event_bus.emit("trade_update", data=message)
-        elif msg_type == "tick_size_change":
-            pass
-        else:
-            logger.debug("ws_unknown_message", type=msg_type,
-                         preview=str(message)[:100])
+        mid = ob.mid_price
+        if mid < 0.05 or mid > 0.95:
+            common["reason"] = BlockReason.OUTSIDE_PRICE_BAND
+            emit(**common)
+            return None
 
-    async def _send_subscribe(self, token_id: str) -> None:
-        """Send subscribe in Polymarket's required format."""
-        if self._ws:
-            msg = json.dumps({
-                "type": "market",
-                "assets_ids": [token_id],
+        if snapshot.market.volume_24h < self._volume_boost_threshold * 0.1:
+            common["reason"] = BlockReason.SPREAD_TOO_NARROW
+            emit(**common)
+            return None
+
+        # ── NEW: Notional cap on this market's inventory ─────────────
+        current_notional = self._inventory_notional.get(market_id, 0.0)
+        if current_notional >= self._max_position_notional:
+            common["reason"] = BlockReason.POSITION_CAP
+            emit(**common, extra={
+                "inventory_notional_usd": current_notional,
+                "cap_usd": self._max_position_notional,
             })
-            await self._ws.send(msg)
-            logger.info("ws_subscribed", token_id=token_id[:16])
+            return None
+
+        # ── NEW: Anti-spam quote interval ────────────────────────────
+        now_ts = time.time()
+        last_ts = self._last_quote_ts.get(market_id, 0.0)
+        last_mid = self._last_quote_mid.get(market_id, 0.0)
+        if last_ts > 0:
+            elapsed = now_ts - last_ts
+            mid_change = abs(mid - last_mid)
+            # If we recently quoted AND mid hasn't moved meaningfully → skip
+            if elapsed < self._min_quote_interval and mid_change < self._min_mid_change:
+                common["reason"] = BlockReason.COOLDOWN
+                emit(**common, extra={
+                    "elapsed_s": round(elapsed, 1),
+                    "mid_change": round(mid_change, 4),
+                    "min_interval": self._min_quote_interval,
+                })
+                return None
+
+        # ── Inventory-aware side selection ───────────────────────────
+        inventory_shares = self._inventory_shares.get(market_id, 0.0)
+        imbalance = ob.book_imbalance
+
+        # Long → prefer SELL; short → prefer BUY; flat → follow imbalance
+        if inventory_shares > self._max_inventory * 0.5:
+            direction = Direction.SELL
+            outcome = "Yes"
+        elif inventory_shares < -self._max_inventory * 0.5:
+            direction = Direction.BUY
+            outcome = "Yes"
+        elif imbalance > 0.15:
+            direction = Direction.BUY
+            outcome = "Yes"
+        elif imbalance < -0.15:
+            direction = Direction.SELL
+            outcome = "Yes"
+        else:
+            common["reason"] = BlockReason.NO_SIGNAL
+            emit(**common)
+            return None
+
+        # Inventory cap check (shares-based)
+        if direction == Direction.BUY and inventory_shares >= self._max_inventory:
+            common["reason"] = BlockReason.POSITION_CAP
+            emit(**common)
+            return None
+        if direction == Direction.SELL and inventory_shares <= -self._max_inventory:
+            common["reason"] = BlockReason.POSITION_CAP
+            emit(**common)
+            return None
+
+        # ── Quote price ──────────────────────────────────────────────
+        skew_adj = self._inventory_skew * (
+            inventory_shares / max(self._max_inventory, 1e-9)
+        )
+        half_spread = max(self._quote_offset, spread / 2.0 - 0.001)
+        if direction == Direction.BUY:
+            target_price = max(0.01, mid - half_spread - 0.005 * skew_adj)
+        else:
+            target_price = min(0.99, mid + half_spread + 0.005 * skew_adj)
+
+        tick = 0.001 if (mid < 0.04 or mid > 0.96) else 0.01
+        target_price = round(target_price / tick) * tick
+
+        edge = half_spread
+        edge_bps = edge * 10000
+        common["edge_bps"] = edge_bps
+
+        confidence = max(
+            self._confidence_floor,
+            min(0.85, 0.4 + edge * 4 + abs(imbalance) * 0.2),
+        )
+        common["confidence"] = confidence
+        common["fair_value"] = mid
+        common["decision"] = direction.value
+        common["reason"] = BlockReason.OK
+
+        # Stamp this quote
+        self._last_quote_ts[market_id] = now_ts
+        self._last_quote_mid[market_id] = mid
+
+        emit(**common, extra={
+            "inventory_shares": inventory_shares,
+            "inventory_notional_usd": current_notional,
+            "imbalance": imbalance,
+            "half_spread": half_spread,
+            "target_price": target_price,
+        })
+
+        logger.info(
+            "maker_signal",
+            m=market_id[:12],
+            dir=direction.value,
+            target=round(target_price, 4),
+            mid=round(mid, 4),
+            spread=round(spread, 4),
+            inv=round(inventory_shares, 3),
+            inv_usd=round(current_notional, 2),
+            cap_usd=self._max_position_notional,
+            conf=round(confidence, 3),
+        )
+
+        return Signal(
+            market_id=market_id,
+            strategy=self.name,
+            direction=direction,
+            outcome=outcome,
+            target_price=target_price,
+            confidence=confidence,
+            size_pct=self._size_pct * confidence,
+            reason=(
+                f"Maker quote {direction.value}@{target_price:.4f} "
+                f"mid={mid:.4f} spread={spread:.4f} "
+                f"inv_shares={inventory_shares:+.3f} inv_usd=${current_notional:.2f}"
+            ),
+            metadata={
+                "is_maker_only": True,
+                "is_market_maker": True,
+                "fair_value": mid,
+                "edge_bps": edge_bps,
+                "inventory_shares": inventory_shares,
+                "inventory_notional_usd": current_notional,
+                "imbalance": imbalance,
+            },
+        )
+
+    def get_params(self) -> dict:
+        return {
+            "min_spread": self._min_spread,
+            "quote_offset": self._quote_offset,
+            "max_inventory_shares": self._max_inventory,
+            "max_position_notional_usd": self._max_position_notional,
+            "min_quote_interval_s": self._min_quote_interval,
+            "inventory_skew": self._inventory_skew,
+            "size_pct": self._size_pct,
+            "confidence_floor": self._confidence_floor,
+            "force_trade": FORCE_TRADE,
+        }
