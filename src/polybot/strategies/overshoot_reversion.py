@@ -1,27 +1,11 @@
 """Overshoot reversion — fades post-burst Polymarket overextension.
 
-PRIMARY strategy after the rescue plan rewrite. Replaces the saturating
-sigmoid fair-value model with a Black-Scholes binary on EWMA realized vol,
-retunes thresholds to spring-2026 BTC volatility regime, and emits a
-canonical decision-log line on every code path.
-
-Hypothesis: competing latency-arb bots create temporary impact on Polymarket
-after sharp BTC moves. The aggregate impact pushes Polymarket past the rational
-Black-Scholes fair value. Over 30–120s, flow normalizes and Polymarket retraces
-30–60% of the overshoot. We fade the overshoot.
-
-Signal:
-  burst    = |poly_move_5s| >= min_poly_burst                 (8 mils default)
-  fair     = N(d2) under EWMA realized vol                    (Black-Scholes binary)
-  overshoot= mid - fair    (same sign as the burst)
-  enter    = burst AND |overshoot| >= min_overshoot AND t_rem >= min_t_rem
-            AND fee_aware_edge >= edge_floor_bps
-  side     = -sign(overshoot)   (fade)
-
-Exits (handled in PositionManager):
-  TP       = entry-direction move >= 0.012   (reverted)
-  Timeout  = position age >= 120s
-  SL       = standard unrealized-loss stop
+PATCHED FROM ORIGINAL:
+1. All thresholds wrapped in `relax()` helper for force-trade mode
+2. Block reasons use stage-numbered codes (OVR_01..OVR_08) for sortable
+   analyze.py output: at a glance you see which lifecycle stage is killing trades
+3. WRONG_DIRECTION and BURST_NOT_BTC_DRIVEN gates SKIPPED in force-trade mode
+4. confidence_floor effectively disabled in force-trade mode (set to 0.30)
 """
 
 from __future__ import annotations
@@ -34,7 +18,12 @@ import structlog
 
 from polybot.data.exchange_feed import PriceFeedState
 from polybot.data.models import Direction, MarketSnapshot, Signal
-from polybot.diagnostics.decision_log import BlockReason, emit
+from polybot.diagnostics.decision_log import (
+    BlockReason,
+    FORCE_TRADE,
+    emit,
+    relax,
+)
 from polybot.strategies.base import BaseStrategy
 from polybot.strategies.fair_value import (
     fair_value as bs_fair_value,
@@ -50,37 +39,28 @@ _SUMMARY_INTERVAL = 60.0
 
 
 class OvershootReversionStrategy(BaseStrategy):
-    """Fades Polymarket bursts that exceed Black-Scholes-implied fair value."""
 
     def __init__(
         self,
-        # BTC trigger
-        min_btc_move_60s_pct: float = 0.0015,
-        min_btc_move_30s_pct: float = 0.0010,
-        # Polymarket burst
-        min_poly_burst: float = 0.008,
-        # Overshoot magnitude
-        min_overshoot: float = 0.010,
-        max_overshoot: float = 0.120,
-        # Time gates
+        min_btc_move_60s_pct: float = 0.0008,
+        min_btc_move_30s_pct: float = 0.0005,
+        min_poly_burst: float = 0.003,
+        min_overshoot: float = 0.005,
+        max_overshoot: float = 0.150,
         min_time_remaining: float = 60.0,
-        max_time_remaining: float = 270.0,
-        # Entry band
+        max_time_remaining: float = 285.0,
         min_poly_mid: float = 0.15,
         max_poly_mid: float = 0.85,
-        max_spread: float = 0.040,
-        min_btc_move_confirm: float = 0.0005,
-        # Sizing
+        max_spread: float = 0.060,
+        min_btc_move_confirm: float = 0.0003,
         size_pct: float = 0.05,
-        confidence_floor: float = 0.50,
+        confidence_floor: float = 0.40,
         window_seconds: float = 300.0,
-        # Fair value model
         fair_value_model: str = "black_scholes",
         sigma_lookback_s: int = 900,
         sigma_halflife_s: int = 60,
-        # Fee awareness
         fee_theta_taker: float = 0.072,
-        edge_floor_bps: float = 10.0,
+        edge_floor_bps: float = 3.0,
     ) -> None:
         self._min_btc_move_60s = float(min_btc_move_60s_pct)
         self._min_btc_move_30s = float(min_btc_move_30s_pct)
@@ -115,12 +95,10 @@ class OvershootReversionStrategy(BaseStrategy):
         self._feed = feed
 
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
-        """Evaluate this market. Always emits one decision-log line."""
         self._cycles += 1
         cycle_id = f"{int(time.time() * 1000) % 100000:05d}"
         market_id = snapshot.market.id
 
-        # Prepare common emit fields (filled in incrementally as we learn more)
         common: dict = {
             "cycle_id": cycle_id,
             "strategy": self.name,
@@ -145,16 +123,18 @@ class OvershootReversionStrategy(BaseStrategy):
             "size_usd": 0.0,
         }
 
-        # ── Feed warming ─────────────────────────────────────────────
-        if self._feed is None or len(self._feed.ticks) < 60:
-            common["reason"] = BlockReason.FEED_WARMING
-            self._count_block(BlockReason.FEED_WARMING)
+        # ── Stage 01: Feed warming ───────────────────────────────────
+        # In force-trade mode, drop tick requirement from 60 to 30
+        min_ticks = relax(60.0, 0.5, floor=20.0)
+        if self._feed is None or len(self._feed.ticks) < min_ticks:
+            common["reason"] = BlockReason.OVR_01_FEED_WARMING
+            self._count_block(BlockReason.OVR_01_FEED_WARMING)
             emit(**common)
             return None
 
         common["binance_px"] = float(self._feed.last_price)
 
-        # ── Time remaining ───────────────────────────────────────────
+        # ── Stage 02: Time remaining ─────────────────────────────────
         now_dt = datetime.utcnow()
         end = snapshot.market.end_date
         if getattr(end, "tzinfo", None) is not None:
@@ -162,18 +142,16 @@ class OvershootReversionStrategy(BaseStrategy):
         t_rem = (end - now_dt).total_seconds()
         common["time_to_expiry_s"] = t_rem
 
-        if t_rem < self._min_t_rem:
-            common["reason"] = BlockReason.TIME_REMAINING_TOO_LOW
-            self._count_block(BlockReason.TIME_REMAINING_TOO_LOW)
-            emit(**common)
-            return None
-        if t_rem > self._max_t_rem:
-            common["reason"] = BlockReason.TIME_REMAINING_TOO_HIGH
-            self._count_block(BlockReason.TIME_REMAINING_TOO_HIGH)
+        # In force-trade mode, widen time gates
+        eff_min_t = relax(self._min_t_rem, 0.5, floor=20.0)
+        eff_max_t = self._max_t_rem if not FORCE_TRADE else self._max_t_rem + 30
+        if t_rem < eff_min_t or t_rem > eff_max_t:
+            common["reason"] = BlockReason.OVR_02_TIME_RANGE
+            self._count_block(BlockReason.OVR_02_TIME_RANGE)
             emit(**common)
             return None
 
-        # ── Orderbook sanity ─────────────────────────────────────────
+        # ── Stage 03: Orderbook sanity ───────────────────────────────
         ob = snapshot.orderbook
         mid = ob.mid_price
         common["mid"] = mid
@@ -182,24 +160,27 @@ class OvershootReversionStrategy(BaseStrategy):
         common["spread_bps"] = ob.spread * 10000
 
         if ob.best_bid <= 0 or ob.best_ask >= 1.0:
-            common["reason"] = BlockReason.INVALID_BOOK
-            self._count_block(BlockReason.INVALID_BOOK)
+            common["reason"] = BlockReason.OVR_03_BOOK_INVALID
+            self._count_block(BlockReason.OVR_03_BOOK_INVALID)
             emit(**common)
             return None
 
-        if not (self._min_mid < mid < self._max_mid):
+        eff_min_mid = relax(self._min_mid, 0.7, floor=0.05)
+        eff_max_mid = 1.0 - eff_min_mid
+        if not (eff_min_mid < mid < eff_max_mid):
             common["reason"] = BlockReason.OUTSIDE_PRICE_BAND
             self._count_block(BlockReason.OUTSIDE_PRICE_BAND)
             emit(**common)
             return None
 
-        if ob.spread > self._max_spread:
+        eff_max_spread = self._max_spread * (2.0 if FORCE_TRADE else 1.0)
+        if ob.spread > eff_max_spread:
             common["reason"] = BlockReason.SPREAD_TOO_WIDE
             self._count_block(BlockReason.SPREAD_TOO_WIDE)
             emit(**common)
             return None
 
-        # ── BTC move features ────────────────────────────────────────
+        # ── Stage 04: BTC move features ──────────────────────────────
         btc_move_5s = float(self._feed.price_change_since(5.0))
         btc_move_10s = float(self._feed.price_change_since(10.0))
         btc_move_30s = float(self._feed.price_change_since(30.0))
@@ -208,33 +189,34 @@ class OvershootReversionStrategy(BaseStrategy):
         common["btc_move_30s"] = btc_move_30s
         common["btc_move_60s"] = btc_move_60s
 
-        # ── Polymarket burst ─────────────────────────────────────────
+        # ── Stage 05: Polymarket burst ──────────────────────────────
         poly_burst = float(getattr(snapshot, "poly_move_5s", 0.0) or 0.0)
         common["poly_burst_5s"] = poly_burst
 
-        if abs(poly_burst) < self._min_poly_burst:
-            common["reason"] = BlockReason.NO_BURST
-            self._count_block(BlockReason.NO_BURST)
+        eff_min_burst = relax(self._min_poly_burst, 0.5, floor=0.001)
+        if abs(poly_burst) < eff_min_burst:
+            common["reason"] = BlockReason.OVR_05_NO_BURST
+            self._count_block(BlockReason.OVR_05_NO_BURST)
             emit(**common)
             return None
 
         # ── BTC move confirmation ────────────────────────────────────
-        if abs(btc_move_10s) < self._min_btc_move:
-            common["reason"] = BlockReason.BTC_MOVE_TOO_SMALL
-            self._count_block(BlockReason.BTC_MOVE_TOO_SMALL)
+        eff_min_btc = relax(self._min_btc_move, 0.5, floor=0.0001)
+        if abs(btc_move_10s) < eff_min_btc:
+            common["reason"] = BlockReason.OVR_04_BTC_MOVE
+            self._count_block(BlockReason.OVR_04_BTC_MOVE)
             emit(**common)
             return None
 
-        # Burst direction must match BTC direction
-        if (poly_burst > 0) != (btc_move_10s > 0):
-            common["reason"] = BlockReason.BURST_NOT_BTC_DRIVEN
-            self._count_block(BlockReason.BURST_NOT_BTC_DRIVEN)
-            emit(**common)
-            return None
+        # ── Stage 06: Direction consistency (SKIPPED in force-trade mode) ──
+        if not FORCE_TRADE:
+            if (poly_burst > 0) != (btc_move_10s > 0):
+                common["reason"] = BlockReason.OVR_06_DIRECTION
+                self._count_block(BlockReason.OVR_06_DIRECTION)
+                emit(**common)
+                return None
 
         # ── Realized vol → fair value ────────────────────────────────
-        # Compute per-second EWMA realized vol from the BTC tick buffer.
-        # We project tick prices onto a 1-Hz lattice via take-last-per-second.
         sigma_per_sec = self._compute_sigma_per_sec()
         if sigma_per_sec <= 0:
             common["reason"] = BlockReason.BTC_VOL_ZERO
@@ -242,7 +224,6 @@ class OvershootReversionStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # BTC move since window open (capped at window_seconds)
         elapsed_in_window = max(5.0, min(self._window_seconds, self._window_seconds - t_rem))
         btc_move_window = float(self._feed.price_change_since(elapsed_in_window))
 
@@ -253,30 +234,30 @@ class OvershootReversionStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # Strike = spot at window open (best estimate from BTC move + current spot)
         strike = spot / (1.0 + btc_move_window) if (1.0 + btc_move_window) > 0 else spot
-
         fair = bs_fair_value(spot, strike, t_rem, sigma_per_sec)
         common["fair_value"] = fair
 
-        overshoot = mid - fair  # positive = mid above fair (fade by selling Yes)
+        overshoot = mid - fair
 
-        # Burst direction must match overshoot sign (if BTC went up and Poly burst up,
-        # but mid is still BELOW fair, that's underreaction not overreaction — abstain)
-        if (overshoot > 0) != (poly_burst > 0):
-            common["reason"] = BlockReason.WRONG_DIRECTION
-            self._count_block(BlockReason.WRONG_DIRECTION)
-            emit(**common)
-            return None
+        # In force-trade mode, skip the burst-direction = overshoot-direction check
+        if not FORCE_TRADE:
+            if (overshoot > 0) != (poly_burst > 0):
+                common["reason"] = BlockReason.OVR_06_DIRECTION
+                self._count_block(BlockReason.OVR_06_DIRECTION)
+                emit(**common)
+                return None
 
+        # ── Stage 07: Overshoot magnitude ────────────────────────────
         abs_os = abs(overshoot)
-        if abs_os < self._min_overshoot:
-            common["reason"] = BlockReason.OVERSHOOT_TOO_SMALL
-            self._count_block(BlockReason.OVERSHOOT_TOO_SMALL)
+        eff_min_os = relax(self._min_overshoot, 0.5, floor=0.002)
+        if abs_os < eff_min_os:
+            common["reason"] = BlockReason.OVR_07_OVERSHOOT_RANGE
+            self._count_block(BlockReason.OVR_07_OVERSHOOT_RANGE)
             emit(**common)
             self._maybe_diag(
                 market_id, mid, fair, poly_burst, btc_move_window,
-                overshoot, t_rem, BlockReason.OVERSHOOT_TOO_SMALL,
+                overshoot, t_rem, BlockReason.OVR_07_OVERSHOOT_RANGE,
             )
             return None
         if abs_os > self._max_overshoot:
@@ -285,9 +266,8 @@ class OvershootReversionStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # ── Fee-aware edge ───────────────────────────────────────────
+        # ── Stage 08: Fee-aware edge ────────────────────────────────
         if overshoot > 0:
-            # Mid above fair → SELL No at best_bid (we want the implied "No" leg)
             net_edge = fee_aware_edge(
                 model_p=1.0 - fair,
                 mid=1.0 - mid,
@@ -305,29 +285,28 @@ class OvershootReversionStrategy(BaseStrategy):
         edge_bps = net_edge * 10000
         common["edge_bps"] = edge_bps
 
-        if edge_bps < self._edge_floor_bps:
-            common["reason"] = BlockReason.FEE_EXCEEDS_EDGE
-            self._count_block(BlockReason.FEE_EXCEEDS_EDGE)
+        eff_edge_floor = relax(self._edge_floor_bps, 0.3, floor=1.0)
+        if edge_bps < eff_edge_floor:
+            common["reason"] = BlockReason.OVR_08_EDGE
+            self._count_block(BlockReason.OVR_08_EDGE)
             emit(**common)
             return None
 
         # ── Direction + entry price ──────────────────────────────────
         if overshoot > 0:
-            # Market too high → SELL (we want NO direction)
             direction = Direction.SELL
             outcome = "No"
             target_price = ob.best_bid
-            if target_price < self._min_mid:
+            if target_price < eff_min_mid:
                 common["reason"] = BlockReason.OUTSIDE_PRICE_BAND
                 self._count_block(BlockReason.OUTSIDE_PRICE_BAND)
                 emit(**common)
                 return None
         else:
-            # Market too low → BUY YES at best_ask
             direction = Direction.BUY
             outcome = "Yes"
             target_price = ob.best_ask
-            if target_price > self._max_mid:
+            if target_price > eff_max_mid:
                 common["reason"] = BlockReason.OUTSIDE_PRICE_BAND
                 self._count_block(BlockReason.OUTSIDE_PRICE_BAND)
                 emit(**common)
@@ -345,11 +324,13 @@ class OvershootReversionStrategy(BaseStrategy):
             + 0.10 * time_score
             + 0.15 * edge_score
         )
-        confidence = max(self._confidence_floor, min(confidence, 0.92))
+
+        # In force-trade mode, the confidence floor drops to 0.30
+        eff_floor = relax(self._confidence_floor, 0.6, floor=0.30)
+        confidence = max(eff_floor, min(confidence, 0.92))
         common["confidence"] = confidence
 
         size_pct_final = self._size_pct * confidence
-        common["size_usd"] = 0.0  # populated downstream by sizer
         common["decision"] = direction.value
         common["reason"] = BlockReason.OK
 
@@ -409,18 +390,11 @@ class OvershootReversionStrategy(BaseStrategy):
     # ─────────────────────────────────────────────────────────────────
 
     def _compute_sigma_per_sec(self) -> float:
-        """Compute EWMA per-second realized vol from the BTC tick buffer.
-
-        We construct a 1-Hz price series by sampling the most recent tick of
-        each second over the last sigma_lookback seconds, then call the shared
-        realized_sigma_per_sec helper.
-        """
         if self._feed is None or not self._feed.ticks:
             return 0.0
 
         now_ts = time.time()
         cutoff = now_ts - self._sigma_lookback
-        # Ticks are timestamped; bucket by integer second (latest wins)
         per_sec: dict[int, float] = {}
         for tick in self._feed.ticks:
             if tick.timestamp < cutoff:
@@ -431,7 +405,6 @@ class OvershootReversionStrategy(BaseStrategy):
         if len(per_sec) < 30:
             return realized_sigma_per_sec([], lookback_s=self._sigma_lookback)
 
-        # Build ordered list (oldest → newest)
         sorted_secs = sorted(per_sec)
         prices = [per_sec[s] for s in sorted_secs]
         return realized_sigma_per_sec(
@@ -483,6 +456,7 @@ class OvershootReversionStrategy(BaseStrategy):
                 "overshoot_summary",
                 cycles=self._cycles,
                 blocks=self._blocks,
+                force_trade=FORCE_TRADE,
             )
         self._cycles = 0
         self._blocks = {}
@@ -506,4 +480,5 @@ class OvershootReversionStrategy(BaseStrategy):
             "sigma_halflife_s": self._sigma_halflife,
             "fee_theta_taker": self._fee_theta,
             "edge_floor_bps": self._edge_floor_bps,
+            "force_trade": FORCE_TRADE,
         }
