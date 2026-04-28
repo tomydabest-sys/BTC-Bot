@@ -1,10 +1,12 @@
 """Risk management — limits, sizing, exposure tracking.
 
-Major changes vs original:
-1. Adds `kelly_size_for_signal()` — Quarter-Kelly with confidence + per-tf caps
-2. Decision-log emits on every gate failure (no more silent risk blocks)
-3. Per-strategy daily-loss tracking
-4. Configurable edge floor before any sizing happens
+PATCHED v2 — fixes from first run:
+1. Exit orders (strategy starts with 'exit_' or 'auto_exit') BYPASS max_order_size.
+   Closing existing exposure is not new risk; blocking exits creates the infinite
+   auto_close loop we observed (order_size $183.17 exceeds max $30).
+2. Exit orders also bypass the portfolio-budget check — you must always be able
+   to close a position, regardless of remaining budget.
+3. New: emit decision-log line on every block instead of just the open() path.
 """
 
 from __future__ import annotations
@@ -32,25 +34,28 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
+def _is_exit_order(order: Order) -> bool:
+    """Exit orders are tagged by main._execute_exit / auto_close paths."""
+    s = (order.strategy or "").lower()
+    return s.startswith("exit_") or s.startswith("auto_exit")
+
+
 class RiskManager:
     """Enforces risk limits and computes Kelly-aware position sizes."""
 
     def __init__(self, config: RiskConfig) -> None:
         self._config = config
-        # Per-strategy daily P&L tracking
         self._daily_pnl_by_strategy: dict[str, float] = defaultdict(float)
         self._daily_reset_at: datetime = datetime.utcnow().replace(
             hour=0, minute=0, second=0, microsecond=0
         ) + timedelta(days=1)
-        # Per-strategy open exposure
         self._open_by_strategy: dict[str, float] = defaultdict(float)
-        # Sizing policy (built once from config)
         self._sizing_policy = SizingPolicy(
             bankroll_usd=config.bankroll_usd,
             kelly_fraction=config.kelly_fraction,
             hard_cap_pct=config.hard_cap_pct,
             edge_floor_bps=config.edge_floor_bps,
-            min_usd=5.0,
+            min_usd=getattr(config, "min_usd", 2.0),
             per_timeframe_cap_pct=dict(config.per_timeframe_cap_pct),
         )
 
@@ -85,7 +90,7 @@ class RiskManager:
             self._open_by_strategy[strategy] = 0.0
 
     # ─────────────────────────────────────────────────────────────────
-    #  Pre-trade gates
+    #  Pre-trade gates (entry signals)
     # ─────────────────────────────────────────────────────────────────
 
     def can_open_position(
@@ -94,26 +99,19 @@ class RiskManager:
         signal: Signal,
         timeframe: str = "",
     ) -> tuple[bool, str]:
-        """Check whether opening this position passes all risk gates.
-
-        Returns (allowed, reason). On rejection, also emits a decision-log line.
-        """
         self._maybe_reset_daily()
 
-        # Daily loss kill-switch
         total_daily_pnl = sum(self._daily_pnl_by_strategy.values())
         if total_daily_pnl <= -abs(self._config.max_daily_loss):
             self._emit_block(signal, BlockReason.DAILY_LOSS_HALT,
                              f"daily_pnl ${total_daily_pnl:.2f}")
             return False, "daily_loss_halt"
 
-        # Concurrent-position cap
         if len(portfolio.positions) >= self._config.max_positions:
             self._emit_block(signal, BlockReason.POSITION_CAP,
                              f"{len(portfolio.positions)}/{self._config.max_positions} open")
             return False, "position_cap"
 
-        # Total portfolio exposure
         if portfolio.total_exposure >= self._config.max_portfolio_exposure:
             self._emit_block(signal, BlockReason.RISK_BLOCK,
                              f"exposure ${portfolio.total_exposure:.2f}")
@@ -131,16 +129,10 @@ class RiskManager:
         bankroll: float,
         timeframe: str = "",
     ) -> SizingResult:
-        """Quarter-Kelly size for a signal, with confidence + tf caps applied.
-
-        Pulls fair_value and edge_bps from signal.metadata. If those are
-        missing, falls back to flat `bankroll * size_pct`.
-        """
         meta = signal.metadata or {}
         fair_value = float(meta.get("fair_value", 0.0))
         edge_bps = float(meta.get("edge_bps", 0.0))
 
-        # Fallback path: no fair value → use legacy size_pct
         if fair_value <= 0 or edge_bps <= 0:
             size = max(0.0, bankroll * signal.size_pct)
             if size > self._config.max_position_size:
@@ -170,7 +162,6 @@ class RiskManager:
             policy=self._sizing_policy,
         )
 
-        # Apply absolute hard cap from config
         if result.size_usd > self._config.max_position_size:
             result.size_usd = float(self._config.max_position_size)
             result.capped_by = "max_position_size"
@@ -178,7 +169,7 @@ class RiskManager:
         return result
 
     # ─────────────────────────────────────────────────────────────────
-    #  Order-level checks
+    #  Order-level checks (place/execute path)
     # ─────────────────────────────────────────────────────────────────
 
     def can_place_order(
@@ -186,12 +177,26 @@ class RiskManager:
         order: Order,
         portfolio: Portfolio,
     ) -> tuple[bool, str]:
-        notional = order.size * max(order.price, 0.01)
+        """Pre-execution check.
 
+        CRITICAL FIX: exit orders bypass max_order_size and portfolio-budget
+        gates. You must always be able to close an existing position.
+        """
+        notional = order.size * max(order.price, 0.01)
+        is_exit = _is_exit_order(order)
+
+        # Exit orders: minimal sanity check only
+        if is_exit:
+            if notional <= 0:
+                return False, "exit_zero_notional"
+            # Always allow exits, even if they exceed max_order_size or
+            # remaining portfolio budget. The position already exists.
+            return True, "ok_exit"
+
+        # Entry orders: full risk gate
         if notional > self._config.max_order_size and notional > self._config.max_position_size:
             return False, f"order_size ${notional:.2f} exceeds max"
 
-        # Need to fit within remaining portfolio budget
         remaining = self._config.max_portfolio_exposure - portfolio.total_exposure
         if notional > remaining:
             return False, f"insufficient_portfolio_budget (rem=${remaining:.2f})"
