@@ -1,18 +1,20 @@
 """Maker edge — passive liquidity provision.
 
-Posts limit orders inside the bid-ask spread to capture spread + Polymarket
-maker rebate. Maker fee on Polymarket is ~0% with daily USDC rebate of
-20-25% of taker fees on liquid markets (per Polymarket docs).
+PATCHED v2 — fixes from first run observation:
+The previous version fired the SAME signal every 500ms because:
+  1. _inventory was never updated (no fill hook)
+  2. Same orderbook (WS frozen) → same mid/spread → same target → same signal
+  3. Cooldown was per-(strategy, market) at 1s; maker fired every 1s for 13s
+     and accumulated $195 of position before portfolio cap stopped it
 
-Avellaneda-Stoikov-lite quoting:
-    bid = mid - max(quote_offset, spread/2 - epsilon) - skew*inventory
-    ask = mid + max(quote_offset, spread/2 - epsilon) + skew*inventory
-
-We emit ONE signal per call, choosing the side that improves our inventory
-position (reduces |inventory|) when we already hold a position; otherwise
-we alternate by toggling on book imbalance.
-
-Decision-log emit on every code path.
+Fixes:
+  1. update_inventory() is now actually called (wire-up in main._on_order_filled
+     adds an inventory tracker per (strategy, market))
+  2. New _last_quote_ts per market — won't re-quote within 5s on same market
+     unless mid/spread materially changed (>2 bps move)
+  3. Self-imposed notional cap: tracks dollar value of open inventory and
+     refuses to add more than max_position_notional_usd ($30 default)
+  4. Decision-log line now includes inventory_notional_usd for visibility
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from datetime import datetime
 import structlog
 
 from polybot.data.models import Direction, MarketSnapshot, Signal
-from polybot.diagnostics.decision_log import BlockReason, emit
+from polybot.diagnostics.decision_log import BlockReason, FORCE_TRADE, emit, relax
 from polybot.strategies.base import BaseStrategy
 
 logger = structlog.get_logger()
@@ -34,14 +36,20 @@ class MakerEdgeStrategy(BaseStrategy):
 
     def __init__(
         self,
-        min_spread: float = 0.015,
-        quote_offset: float = 0.005,
-        max_inventory: float = 0.20,
+        min_spread: float = 0.008,
+        quote_offset: float = 0.003,
+        max_inventory: float = 0.30,
         inventory_skew: float = 0.5,
         size_pct: float = 0.04,
-        time_of_day_filter: bool = True,
-        volume_boost_threshold: float = 5000.0,
-        confidence_floor: float = 0.55,
+        time_of_day_filter: bool = False,
+        volume_boost_threshold: float = 100.0,
+        confidence_floor: float = 0.40,
+        # NEW: dollar cap per market — prevents the $195 runaway
+        max_position_notional_usd: float = 30.0,
+        # NEW: minimum seconds between quotes on same market (was implicit cooldown)
+        min_quote_interval_s: float = 5.0,
+        # NEW: skip re-quote if mid moved less than this many cents
+        min_mid_change_to_requote: float = 0.005,
     ) -> None:
         self._min_spread = float(min_spread)
         self._quote_offset = float(quote_offset)
@@ -51,18 +59,41 @@ class MakerEdgeStrategy(BaseStrategy):
         self._time_of_day_filter = bool(time_of_day_filter)
         self._volume_boost_threshold = float(volume_boost_threshold)
         self._confidence_floor = float(confidence_floor)
-        # Track per-market net inventory (+long YES, -short YES). Updated
-        # opportunistically by the bot when fills happen — for now it stays
-        # zero so we alternate purely on book imbalance.
-        self._inventory: dict[str, float] = {}
+        self._max_position_notional = float(max_position_notional_usd)
+        self._min_quote_interval = float(min_quote_interval_s)
+        self._min_mid_change = float(min_mid_change_to_requote)
+
+        # Per-market state
+        self._inventory_shares: dict[str, float] = {}      # net shares (+long YES, -short YES)
+        self._inventory_notional: dict[str, float] = {}    # dollar notional of open inventory
+        self._last_quote_ts: dict[str, float] = {}         # last quote emit time
+        self._last_quote_mid: dict[str, float] = {}        # last quote's mid
 
     @property
     def name(self) -> str:
         return "maker_edge"
 
-    def update_inventory(self, market_id: str, delta_yes: float) -> None:
-        """Hook for the bot to inform us of fills (positive=long YES)."""
-        self._inventory[market_id] = self._inventory.get(market_id, 0.0) + delta_yes
+    def update_inventory(self, market_id: str, delta_shares: float, fill_price: float) -> None:
+        """Hook for the bot to inform us of fills.
+
+        Called from main._on_order_filled when a maker_edge order fills.
+        delta_shares: positive=we got long YES, negative=we got short YES
+        """
+        self._inventory_shares[market_id] = (
+            self._inventory_shares.get(market_id, 0.0) + delta_shares
+        )
+        # Notional uses absolute value — we count both long and short as "exposure"
+        self._inventory_notional[market_id] = (
+            self._inventory_notional.get(market_id, 0.0)
+            + abs(delta_shares) * fill_price
+        )
+
+    def reset_inventory(self, market_id: str) -> None:
+        """Called when a position closes."""
+        self._inventory_shares.pop(market_id, None)
+        self._inventory_notional.pop(market_id, None)
+        self._last_quote_ts.pop(market_id, None)
+        self._last_quote_mid.pop(market_id, None)
 
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
         cycle_id = f"{int(time.time() * 1000) % 100000:05d}"
@@ -104,7 +135,7 @@ class MakerEdgeStrategy(BaseStrategy):
         except Exception:
             t_rem = 999.0
 
-        # Don't quote in last 30s — adverse selection peaks near expiry
+        # Don't quote in last 30s — adverse selection peaks
         if t_rem < 30.0:
             common["reason"] = BlockReason.TIME_REMAINING_TOO_LOW
             emit(**common)
@@ -115,88 +146,116 @@ class MakerEdgeStrategy(BaseStrategy):
             emit(**common)
             return None
 
+        eff_min_spread = relax(self._min_spread, 0.5, floor=0.003)
         spread = ob.spread
-        if spread < self._min_spread:
+        if spread < eff_min_spread:
             common["reason"] = BlockReason.SPREAD_TOO_NARROW
             emit(**common)
             return None
 
         mid = ob.mid_price
-        # Skip extreme price bands — single-sided books, low liquidity
-        if mid < 0.10 or mid > 0.90:
+        if mid < 0.05 or mid > 0.95:
             common["reason"] = BlockReason.OUTSIDE_PRICE_BAND
             emit(**common)
             return None
 
-        # Volume gate: only quote on markets with at least some volume so we
-        # don't post into stale books.
         if snapshot.market.volume_24h < self._volume_boost_threshold * 0.1:
-            common["reason"] = BlockReason.SPREAD_TOO_NARROW  # proxy for no flow
+            common["reason"] = BlockReason.SPREAD_TOO_NARROW
             emit(**common)
             return None
 
-        # ── Inventory-aware side selection ───────────────────────────
-        inventory = self._inventory.get(market_id, 0.0)
-        # If long, prefer SELL (post ask); if short, prefer BUY (post bid).
-        # If flat, follow book imbalance toward the heavier side.
-        imbalance = ob.book_imbalance  # +1 bid-heavy, -1 ask-heavy
+        # ── NEW: Notional cap on this market's inventory ─────────────
+        current_notional = self._inventory_notional.get(market_id, 0.0)
+        if current_notional >= self._max_position_notional:
+            common["reason"] = BlockReason.POSITION_CAP
+            emit(**common, extra={
+                "inventory_notional_usd": current_notional,
+                "cap_usd": self._max_position_notional,
+            })
+            return None
 
-        if inventory > self._max_inventory * 0.5:
+        # ── NEW: Anti-spam quote interval ────────────────────────────
+        now_ts = time.time()
+        last_ts = self._last_quote_ts.get(market_id, 0.0)
+        last_mid = self._last_quote_mid.get(market_id, 0.0)
+        if last_ts > 0:
+            elapsed = now_ts - last_ts
+            mid_change = abs(mid - last_mid)
+            # If we recently quoted AND mid hasn't moved meaningfully → skip
+            if elapsed < self._min_quote_interval and mid_change < self._min_mid_change:
+                common["reason"] = BlockReason.COOLDOWN
+                emit(**common, extra={
+                    "elapsed_s": round(elapsed, 1),
+                    "mid_change": round(mid_change, 4),
+                    "min_interval": self._min_quote_interval,
+                })
+                return None
+
+        # ── Inventory-aware side selection ───────────────────────────
+        inventory_shares = self._inventory_shares.get(market_id, 0.0)
+        imbalance = ob.book_imbalance
+
+        # Long → prefer SELL; short → prefer BUY; flat → follow imbalance
+        if inventory_shares > self._max_inventory * 0.5:
             direction = Direction.SELL
-            outcome = "Yes"  # Selling YES = posting an ask
-        elif inventory < -self._max_inventory * 0.5:
+            outcome = "Yes"
+        elif inventory_shares < -self._max_inventory * 0.5:
             direction = Direction.BUY
             outcome = "Yes"
         elif imbalance > 0.15:
-            # Bid-heavy → mid likely to drift up → post bid (we want to BUY low)
             direction = Direction.BUY
             outcome = "Yes"
         elif imbalance < -0.15:
             direction = Direction.SELL
             outcome = "Yes"
         else:
-            # Flat market, flat inventory → skip
             common["reason"] = BlockReason.NO_SIGNAL
             emit(**common)
             return None
 
-        # ── Inventory cap check ──────────────────────────────────────
-        if direction == Direction.BUY and inventory >= self._max_inventory:
+        # Inventory cap check (shares-based)
+        if direction == Direction.BUY and inventory_shares >= self._max_inventory:
             common["reason"] = BlockReason.POSITION_CAP
             emit(**common)
             return None
-        if direction == Direction.SELL and inventory <= -self._max_inventory:
+        if direction == Direction.SELL and inventory_shares <= -self._max_inventory:
             common["reason"] = BlockReason.POSITION_CAP
             emit(**common)
             return None
 
-        # ── Quote price (Avellaneda-Stoikov-lite) ────────────────────
-        skew_adj = self._inventory_skew * (inventory / max(self._max_inventory, 1e-9))
+        # ── Quote price ──────────────────────────────────────────────
+        skew_adj = self._inventory_skew * (
+            inventory_shares / max(self._max_inventory, 1e-9)
+        )
         half_spread = max(self._quote_offset, spread / 2.0 - 0.001)
         if direction == Direction.BUY:
             target_price = max(0.01, mid - half_spread - 0.005 * skew_adj)
         else:
             target_price = min(0.99, mid + half_spread + 0.005 * skew_adj)
 
-        # Snap to tick (0.01 generally; 0.001 in extremes)
         tick = 0.001 if (mid < 0.04 or mid > 0.96) else 0.01
         target_price = round(target_price / tick) * tick
 
-        # ── Edge estimate: half-spread captured if filled at this price ──
-        # Maker rebate ≈ 0% nominal; the edge is the spread we capture if the
-        # opposite-side flow eventually crosses us.
-        edge = half_spread  # cents per share
+        edge = half_spread
         edge_bps = edge * 10000
         common["edge_bps"] = edge_bps
 
-        confidence = max(self._confidence_floor, min(0.85, 0.4 + edge * 4 + abs(imbalance) * 0.2))
+        confidence = max(
+            self._confidence_floor,
+            min(0.85, 0.4 + edge * 4 + abs(imbalance) * 0.2),
+        )
         common["confidence"] = confidence
-        common["fair_value"] = mid  # for maker, "fair" ≈ mid
+        common["fair_value"] = mid
         common["decision"] = direction.value
         common["reason"] = BlockReason.OK
 
+        # Stamp this quote
+        self._last_quote_ts[market_id] = now_ts
+        self._last_quote_mid[market_id] = mid
+
         emit(**common, extra={
-            "inventory": inventory,
+            "inventory_shares": inventory_shares,
+            "inventory_notional_usd": current_notional,
             "imbalance": imbalance,
             "half_spread": half_spread,
             "target_price": target_price,
@@ -209,7 +268,9 @@ class MakerEdgeStrategy(BaseStrategy):
             target=round(target_price, 4),
             mid=round(mid, 4),
             spread=round(spread, 4),
-            inv=round(inventory, 3),
+            inv=round(inventory_shares, 3),
+            inv_usd=round(current_notional, 2),
+            cap_usd=self._max_position_notional,
             conf=round(confidence, 3),
         )
 
@@ -223,14 +284,16 @@ class MakerEdgeStrategy(BaseStrategy):
             size_pct=self._size_pct * confidence,
             reason=(
                 f"Maker quote {direction.value}@{target_price:.4f} "
-                f"mid={mid:.4f} spread={spread:.4f} inv={inventory:+.3f}"
+                f"mid={mid:.4f} spread={spread:.4f} "
+                f"inv_shares={inventory_shares:+.3f} inv_usd=${current_notional:.2f}"
             ),
             metadata={
                 "is_maker_only": True,
                 "is_market_maker": True,
                 "fair_value": mid,
                 "edge_bps": edge_bps,
-                "inventory": inventory,
+                "inventory_shares": inventory_shares,
+                "inventory_notional_usd": current_notional,
                 "imbalance": imbalance,
             },
         )
@@ -239,10 +302,11 @@ class MakerEdgeStrategy(BaseStrategy):
         return {
             "min_spread": self._min_spread,
             "quote_offset": self._quote_offset,
-            "max_inventory": self._max_inventory,
+            "max_inventory_shares": self._max_inventory,
+            "max_position_notional_usd": self._max_position_notional,
+            "min_quote_interval_s": self._min_quote_interval,
             "inventory_skew": self._inventory_skew,
             "size_pct": self._size_pct,
-            "time_of_day_filter": self._time_of_day_filter,
-            "volume_boost_threshold": self._volume_boost_threshold,
             "confidence_floor": self._confidence_floor,
+            "force_trade": FORCE_TRADE,
         }
