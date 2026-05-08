@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
-from polybot.aggregator import StrategyAggregator
+from polybot.strategies.aggregator import StrategyAggregator
 from polybot.config import Config, load_config
 from polybot.data.client import (
     LIVE_TRADING_ENABLED,
@@ -152,7 +152,12 @@ class Bot:
             if hasattr(s, "set_exchange_feed"):
                 s.set_exchange_feed(self._exchange_feed.state)
 
-        self._aggregator = StrategyAggregator(config.strategies.aggregation)
+        self._aggregator = StrategyAggregator(
+            min_confidence=config.strategies.aggregation.min_confidence,
+            conflict_resolution=config.strategies.aggregation.conflict_resolution,
+            strategy_weights=config.strategies.aggregation.strategy_weights,
+            min_net_score=config.strategies.aggregation.min_net_score,
+        )
 
         # Trading-loop state
         # Map market_id -> expiry timestamp; pruned each cycle
@@ -185,6 +190,7 @@ class Bot:
         await self._scanner.start()
         await self._pipeline.start()
         await self._alerts.start()
+        await self._storage.initialize()
 
         # Event subscriptions
         self._event_bus.subscribe("order_filled", self._on_order_filled)
@@ -237,7 +243,10 @@ class Bot:
             logger.warning("shutdown_component_err", error=str(e))
 
         try:
-            self._storage.close()
+            await self._storage.close()
+        except Exception:
+            pass
+        try:
             self._features.close()
         except Exception:
             pass
@@ -278,21 +287,26 @@ class Bot:
     # ─────────────────────────────────────────────────────────────────
 
     async def _on_market_discovered(self, market: Market, **_) -> None:
+        # Register first so any orderbook frames that arrive between the
+        # ws subscribe and the first cycle land in a buffer.
+        self._pipeline.register_market(market)
         for token_id in market.token_ids:
             await self._ws.subscribe_market(token_id)
 
     async def _on_market_removed(self, market_id: str, **_) -> None:
-        # We need the token_ids to unsub — pull from the pipeline cache
-        snap = self._pipeline.get_snapshot(market_id)
-        if snap and snap.market.token_ids:
-            for token_id in snap.market.token_ids:
+        # Pull token_ids from the pipeline market cache (works even with no
+        # orderbook yet), unsubscribe ws, then unregister from the pipeline.
+        market = self._pipeline.get_market(market_id)
+        if market and market.token_ids:
+            for token_id in market.token_ids:
                 await self._ws.unsubscribe_market(token_id)
+        self._pipeline.unregister_market(market_id)
 
     async def _on_order_filled(self, order: Order, **_) -> None:
         """Update positions, sizing-state, and storage when a fill arrives."""
         try:
             self._positions.update_from_fill(order)
-            self._storage.save_order(order)
+            await self._storage.save_order(order)
 
             # If a maker_edge fill, update its inventory tracker
             if order.strategy.startswith("maker_edge"):
@@ -380,7 +394,10 @@ class Bot:
             if not signals:
                 continue
 
-            agg = self._aggregator.aggregate(signals)
+            # Aggregator returns a list keyed per market; per-market loop
+            # means at most one survives for this market_id.
+            agg_list = self._aggregator.aggregate(signals)
+            agg = agg_list[0] if agg_list else None
             if agg is None:
                 continue
 

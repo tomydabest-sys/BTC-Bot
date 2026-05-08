@@ -81,10 +81,42 @@ class LogChannel(AlertChannel):
 
 
 class AlertManager:
-    """Routes alerts to configured channels."""
+    """Routes alerts to configured channels.
 
-    def __init__(self, channels: list[AlertChannel] | None = None) -> None:
-        self._channels = channels or [LogChannel()]
+    Accepts either a list of AlertChannel instances or an AlertsConfig
+    pydantic model (the orchestrator passes the latter). When an AlertsConfig
+    is supplied, channels are constructed lazily based on which env vars are
+    populated; LogChannel is always included as a fallback.
+    """
+
+    def __init__(self, channels_or_config=None) -> None:
+        if channels_or_config is None:
+            self._channels: list[AlertChannel] = [LogChannel()]
+        elif isinstance(channels_or_config, list):
+            self._channels = channels_or_config or [LogChannel()]
+        else:
+            cfg = channels_or_config
+            built: list[AlertChannel] = [LogChannel()]
+            try:
+                if os.environ.get(getattr(cfg, "discord_webhook_env", "DISCORD_WEBHOOK_URL"), ""):
+                    built.append(DiscordWebhookChannel(cfg.discord_webhook_env))
+                if (
+                    os.environ.get(getattr(cfg, "telegram_bot_token_env", "TELEGRAM_BOT_TOKEN"), "")
+                    and os.environ.get(getattr(cfg, "telegram_chat_id_env", "TELEGRAM_CHAT_ID"), "")
+                ):
+                    built.append(
+                        TelegramChannel(cfg.telegram_bot_token_env, cfg.telegram_chat_id_env)
+                    )
+            except Exception as e:
+                logger.warning("alerts_config_parse_err", error=str(e))
+            self._channels = built
+        self._started = False
+
+    async def start(self) -> None:
+        self._started = True
+
+    async def stop(self) -> None:
+        self._started = False
 
     async def send_alert(self, level: AlertLevel, message: str, data: dict | None = None) -> None:
         data = data or {}

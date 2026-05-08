@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
@@ -72,8 +73,40 @@ class Storage:
         """)
         await self._db.commit()
 
-    async def save_order(self, order: dict) -> None:
-        assert self._db is not None
+    async def save_order(self, order) -> None:
+        """Persist an order. Accepts either a plain dict or a domain Order."""
+        if self._db is None:
+            return
+        if isinstance(order, dict):
+            row = order
+        else:
+            now_iso = datetime.utcnow().isoformat()
+            row = {
+                "order_id": order.order_id or "",
+                "market_id": order.market_id,
+                "token_id": order.token_id,
+                "side": order.side.value if hasattr(order.side, "value") else str(order.side),
+                "price": float(order.price),
+                "size": float(order.size),
+                "order_type": (
+                    order.order_type.value
+                    if hasattr(order.order_type, "value")
+                    else str(order.order_type)
+                ),
+                "status": (
+                    order.status.value if hasattr(order.status, "value") else str(order.status)
+                ),
+                "strategy": order.strategy or "",
+                "signal_id": order.signal_id or "",
+                "filled_size": float(order.filled_size or 0.0),
+                "avg_fill_price": float(order.avg_fill_price or 0.0),
+                "created_at": (
+                    order.created_at.isoformat()
+                    if getattr(order, "created_at", None) is not None
+                    else now_iso
+                ),
+                "updated_at": now_iso,
+            }
         await self._db.execute(
             """INSERT OR REPLACE INTO orders
                (order_id, market_id, token_id, side, price, size, order_type,
@@ -81,20 +114,20 @@ class Storage:
                 created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                order["order_id"],
-                order["market_id"],
-                order["token_id"],
-                order["side"],
-                order["price"],
-                order["size"],
-                order["order_type"],
-                order["status"],
-                order.get("strategy", ""),
-                order.get("signal_id", ""),
-                order.get("filled_size", 0),
-                order.get("avg_fill_price", 0),
-                order["created_at"],
-                order["updated_at"],
+                row["order_id"],
+                row["market_id"],
+                row["token_id"],
+                row["side"],
+                row["price"],
+                row["size"],
+                row["order_type"],
+                row["status"],
+                row.get("strategy", ""),
+                row.get("signal_id", ""),
+                row.get("filled_size", 0),
+                row.get("avg_fill_price", 0),
+                row["created_at"],
+                row["updated_at"],
             ),
         )
         await self._db.commit()

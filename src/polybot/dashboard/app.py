@@ -73,6 +73,20 @@ def get_bot():
 
 app = FastAPI(title="PolyBot Dashboard", version="1.0.0")
 
+
+def create_app(bot=None, config=None):
+    """Factory used by the launcher.
+
+    Wires the running Bot (and optional Config) into the module-level FastAPI
+    instance so the existing route handlers can reach them via get_bot().
+    """
+    if bot is not None:
+        set_bot(bot)
+    if config is not None:
+        # Stash for routes that may want to read config without importing main
+        app.state.config = config
+    return app
+
 _ws_clients: list[WebSocket] = []
 
 

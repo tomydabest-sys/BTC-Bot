@@ -16,6 +16,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "python-dotenv>=1",
+    "aiosqlite>=0.19",
     # Live mode dependencies — required when LIVE_TRADING_ENABLED is flipped True.
     # Pinned loose so users can pick a version compatible with their Polygon RPC.
     # "py-clob-client>=0.16",

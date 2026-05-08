@@ -44,7 +44,6 @@ strategies:
         sigma_halflife_s: 60
         fee_theta_taker: 0.072
         edge_floor_bps: 3
-        exchange_symbol: "BTC"
 
     # ── DUAL DIRECTION ARB (relaxed) ────────────────────────────────────
     - name: "dual_direction_arb"
@@ -70,7 +69,6 @@ strategies:
         sigma_lookback_s: 900
         sigma_halflife_s: 60
         fee_theta_taker: 0.072
-        exchange_symbol: "BTC"
 
     # ── MAKER EDGE (much lower spread floor) ────────────────────────────
     - name: "maker_edge"
