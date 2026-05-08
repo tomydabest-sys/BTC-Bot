@@ -2,34 +2,17 @@
 
 When `t_rem < 60s` and BTC has moved decisively from the strike (defined as
 `|btc_move_window_pct| > 0.10%`), the BTC up/down market has a near-certain
-"should-resolve" answer. Mispricings exist when the losing side trades higher
-than its remaining tail probability.
+"should-resolve" answer.
 
-This strategy works for retail because:
-1. The 70ms latency disadvantage is irrelevant — the underlying outcome is
-   already nearly determined; you're not racing anyone, you're collecting
-   on convexity that the book hasn't fully priced.
-2. Black-Scholes binary tail probability (N(d2)) gives an honest closed-form
-   for "remaining probability of price crossing back through strike."
-3. Win rate is 90–95% by construction: the loss case is a late-window BTC
-   reversal through strike, ~5–10% historically.
-
-Signal:
-  win_side = "Yes" if btc_now > strike else "No"
-  P(win)   = N(d2)  (very close to 1 when BTC is far from strike with little time)
-  edge_yes = (1 - P(yes_loses)) - mid_yes  if Yes is the winning side
-  enter    = win_side priced too low (e.g. <8c) OR loser priced too high (e.g. >92c)
-            AND |btc_move_window_pct| > min_btc_delta_pct
-            AND t_rem < max_time_remaining
-            AND fee_aware_edge >= edge_floor_bps
-  side     = BUY winning side / SELL losing side
-
-Exits: held to expiry (auto-close <20s before expiry handles this)
+PATCHED v2:
+1. Hard cutoff at t_rem < 25s — Black-Scholes binary becomes numerically
+   unstable as sigma_t → 0, producing spurious trades at expiry. Auto-close
+   handles the <20s window, so we leave a small buffer.
+2. Sigma bucket threshold lowered from 30 → 10 (same fix as overshoot).
 """
 
 from __future__ import annotations
 
-import math
 import time
 from datetime import datetime
 
@@ -50,6 +33,12 @@ logger = structlog.get_logger()
 
 _DIAG_INTERVAL = 10.0
 _SUMMARY_INTERVAL = 60.0
+# Minimum 1-Hz buckets needed for vol estimation (matches overshoot)
+_MIN_SIGMA_BUCKETS = 10
+# Below this t_rem, BS sigma_t is too small to give stable probabilities.
+# Auto-close kicks in at config.execution.auto_close_before_expiry_s (~20s),
+# so we set ours slightly above that.
+_HARD_TIME_FLOOR_S = 25.0
 
 
 class BoundaryDecayStrategy(BaseStrategy):
@@ -121,7 +110,7 @@ class BoundaryDecayStrategy(BaseStrategy):
             "size_usd": 0.0,
         }
 
-        # ── Feed warming ─────────────────────────────────────────────
+        # Feed warming
         if self._feed is None or len(self._feed.ticks) < 60:
             common["reason"] = BlockReason.FEED_WARMING
             self._count_block(BlockReason.FEED_WARMING)
@@ -130,7 +119,7 @@ class BoundaryDecayStrategy(BaseStrategy):
 
         common["binance_px"] = float(self._feed.last_price)
 
-        # ── Time gate: only the final minute ─────────────────────────
+        # Time gate: only the final minute, but never below the BS-stability floor
         now_dt = datetime.utcnow()
         end = snapshot.market.end_date
         if getattr(end, "tzinfo", None) is not None:
@@ -138,7 +127,8 @@ class BoundaryDecayStrategy(BaseStrategy):
         t_rem = (end - now_dt).total_seconds()
         common["time_to_expiry_s"] = t_rem
 
-        if t_rem <= 20:  # let auto-close handle <20s
+        if t_rem <= _HARD_TIME_FLOOR_S:
+            # BS becomes unstable here; auto_close should be running.
             common["reason"] = BlockReason.TIME_REMAINING_TOO_LOW
             self._count_block(BlockReason.TIME_REMAINING_TOO_LOW)
             emit(**common)
@@ -149,7 +139,7 @@ class BoundaryDecayStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # ── Orderbook sanity ─────────────────────────────────────────
+        # Orderbook sanity
         ob = snapshot.orderbook
         mid = ob.mid_price
         common["mid"] = mid
@@ -163,7 +153,7 @@ class BoundaryDecayStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # ── BTC move features ────────────────────────────────────────
+        # BTC move features
         spot = float(self._feed.last_price)
         if spot <= 0:
             common["reason"] = BlockReason.BTC_FEED_INVALID
@@ -178,10 +168,7 @@ class BoundaryDecayStrategy(BaseStrategy):
         common["btc_move_30s"] = btc_move_30s
         common["btc_move_60s"] = btc_move_60s
 
-        # BTC move since window open
-        # For 5m windows: window_seconds=300, but if t_rem=45 then elapsed=255s
-        # Approximate: use whichever lookback covers the window
-        window_total = 300.0  # default 5m window; longer timeframes will saturate
+        window_total = 300.0
         elapsed_in_window = max(5.0, min(window_total, window_total - t_rem))
         btc_move_window = float(self._feed.price_change_since(elapsed_in_window))
 
@@ -191,7 +178,7 @@ class BoundaryDecayStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # ── Compute realized vol → fair value ────────────────────────
+        # Realized vol → fair value
         sigma_per_sec = self._compute_sigma_per_sec()
         if sigma_per_sec <= 0:
             common["reason"] = BlockReason.BTC_VOL_ZERO
@@ -199,46 +186,30 @@ class BoundaryDecayStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # Strike = spot at window open
         strike = spot / (1.0 + btc_move_window) if (1.0 + btc_move_window) > 0 else spot
-
-        # P(yes) = P(spot_T >= strike) under remaining-time GBM
         p_yes = bs_fair_value(spot, strike, t_rem, sigma_per_sec)
         p_no = 1.0 - p_yes
         common["fair_value"] = p_yes
 
-        # ── Decision: which side is winning, is it priced cheaply enough? ──
-        # We're fading extreme prices on either side that don't reflect the
-        # near-certainty of the resolution.
         signal_yes = None
         signal_no = None
 
-        # Case 1: Yes is the winning side (BTC up from strike)
-        # Buy Yes if it's mispriced LOW (mid_yes < fade_below_price means market
-        # disagrees with the obvious resolution)
         if p_yes > 0.85 and ob.best_ask < self._fade_below_high_winner_threshold():
-            # Buy Yes cheap
             edge = p_yes - ob.best_ask
             net_edge = fee_aware_edge(p_yes, ob.best_ask, exit_p_estimate=p_yes,
                                       theta=self._fee_theta)
             if edge >= self._min_edge_cents and net_edge * 10000 >= self._edge_floor_bps:
                 signal_yes = ("BUY_YES", ob.best_ask, edge, net_edge)
 
-        # Case 2: No is the winning side (BTC down from strike)
         if p_no > 0.85 and (1.0 - ob.best_bid) < self._fade_below_high_winner_threshold():
-            # Buy No cheap (== sell Yes high). On Polymarket, you BUY No directly.
-            # We model it as direction=SELL on Yes leg.
-            no_ask = 1.0 - ob.best_bid  # implied
+            no_ask = 1.0 - ob.best_bid
             edge = p_no - no_ask
             net_edge = fee_aware_edge(p_no, no_ask, exit_p_estimate=p_no,
                                       theta=self._fee_theta)
             if edge >= self._min_edge_cents and net_edge * 10000 >= self._edge_floor_bps:
                 signal_no = ("SELL_YES", ob.best_bid, edge, net_edge)
 
-        # Case 3: Yes is OVERPRICED relative to its tail probability
-        # (BTC clearly down; Yes still trades >fade_above)
         if p_yes < 0.15 and ob.best_bid > self._fade_above:
-            # SELL Yes (it's priced too high given near-certain No resolution)
             edge = ob.best_bid - p_yes
             net_edge = fee_aware_edge(1.0 - p_yes, 1.0 - ob.best_bid,
                                       exit_p_estimate=p_no,
@@ -247,7 +218,6 @@ class BoundaryDecayStrategy(BaseStrategy):
                 if signal_no is None or edge > signal_no[2]:
                     signal_no = ("SELL_YES", ob.best_bid, edge, net_edge)
 
-        # Case 4: No is OVERPRICED → BUY YES cheap
         if p_no < 0.15 and (1.0 - ob.best_ask) > self._fade_above:
             edge = (1.0 - ob.best_ask) - p_no
             net_edge = fee_aware_edge(p_yes, ob.best_ask, exit_p_estimate=p_yes,
@@ -256,7 +226,6 @@ class BoundaryDecayStrategy(BaseStrategy):
                 if signal_yes is None or edge > signal_yes[2]:
                     signal_yes = ("BUY_YES", ob.best_ask, edge, net_edge)
 
-        # Pick the highest-edge candidate
         candidates = [c for c in (signal_yes, signal_no) if c is not None]
         if not candidates:
             common["reason"] = BlockReason.BELOW_MIN_EDGE
@@ -276,11 +245,8 @@ class BoundaryDecayStrategy(BaseStrategy):
             direction = Direction.SELL
             outcome = "No"
 
-        # ── Confidence ───────────────────────────────────────────────
-        # Higher when (a) BTC is far from strike (move_window large), (b) edge is fat,
-        # (c) very little time left (more certain)
-        certainty_score = max(p_yes, p_no)  # closer to 1 = more certain
-        time_score = 1.0 - min(t_rem / self._max_t_rem, 1.0)  # less time = more confident
+        certainty_score = max(p_yes, p_no)
+        time_score = 1.0 - min(t_rem / self._max_t_rem, 1.0)
         edge_score = min(raw_edge / 0.05, 1.0)
         confidence = 0.30 + 0.35 * certainty_score + 0.20 * time_score + 0.15 * edge_score
         confidence = max(self._confidence_floor, min(confidence, 0.95))
@@ -336,6 +302,7 @@ class BoundaryDecayStrategy(BaseStrategy):
                 "strike": strike,
                 "raw_edge_cents": raw_edge,
                 "edge_bps": edge_bps,
+                "fair_value": p_yes,
                 "is_boundary": True,
             },
         )
@@ -345,14 +312,6 @@ class BoundaryDecayStrategy(BaseStrategy):
     # ─────────────────────────────────────────────────────────────────
 
     def _fade_below_high_winner_threshold(self) -> float:
-        """Mid below which we'd buy a near-certain winner.
-
-        If p_yes > 0.85 and yes is priced below this, we treat it as
-        mispriced-cheap. Default mirrors fade_below_price (0.08).
-        """
-        # We want the winner to be priced "low" — i.e. cheaper than its
-        # near-certain probability would suggest. Defining "low" as anything
-        # below 1 - fade_above (e.g. fade_above=0.92 → threshold 0.08).
         return 1.0 - self._fade_above + self._min_edge_cents * 5
 
     def _compute_sigma_per_sec(self) -> float:
@@ -366,7 +325,7 @@ class BoundaryDecayStrategy(BaseStrategy):
                 continue
             sec = int(tick.timestamp)
             per_sec[sec] = tick.price
-        if len(per_sec) < 30:
+        if len(per_sec) < _MIN_SIGMA_BUCKETS:
             return realized_sigma_per_sec([], lookback_s=self._sigma_lookback)
         sorted_secs = sorted(per_sec)
         prices = [per_sec[s] for s in sorted_secs]
@@ -406,4 +365,5 @@ class BoundaryDecayStrategy(BaseStrategy):
             "sigma_halflife_s": self._sigma_halflife,
             "fee_theta_taker": self._fee_theta,
             "edge_floor_bps": self._edge_floor_bps,
+            "hard_time_floor_s": _HARD_TIME_FLOOR_S,
         }

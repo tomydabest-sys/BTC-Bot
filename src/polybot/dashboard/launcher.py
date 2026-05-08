@@ -1,242 +1,219 @@
-"""Launcher that runs the bot and dashboard together.
+"""Dashboard + bot launcher.
 
-Hardened:
-- DualOutputLogger now accepts *args/**kwargs from structlog's factory protocol
-  (prevents AttributeError if any future code calls structlog.get_logger("name")).
-- Startup validation runs via Bot.validate_system() before the trading loop.
-- Graceful shutdown on Ctrl+C.
+Runs the FastAPI dashboard alongside the trading bot in a single process.
+Both processes share the same storage backend so the dashboard sees live data.
+
+Adds --mock-btc-feed flag for offline/testing runs (sets BTC_BOT_USE_MOCK_FEED).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import signal as signal_mod
+import logging
+import os
+import signal
 import sys
+from pathlib import Path
 
 import structlog
 import uvicorn
 
 from polybot.config import load_config
-from polybot.dashboard.app import app, set_bot
 from polybot.main import Bot
 
-logger = structlog.get_logger()
 
-
-def _configure_logging(log_level: str) -> None:
-    """Configure structlog to write to stdout AND the dashboard WebSocket terminal."""
-    from polybot.dashboard.app import _broadcast_terminal, _terminal_buffer
-
-    level = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}.get(
-        log_level, 20
+def _configure_logging(level: str) -> None:
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)-7s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
     )
-
-    class DualOutputLogger:
-        """Writes to stdout and pushes into the WebSocket terminal buffer.
-
-        Accepts *args/**kwargs because structlog's logger_factory protocol may
-        pass the logger name as a positional argument.
-        """
-
-        def __init__(self, *args, **kwargs) -> None:
-            import sys as _sys
-            self._file = _sys.stdout
-
-        def msg(self, message: str) -> None:
-            try:
-                print(message, file=self._file)
-            except Exception:
-                pass
-            try:
-                s = str(message)
-                _terminal_buffer.append(s)
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(_broadcast_terminal(s))
-                except RuntimeError:
-                    pass
-            except Exception:
-                pass
-
-        debug = info = warning = error = critical = fatal = msg
-        log = msg
-
-        def __repr__(self) -> str:
-            return "<DualOutputLogger>"
-
     structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-            structlog.dev.set_exc_info,
-            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+            structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=True),
             structlog.dev.ConsoleRenderer(),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(level),
-        context_class=dict,
-        logger_factory=DualOutputLogger,
-        cache_logger_on_first_use=False,
     )
 
 
-def run_dashboard() -> None:
-    """CLI entry point for the dashboard + bot."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+class DualOutputLogger:
+    """Tee stdout/stderr to a log file while preserving console output."""
 
-    parser = argparse.ArgumentParser(description="PolyBot Dashboard")
-    parser.add_argument("--config", default="config.yaml", help="Path to config file")
-    parser.add_argument("--mode", choices=["paper", "live"], help="Override trading mode")
-    parser.add_argument("--host", default="0.0.0.0", help="Dashboard host")
-    parser.add_argument("--port", type=int, default=8080, help="Dashboard port")
-    parser.add_argument("--no-bot", action="store_true", help="Run dashboard only (no bot)")
-    parser.add_argument(
-        "--skip-validation", action="store_true",
-        help="Skip startup validation (not recommended)",
-    )
-    args = parser.parse_args()
+    def __init__(self, original_stream, log_path: Path):
+        self._stream = original_stream
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(log_path, "a", encoding="utf-8", buffering=1)
 
-    # Load config first — bail early on bad YAML
+    def write(self, msg: str) -> int:
+        try:
+            self._stream.write(msg)
+        except Exception:
+            pass
+        try:
+            self._fh.write(msg)
+        except Exception:
+            pass
+        return len(msg)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            self._fh.flush()
+        except Exception:
+            pass
+
+
+def validate_system(config) -> bool:
+    """Pre-flight checks. Returns True if OK to start."""
+    log = structlog.get_logger()
+    issues: list[str] = []
+
+    # Check data dir exists / is writeable
+    data_dir = Path(config.bot.data_dir)
     try:
-        config = load_config(args.config)
-    except FileNotFoundError as e:
-        print(f"\n[FATAL] {e}", file=sys.stderr)
-        print("        Create a config.yaml in the project root or pass --config PATH\n",
-              file=sys.stderr)
-        sys.exit(2)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / ".write_test").write_text("ok")
+        (data_dir / ".write_test").unlink()
     except Exception as e:
-        print(f"\n[FATAL] Config load failed: {type(e).__name__}: {e}\n", file=sys.stderr)
-        sys.exit(2)
+        issues.append(f"data_dir not writeable: {data_dir}: {e}")
 
-    if args.mode:
-        config.bot.mode = args.mode
+    # Check API key envs
+    api_key = os.environ.get(config.wallet.api_key_env, "")
+    if not api_key:
+        log.warning(
+            "no_api_key",
+            env_var=config.wallet.api_key_env,
+            note="Polymarket Gamma API still works without one but rate limits are tighter",
+        )
 
-    _configure_logging(config.bot.log_level)
+    # Live mode hard guard
+    if config.bot.mode == "live" and not config.bot.allow_live:
+        issues.append(
+            "config.bot.mode='live' but config.bot.allow_live=false. "
+            "Live mode is hard-guarded; you must opt in explicitly."
+        )
+
+    if issues:
+        for issue in issues:
+            log.error("preflight_failed", issue=issue)
+        return False
+    return True
+
+
+async def _run_with_dashboard(args, config) -> None:
+    log = structlog.get_logger()
 
     bot = Bot(config)
-    set_bot(bot)
+    stop_event = asyncio.Event()
 
-    async def run_all() -> None:
-        # ── STARTUP VALIDATION ───────────────────────────────────────────
-        if not args.no_bot and not args.skip_validation:
-            ok, errors = await bot.validate_system()
-            if not ok:
-                print("\n" + "=" * 60, file=sys.stderr)
-                print("  STARTUP VALIDATION FAILED", file=sys.stderr)
-                print("=" * 60, file=sys.stderr)
-                for err in errors:
-                    print(f"  [x] {err}", file=sys.stderr)
-                print("=" * 60, file=sys.stderr)
-                print("  Fix the above issues and try again.", file=sys.stderr)
-                print("  To bypass (not recommended): --skip-validation\n", file=sys.stderr)
-                # Cleanly tear down any resources validate_system opened
-                try:
-                    await bot.stop()
-                except Exception:
-                    pass
-                sys.exit(3)
+    def _on_signal(*_):
+        log.info("signal_received_stopping")
+        stop_event.set()
 
-        uvi_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
-        server = uvicorn.Server(uvi_config)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: stop_event.set())
 
-        shutdown_event = asyncio.Event()
+    bot_task: asyncio.Task | None = None
+    server_task: asyncio.Task | None = None
 
-        async def bot_runner() -> None:
-            try:
-                await bot.start()
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error("bot_runner_crashed", error=str(e), error_type=type(e).__name__)
-            finally:
-                shutdown_event.set()
-
-        async def server_runner() -> None:
-            try:
-                await server.serve()
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error("server_crashed", error=str(e))
-            finally:
-                shutdown_event.set()
-
-        tasks = [asyncio.create_task(server_runner())]
+    try:
         if not args.no_bot:
-            tasks.append(asyncio.create_task(bot_runner()))
+            await bot.start()
+            bot_task = asyncio.create_task(stop_event.wait())
 
-        display_host = "localhost" if args.host == "0.0.0.0" else args.host
-        print(f"\n{'=' * 60}")
-        print("  POLYBOT DASHBOARD RUNNING")
-        print(f"  URL: http://{display_host}:{args.port}")
-        print(f"  Mode: {config.bot.mode.upper()}")
-        print(f"  Strategies: {len(config.strategies.enabled)} loaded")
-        print("  Terminal: Live log streaming via WebSocket")
-        print("  Press Ctrl+C to stop")
-        print(f"{'=' * 60}\n")
+        if not args.no_dashboard:
+            from polybot.dashboard.app import create_app
+            app = create_app(bot=bot if not args.no_bot else None, config=config)
+            ucfg = uvicorn.Config(
+                app,
+                host=args.host,
+                port=args.port,
+                log_level=args.log_level.lower(),
+                access_log=False,
+            )
+            server = uvicorn.Server(ucfg)
+            server_task = asyncio.create_task(server.serve())
+            log.info("dashboard_started", url=f"http://{args.host}:{args.port}")
 
-        try:
-            import webbrowser
-            webbrowser.open(f"http://{display_host}:{args.port}")
-        except Exception:
-            pass
-
-        await shutdown_event.wait()
-
-        logger.info("shutting_down")
-        try:
-            await bot.stop()
-        except Exception as e:
-            logger.error("bot_stop_error", error=str(e))
-
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    def handle_signal(sig: int, _frame) -> None:
-        logger.info("signal_received", signal=sig)
-        bot._running = False
-
-    signal_mod.signal(signal_mod.SIGINT, handle_signal)
-    try:
-        signal_mod.signal(signal_mod.SIGTERM, handle_signal)
-    except (ValueError, AttributeError):
-        # SIGTERM may not be available on Windows for this signal handler flow
-        pass
-
-    try:
-        loop.run_until_complete(run_all())
-    except KeyboardInterrupt:
-        try:
-            loop.run_until_complete(bot.stop())
-        except Exception:
-            pass
-    except SystemExit:
-        raise
-    except Exception as e:
-        logger.error("launcher_fatal", error=str(e), error_type=type(e).__name__)
+        # Wait for stop
+        await stop_event.wait()
     finally:
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        if pending:
+        if not args.no_bot:
             try:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception:
+                await bot.stop()
+            except Exception as e:
+                log.warning("bot_stop_err", error=str(e))
+        if server_task is not None:
+            server_task.cancel()
+            try:
+                await server_task
+            except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            loop.close()
-        except Exception:
-            pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="BTC-Bot launcher — dashboard + bot in one process",
+    )
+    parser.add_argument("--config", default="config.yaml", help="Config YAML path")
+    parser.add_argument("--mode", choices=["paper", "live"], default=None,
+                        help="Override config.bot.mode")
+    parser.add_argument("--host", default="0.0.0.0", help="Dashboard bind host")
+    parser.add_argument("--port", type=int, default=8080, help="Dashboard bind port")
+    parser.add_argument("--log-level", default="INFO",
+                        help="Log level (DEBUG, INFO, WARNING, ERROR)")
+    parser.add_argument("--log-file", default="logs/bot.log",
+                        help="Tee stdout/stderr into this file")
+    parser.add_argument("--no-bot", action="store_true",
+                        help="Run dashboard only, no trading")
+    parser.add_argument("--no-dashboard", action="store_true",
+                        help="Run bot only, no dashboard")
+    parser.add_argument("--mock-btc-feed", action="store_true",
+                        help="Use deterministic synthetic BTC feed (no Binance)")
+    parser.add_argument("--no-validate", action="store_true",
+                        help="Skip pre-flight validation")
+    args = parser.parse_args()
+
+    # Tee output
+    log_file = Path(args.log_file)
+    sys.stdout = DualOutputLogger(sys.stdout, log_file)
+    sys.stderr = DualOutputLogger(sys.stderr, log_file)
+
+    # Wire mock feed BEFORE constructing the bot
+    if args.mock_btc_feed:
+        os.environ["BTC_BOT_USE_MOCK_FEED"] = "1"
+
+    _configure_logging(args.log_level)
+    log = structlog.get_logger()
+    log.info("launcher_starting", config=args.config)
+
+    config = load_config(args.config)
+
+    if args.mode is not None:
+        config.bot.mode = args.mode
+
+    # Always require explicit --mode=live and matching config.allow_live
+    if not args.no_validate and not validate_system(config):
+        log.error("preflight_failed_aborting")
+        sys.exit(1)
+
+    try:
+        asyncio.run(_run_with_dashboard(args, config))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    run_dashboard()
+    main()

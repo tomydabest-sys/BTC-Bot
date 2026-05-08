@@ -1,4 +1,9 @@
-"""Market discovery and filtering — BTC Up/Down markets, all timeframes."""
+"""Market discovery and filtering — BTC Up/Down markets, all timeframes.
+
+PATCHED: warns once at startup if resolution_window_days[0] > 0 while short
+timeframes (5m/15m) are enabled — a config combination that silently filters
+out all short-window markets.
+"""
 
 from __future__ import annotations
 
@@ -15,12 +20,10 @@ from polybot.events import EventBus
 
 logger = structlog.get_logger()
 
-# Match "Bitcoin Up or Down" with any case/spacing
 BTC_UPDOWN_PATTERN = re.compile(
     r"bitcoin\s+up\s+or\s+down", re.IGNORECASE
 )
 
-# "12:30AM-12:45AM" embedded time-range — used to infer 5/15-min windows
 TIME_WINDOW_PATTERN = re.compile(
     r"(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
     re.IGNORECASE,
@@ -57,28 +60,17 @@ def estimate_window_minutes(question: str) -> int | None:
 
 
 def classify_btc_market(question: str) -> str | None:
-    """Classify a Bitcoin Up/Down market into a timeframe code.
-
-    Handles real Polymarket title patterns:
-    - 5m / 15m: have embedded time-range (e.g. "12:30AM-12:45AM ET")
-    - 1h: title contains "hour" or "hourly"
-    - 4h: title contains "4 hour" or "4h"
-    - daily: title contains "today" or just a date with no time-range
-
-    Returns None if not a Bitcoin Up/Down market.
-    """
+    """Classify a Bitcoin Up/Down market into a timeframe code."""
     if not is_btc_updown_market(question):
         return None
 
     q_lower = question.lower()
 
-    # Hourly first (matches "hour" before "4 hour" sub-match would)
     if "4 hour" in q_lower or "4-hour" in q_lower or "4h" in q_lower:
         return "4h"
     if "1 hour" in q_lower or "1-hour" in q_lower or "hourly" in q_lower:
         return "1h"
 
-    # Time-range present → 5m or 15m
     window = estimate_window_minutes(question)
     if window is not None:
         if window <= 5:
@@ -92,15 +84,12 @@ def classify_btc_market(question: str) -> str | None:
         else:
             return "daily"
 
-    # No time-range, no hour keywords → assume daily
     if "today" in q_lower or "tomorrow" in q_lower:
         return "daily"
 
-    # Last resort
     return "daily"
 
 
-# Map any user-specified timeframe label to canonical code
 _TIMEFRAME_ALIASES: dict[str, str] = {
     "5 min": "5m", "5m": "5m", "5min": "5m",
     "15 min": "15m", "15m": "15m", "15min": "15m",
@@ -113,6 +102,9 @@ _TIMEFRAME_ALIASES: dict[str, str] = {
 def normalize_timeframe(tf: str) -> str:
     """Map any timeframe label to canonical code (5m, 15m, 1h, 4h, daily)."""
     return _TIMEFRAME_ALIASES.get(tf.lower().strip(), tf.lower().strip())
+
+
+_SHORT_TIMEFRAMES = {"5m", "15m"}
 
 
 class MarketScanner:
@@ -130,6 +122,24 @@ class MarketScanner:
         self._active_markets: dict[str, Market] = {}
         self._market_timeframes: dict[str, str] = {}
         self._running = False
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        """Warn loudly about config combinations that silently filter everything."""
+        if not self._config.resolution_window_days:
+            return
+        min_days = self._config.resolution_window_days[0] if self._config.resolution_window_days else 0
+        allowed = self._get_allowed_timeframes()
+        if min_days > 0 and allowed and allowed & _SHORT_TIMEFRAMES:
+            logger.warning(
+                "scanner_config_warning",
+                msg=(
+                    f"resolution_window_days[0]={min_days} but timeframes include "
+                    f"5m/15m. Short-window markets will ALL be filtered out."
+                ),
+                min_days=min_days,
+                short_timeframes_enabled=sorted(allowed & _SHORT_TIMEFRAMES),
+            )
 
     async def start(self) -> None:
         self._running = True

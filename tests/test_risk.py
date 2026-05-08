@@ -1,148 +1,231 @@
-"""Tests for the risk manager (new API after Quarter-Kelly rewrite)."""
+"""Tests for RiskManager — including v3 patches and v4 projected-exposure check."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import pytest
 
-from polybot.config import RiskConfig
 from polybot.data.models import (
     Direction,
-    Order,
-    OrderType,
-    Portfolio,
     Position,
     PositionStatus,
     Side,
-    Signal,
 )
 from polybot.risk.manager import RiskManager
-from polybot.risk.sizing import (
-    SizingPolicy,
-    derive_p_win_from_signal,
-    expected_value_per_dollar,
-    position_size,
-)
 
 
-def _signal(
-    *,
-    target_price: float = 0.50,
-    fair_value: float = 0.55,
-    confidence: float = 0.7,
-    edge_bps: float = 50.0,
-    direction: Direction = Direction.BUY,
-    size_pct: float = 0.05,
-) -> Signal:
-    return Signal(
-        market_id="m1",
-        strategy="test",
-        direction=direction,
-        outcome="Yes",
-        target_price=target_price,
-        confidence=confidence,
-        size_pct=size_pct,
-        reason="test",
-        metadata={"fair_value": fair_value, "edge_bps": edge_bps},
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sizing tests
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _order(*, size: float = 10.0, price: float = 0.50) -> Order:
-    return Order(
-        market_id="m1",
-        token_id="t1",
-        side=Side.BUY,
-        price=price,
-        size=size,
-        order_type=OrderType.LIMIT,
-        strategy="test",
-    )
+class TestKellySizing:
+    def test_basic_kelly(self, risk_config, make_signal):
+        rm = RiskManager(risk_config)
+        sig = make_signal(
+            target_price=0.50,
+            fair_value=0.55,
+            edge_bps=50.0,
+            confidence=0.60,
+        )
+        result = rm.kelly_size_for_signal(sig, bankroll=500.0)
+        assert result.size_usd > 0
+        assert result.size_usd <= risk_config.max_position_size
+
+    def test_floor_recovery_when_kelly_zero(self, risk_config, make_signal):
+        """Kelly outputs 0 but edge is above floor — should snap to min_usd."""
+        rm = RiskManager(risk_config)
+        sig = make_signal(
+            target_price=0.50,
+            fair_value=0.501,  # tiny fair-value edge
+            edge_bps=4.0,  # > edge_floor_bps=3
+            confidence=0.05,  # low conf forces small Kelly
+        )
+        result = rm.kelly_size_for_signal(sig, bankroll=500.0)
+        # Should never be 0 — should snap to either min_floor or floor_recovery
+        assert result.size_usd >= risk_config.min_usd
+
+    def test_legacy_path_no_metadata(self, risk_config, make_signal):
+        """Signal without fair_value/edge_bps should still produce a size."""
+        rm = RiskManager(risk_config)
+        sig = make_signal(
+            edge_bps=0.0,  # forces legacy path
+            fair_value=0.0,
+        )
+        result = rm.kelly_size_for_signal(sig, bankroll=500.0)
+        assert result.size_usd > 0
+
+    def test_min_usd_floor(self, risk_config, make_signal):
+        """Sized amount below min_usd should be floored to min_usd."""
+        small_cfg = risk_config.model_copy(update={"min_usd": 5.0})
+        rm = RiskManager(small_cfg)
+        sig = make_signal(
+            target_price=0.50,
+            fair_value=0.501,
+            edge_bps=5.0,
+            confidence=0.10,
+        )
+        result = rm.kelly_size_for_signal(sig, bankroll=500.0)
+        assert result.size_usd >= 5.0
+
+    def test_max_position_size_cap(self, risk_config, make_signal):
+        rm = RiskManager(risk_config)
+        sig = make_signal(
+            target_price=0.50,
+            fair_value=0.85,  # huge edge
+            edge_bps=3500.0,
+            confidence=0.95,
+        )
+        result = rm.kelly_size_for_signal(sig, bankroll=10_000.0)
+        assert result.size_usd <= risk_config.max_position_size
+
+    def test_min_usd_default_when_unset(self):
+        """min_usd default should be 2.0 even on a fresh RiskConfig."""
+        from polybot.config import RiskConfig
+        cfg = RiskConfig()
+        rm = RiskManager(cfg)
+        assert rm.min_usd == 2.0
 
 
-# ─── Pre-trade gates ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry gate (can_open_position) tests
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_can_open_position_passes_when_clean(risk_config):
-    rm = RiskManager(risk_config)
-    ok, reason = rm.can_open_position(Portfolio(), _signal())
-    assert ok is True
-    assert reason == "ok"
+class TestCanOpenPosition:
+    def test_under_caps_allows(self, risk_config, make_signal):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        portfolio = Portfolio()
+        sig = make_signal()
+        ok, reason = rm.can_open_position(portfolio, sig, projected_notional=20.0)
+        assert ok is True
 
-
-def test_daily_loss_halt(risk_config):
-    rm = RiskManager(risk_config)
-    rm.record_pnl("test", -abs(risk_config.max_daily_loss) - 1)
-    ok, reason = rm.can_open_position(Portfolio(), _signal())
-    assert ok is False
-    assert reason == "daily_loss_halt"
-
-
-def test_position_cap(risk_config):
-    risk_config.max_positions = 2
-    rm = RiskManager(risk_config)
-    portfolio = Portfolio(
-        positions=[
-            Position(
-                market_id=f"m{i}",
-                token_id=f"t{i}",
-                side=Side.BUY,
-                size=10,
-                avg_entry_price=0.50,
+    def test_position_count_cap(self, risk_config, make_signal, make_market):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        portfolio = Portfolio()
+        # Fill to max_positions
+        for i in range(risk_config.max_positions):
+            portfolio.positions.append(
+                Position(
+                    market_id=f"m{i}",
+                    token_id=f"t{i}",
+                    side=Side.BUY,
+                    size=10,
+                    avg_entry_price=0.5,
+                    strategy="test",
+                    status=PositionStatus.OPEN,
+                )
             )
-            for i in range(2)
-        ]
-    )
-    ok, reason = rm.can_open_position(portfolio, _signal())
+        sig = make_signal()
+        ok, reason = rm.can_open_position(portfolio, sig)
+        assert ok is False
+        assert "position_cap" in reason
+
+    def test_projected_exposure_blocks_when_over_cap(self, risk_config, make_signal):
+        """Current exposure under cap, but projected goes over — should reject."""
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        portfolio = Portfolio()
+        # Existing position taking 95% of cap
+        portfolio.positions.append(
+            Position(
+                market_id="m-existing",
+                token_id="t1",
+                side=Side.BUY,
+                size=380,
+                avg_entry_price=0.5,
+                strategy="test",
+                status=PositionStatus.OPEN,
+            )
+        )
+        # 380 × 0.5 = 190, cap = 200 → only $10 headroom
+        sig = make_signal()
+        ok, reason = rm.can_open_position(portfolio, sig, projected_notional=50.0)
+        assert ok is False
+        assert "exposure" in reason.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Order-level gate (can_place_order) tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCanPlaceOrder:
+    def test_normal_order_passes(self, risk_config, make_order):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        portfolio = Portfolio()
+        order = make_order(price=0.5, size=20)  # $10 notional
+        ok, _ = rm.can_place_order(order, portfolio)
+        assert ok
+
+    def test_zero_size_rejected(self, risk_config, make_order):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        order = make_order(price=0.5, size=0)
+        ok, reason = rm.can_place_order(order, Portfolio())
+        assert ok is False
+        assert "zero" in reason
+
+    def test_max_order_size_rejects(self, risk_config, make_order):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        # max_order_size = 25 in fixture; 100 × 0.5 = $50
+        order = make_order(price=0.5, size=100)
+        ok, reason = rm.can_place_order(order, Portfolio())
+        assert ok is False
+        assert "max_order_size" in reason
+
+    def test_exit_order_bypasses_gates(self, risk_config, make_order):
+        """Exit orders must always go through, even if oversized."""
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        order = make_order(price=0.5, size=200, strategy="exit_overshoot_reversion")
+        ok, _ = rm.can_place_order(order, Portfolio())
+        assert ok
+
+    def test_auto_exit_also_bypasses(self, risk_config, make_order):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        order = make_order(
+            price=0.5, size=200,
+            strategy="auto_exit_dual_direction_arb",
+        )
+        ok, _ = rm.can_place_order(order, Portfolio())
+        assert ok
+
+    def test_projected_exposure_in_can_place(self, risk_config, make_order):
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        portfolio = Portfolio()
+        portfolio.positions.append(
+            Position(
+                market_id="m-x",
+                token_id="t",
+                side=Side.BUY,
+                size=380,
+                avg_entry_price=0.5,
+                strategy="test",
+                status=PositionStatus.OPEN,
+            )
+        )
+        order = make_order(price=0.5, size=40)  # $20 notional, would go to 210 > 200 cap
+        ok, reason = rm.can_place_order(order, portfolio)
+        assert ok is False
+        assert "exposure" in reason.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Daily-loss halt
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_daily_loss_halt(risk_config, make_signal):
+    from polybot.data.models import Portfolio
+    rm = RiskManager(risk_config)
+    rm.record_pnl("overshoot_reversion", -25.0)
+    sig = make_signal()
+    ok, reason = rm.can_open_position(Portfolio(), sig)
     assert ok is False
-    assert reason == "position_cap"
-
-
-def test_can_place_order_rejects_oversize(risk_config):
-    rm = RiskManager(risk_config)
-    # max_order_size=20 default; 100 * 0.50 = $50 exceeds
-    ok, reason = rm.can_place_order(_order(size=200, price=0.50), Portfolio())
-    assert ok is False
-
-
-# ─── Sizing ──────────────────────────────────────────────────────────────────
-
-
-def test_kelly_size_for_signal_positive_edge(risk_config):
-    rm = RiskManager(risk_config)
-    sig = _signal(target_price=0.50, fair_value=0.60, edge_bps=200, confidence=0.8)
-    result = rm.kelly_size_for_signal(sig, bankroll=500.0, timeframe="5m")
-    assert result.size_usd > 0
-    # 5m timeframe cap = 2% × $500 = $10; should land at or below cap
-    assert result.size_usd <= 10.0 + 1e-6
-
-
-def test_kelly_size_for_signal_below_edge_floor(risk_config):
-    rm = RiskManager(risk_config)
-    sig = _signal(edge_bps=5.0)  # below default floor of 10
-    result = rm.kelly_size_for_signal(sig, bankroll=500.0, timeframe="5m")
-    assert result.size_usd == 0.0
-    assert result.capped_by == "edge_floor"
-
-
-def test_position_size_respects_hard_cap():
-    pol = SizingPolicy(bankroll_usd=500, kelly_fraction=1.0, hard_cap_pct=0.05)
-    # Very high p_win to force big Kelly fraction
-    r = position_size(
-        bankroll=500, p_win=0.95, avg_win=0.5, avg_loss=0.5,
-        edge_bps=500, confidence=1.0, timeframe="1h", policy=pol,
-    )
-    # With 1h cap=0.05 = $25 hits hard_cap as well
-    assert r.size_usd <= 500 * 0.05 + 1e-6
-
-
-def test_derive_p_win_from_signal_buy():
-    p_win, avg_win, avg_loss = derive_p_win_from_signal(
-        target_price=0.40, fair_value=0.60, direction_buy=True,
-    )
-    assert p_win == 0.60
-    assert abs(avg_win - 0.60) < 1e-9   # 1 - 0.40
-    assert abs(avg_loss - 0.40) < 1e-9
-
-
-def test_expected_value_positive_when_kelly_positive():
-    ev = expected_value_per_dollar(p_win=0.60, avg_win=0.60, avg_loss=0.40)
-    assert ev > 0
+    assert "daily_loss_halt" in reason

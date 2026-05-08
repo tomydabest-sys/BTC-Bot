@@ -10,6 +10,11 @@ predictable slugs based on Unix timestamps:
     btc-updown-4h-{unix_ts}    (every 14400 seconds)
 
 This client fetches markets directly by constructing these slugs.
+
+Order placement / cancellation in live mode requires EIP-712 signing which
+is gated behind `LIVE_TRADING_ENABLED = False` until properly implemented.
+Calls in paper mode never reach this client; the ExecutionEngine simulates
+fills directly.
 """
 
 from __future__ import annotations
@@ -22,12 +27,24 @@ from datetime import datetime
 import httpx
 import structlog
 
-from polybot.data.models import Market, OrderBook, PriceLevel, Trade, Side
+from polybot.data.models import (
+    Market,
+    Order,
+    OrderBook,
+    OrderStatus,
+    PriceLevel,
+    Side,
+    Trade,
+)
 
 logger = structlog.get_logger()
 
 CLOB_BASE_URL = "https://clob.polymarket.com"
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+
+# Hard guard for live trading. Flip this to True only when EIP-712 signing
+# and the full live order lifecycle are implemented and tested.
+LIVE_TRADING_ENABLED = False
 
 # Slug patterns for BTC up/down markets
 # Format: (slug_prefix, interval_seconds, lookback_count, lookahead_count)
@@ -37,6 +54,10 @@ BTC_UPDOWN_WINDOWS = [
     ("btc-updown-1h",  3600,  1, 1),   # 1-hour: check 1 past + 1 future
     ("btc-updown-4h",  14400, 1, 1),   # 4-hour: check 1 past + 1 future
 ]
+
+
+class LiveTradingNotImplementedError(NotImplementedError):
+    """Raised when live order placement is attempted before signing is wired up."""
 
 
 class RateLimiter:
@@ -96,8 +117,14 @@ class PolymarketClient:
             await self._gamma_client.aclose()
 
     async def get_balance(self) -> float:
-        """Get wallet USDC balance. Returns 0 if not available."""
-        # TODO: Implement via py-clob-client or web3
+        """Get wallet USDC balance.
+
+        Live-mode implementation requires web3.py + USDC.e (Polygon) ERC-20
+        balanceOf call. Until live trading is enabled, returns 0.0.
+        """
+        if not LIVE_TRADING_ENABLED:
+            return 0.0
+        # TODO: implement via web3.py against POLYGON_RPC + USDC.e contract
         return 0.0
 
     # ═══════════════════════════════════════════════════════════════
@@ -118,10 +145,8 @@ class PolymarketClient:
         seen_ids: set[str] = set()
 
         for prefix, interval, lookback, lookahead in BTC_UPDOWN_WINDOWS:
-            # Align to the interval boundary
             current_window = (now // interval) * interval
 
-            # Check past, current, and future windows
             for offset in range(-lookback, lookahead + 1):
                 ts = current_window + (offset * interval)
                 slug = f"{prefix}-{ts}"
@@ -137,14 +162,17 @@ class PolymarketClient:
                         continue
 
                     data = resp.json()
-
-                    # Response can be a list or a single event dict
-                    events = data if isinstance(data, list) else [data] if isinstance(data, dict) and data.get("title") else []
+                    events = (
+                        data
+                        if isinstance(data, list)
+                        else [data]
+                        if isinstance(data, dict) and data.get("title")
+                        else []
+                    )
 
                     for event in events:
                         event_markets = event.get("markets", [])
                         for item in event_markets:
-                            # Only include active, non-closed BTC markets
                             if not item.get("active", False):
                                 continue
                             if item.get("closed", False):
@@ -186,7 +214,6 @@ class PolymarketClient:
         if not condition_id or not question:
             return None
 
-        # Parse token IDs
         token_ids = []
         clob_token_ids = item.get("clobTokenIds")
         if clob_token_ids:
@@ -198,7 +225,6 @@ class PolymarketClient:
             elif isinstance(clob_token_ids, list):
                 token_ids = clob_token_ids
 
-        # Parse outcomes
         outcomes_raw = item.get("outcomes")
         if isinstance(outcomes_raw, str):
             try:
@@ -210,7 +236,6 @@ class PolymarketClient:
         else:
             outcomes = ["Up", "Down"]
 
-        # Parse end date
         end_date_str = (
             item.get("endDate")
             or item.get("end_date_iso")
@@ -226,7 +251,6 @@ class PolymarketClient:
         except (ValueError, TypeError):
             end_date = datetime.utcnow()
 
-        # Parse volume
         volume = 0.0
         for key in ["volume", "volumeNum", "volume_num", "volume24hr", "volume_num_24hr"]:
             val = item.get(key)
@@ -237,7 +261,6 @@ class PolymarketClient:
                 except (ValueError, TypeError):
                     continue
 
-        # Parse liquidity
         liquidity = 0.0
         for key in ["liquidity", "liquidityNum", "liquidity_num"]:
             val = item.get(key)
@@ -262,7 +285,7 @@ class PolymarketClient:
         )
 
     # ═══════════════════════════════════════════════════════════════
-    #  TRADING — via CLOB API
+    #  TRADING — via CLOB API (live mode only — paper mode never gets here)
     # ═══════════════════════════════════════════════════════════════
 
     async def _clob_request(self, method: str, path: str, **kwargs) -> dict:
@@ -307,20 +330,58 @@ class PolymarketClient:
             )
         return trades
 
-    async def place_order(self, order_payload: dict) -> dict:
-        """Submit a signed order to the CLOB."""
-        return await self._clob_request("POST", "/order", json=order_payload)
+    async def place_order(self, order: Order) -> Order:
+        """Submit a signed order to the CLOB.
 
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an open order."""
+        Hard-guarded behind LIVE_TRADING_ENABLED until EIP-712 signing is
+        implemented and tested. ExecutionEngine should never call this in
+        paper mode — it simulates fills internally.
+        """
+        if not LIVE_TRADING_ENABLED:
+            raise LiveTradingNotImplementedError(
+                "Live order placement requires EIP-712 signing which is not "
+                "yet implemented. Run the bot with mode='paper'."
+            )
+
+        if not self._private_key:
+            raise LiveTradingNotImplementedError(
+                "Live mode requires POLYMARKET_PRIVATE_KEY env var to be set."
+            )
+
+        # TODO: build signed order payload via py-clob-client EIP-712 utilities
+        # payload = self._sign_order(order)
+        # data = await self._clob_request("POST", "/order", json=payload)
+        # order.order_id = data.get("orderID", "")
+        # order.status = OrderStatus(data.get("status", "OPEN").upper())
+        # return order
+        raise LiveTradingNotImplementedError(
+            "place_order live path not yet implemented"
+        )
+
+    async def cancel_order(self, order_id: str, market_id: str = "") -> bool:
+        """Cancel an open order.
+
+        `market_id` is accepted for API compatibility with execution paths
+        that pass context, but is ignored in the URL since Polymarket's CLOB
+        cancel endpoint is keyed on order_id only.
+        """
+        if not LIVE_TRADING_ENABLED:
+            # In paper mode, cancellation is a no-op success.
+            return True
         try:
             await self._clob_request("DELETE", f"/order/{order_id}")
             return True
         except httpx.HTTPStatusError:
-            logger.warning("cancel_order_failed", order_id=order_id)
+            logger.warning(
+                "cancel_order_failed",
+                order_id=order_id[:16],
+                market_id=market_id[:16] if market_id else "",
+            )
             return False
 
     async def get_open_orders(self) -> list[dict]:
         """Fetch current open orders."""
+        if not LIVE_TRADING_ENABLED:
+            return []
         data = await self._clob_request("GET", "/orders")
         return data if isinstance(data, list) else data.get("data", [])
