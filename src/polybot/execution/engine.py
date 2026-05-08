@@ -1,12 +1,12 @@
 """Order execution — paper and live.
 
-Major changes vs original:
-1. Detects `is_dual_direction` signals and places BOTH legs atomically
-   (or rolls back the first leg if the second fails)
-2. Emits decision-log lines for execution-stage rejections
-3. Honours `legs_max_age_ms` from signal metadata
-4. Uses Kelly-aware order sizes from RiskManager.kelly_size_for_signal()
-5. Maker-only orders use GTC + post-only flag
+PATCHED v3:
+1. Reads dual-direction metadata from order.metadata (Order now has the field)
+2. Retry/backoff for live order placement (config.execution.retry_attempts)
+3. Live order placement is hard-guarded behind LIVE_TRADING_ENABLED in client.py
+   (raises LiveTradingNotImplementedError clearly)
+4. Cancel calls now pass market_id (matches client's new signature)
+5. Emits decision-log lines for execution-stage rejections
 """
 
 from __future__ import annotations
@@ -15,16 +15,17 @@ import asyncio
 import time
 import uuid
 from datetime import datetime
-from typing import Iterable
 
 import structlog
 
 from polybot.config import ExecutionConfig
-from polybot.data.client import PolymarketClient
+from polybot.data.client import (
+    LiveTradingNotImplementedError,
+    PolymarketClient,
+)
 from polybot.data.models import (
     Order,
     OrderStatus,
-    OrderType,
     Portfolio,
     Side,
 )
@@ -51,9 +52,7 @@ class ExecutionEngine:
         self._config = config
         self._event_bus = event_bus
         self._is_paper = is_paper
-        # Rate limiter
         self._last_request_ts: list[float] = []
-        # Open orders we know about
         self._open_orders: dict[str, Order] = {}
 
     @property
@@ -65,12 +64,7 @@ class ExecutionEngine:
     # ─────────────────────────────────────────────────────────────────
 
     async def execute_order(self, order: Order, portfolio: Portfolio) -> Order:
-        """Place an order. For dual-direction arb signals, places both legs.
-
-        Returns the (possibly partially filled) order. For dual-direction
-        arbs, returns the YES leg; the NO leg is reported via order_filled.
-        """
-        # ── Pre-trade risk gate ──────────────────────────────────────
+        """Place an order. For dual-direction arb signals, places both legs."""
         ok, reason = self._risk.can_place_order(order, portfolio)
         if not ok:
             logger.warning(
@@ -83,34 +77,18 @@ class ExecutionEngine:
             order.status = OrderStatus.CANCELLED
             return order
 
-        # ── Detect dual-direction arb ────────────────────────────────
-        meta = self._meta_from_strategy(order)
+        meta = order.metadata or {}
         is_dual = bool(meta.get("is_dual_direction"))
 
         if is_dual:
             return await self._execute_dual_leg(order, portfolio, meta)
 
-        # ── Standard single-leg path ─────────────────────────────────
         await self._rate_limit()
 
         if self._is_paper:
             return await self._simulate_paper_fill(order)
 
-        try:
-            placed = await self._client.place_order(order)
-            self._open_orders[placed.order_id] = placed
-            return placed
-        except Exception as e:
-            logger.error(
-                "place_order_err",
-                m=order.market_id[:12],
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            self._emit_exec_block(order, BlockReason.NO_FEED,
-                                  f"place_order failed: {e}")
-            order.status = OrderStatus.REJECTED
-            return order
+        return await self._submit_live_with_retry(order)
 
     async def cancel_all(self) -> None:
         if self._is_paper:
@@ -128,6 +106,67 @@ class ExecutionEngine:
         self._open_orders.clear()
 
     # ─────────────────────────────────────────────────────────────────
+    #  Live submission with retry
+    # ─────────────────────────────────────────────────────────────────
+
+    async def _submit_live_with_retry(self, order: Order) -> Order:
+        """Place a live order with config-driven retry/backoff.
+
+        Raises LiveTradingNotImplementedError immediately rather than retrying
+        — that's a permanent error pending implementation.
+        """
+        attempts = max(1, int(self._config.retry_attempts))
+        backoffs = list(self._config.retry_backoff_seconds) or [1.0]
+        last_err: Exception | None = None
+
+        for attempt in range(attempts):
+            try:
+                placed = await self._client.place_order(order)
+                self._open_orders[placed.order_id] = placed
+                return placed
+            except LiveTradingNotImplementedError:
+                # Permanent error — don't retry, surface clearly
+                logger.error(
+                    "place_order_live_not_implemented",
+                    m=order.market_id[:12],
+                    note="set bot.mode='paper' or implement EIP-712 signing",
+                )
+                self._emit_exec_block(
+                    order, BlockReason.NO_FEED,
+                    "live_trading_not_implemented",
+                )
+                order.status = OrderStatus.REJECTED
+                return order
+            except Exception as e:
+                last_err = e
+                if attempt < attempts - 1:
+                    sleep_s = backoffs[min(attempt, len(backoffs) - 1)]
+                    logger.warning(
+                        "place_order_retry",
+                        m=order.market_id[:12],
+                        attempt=attempt + 1,
+                        of=attempts,
+                        sleep_s=sleep_s,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+                    await asyncio.sleep(sleep_s)
+                else:
+                    logger.error(
+                        "place_order_err",
+                        m=order.market_id[:12],
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+
+        self._emit_exec_block(
+            order, BlockReason.NO_FEED,
+            f"place_order failed after {attempts} attempts: {last_err}",
+        )
+        order.status = OrderStatus.REJECTED
+        return order
+
+    # ─────────────────────────────────────────────────────────────────
     #  Dual-direction arb (atomic two-leg)
     # ─────────────────────────────────────────────────────────────────
 
@@ -137,12 +176,7 @@ class ExecutionEngine:
         portfolio: Portfolio,
         meta: dict,
     ) -> Order:
-        """Place YES leg, then NO leg. Roll back YES if NO fails.
-
-        For paper mode, both legs are simulated as filled atomically.
-        For live mode, we use FOK-style logic: place YES first, and if NO
-        cannot be placed within legs_max_age_ms, immediately exit YES.
-        """
+        """Place YES leg, then NO leg. Roll back YES if NO fails."""
         no_token_id = meta.get("no_token_id", "")
         no_implied_ask = float(meta.get("no_implied_ask", 0.0))
         legs_max_age_ms = int(meta.get("legs_max_age_ms", 500))
@@ -159,7 +193,6 @@ class ExecutionEngine:
             yes_order.status = OrderStatus.REJECTED
             return yes_order
 
-        # Build NO-leg order with same notional sizing as YES leg
         no_order = Order(
             market_id=yes_order.market_id,
             token_id=no_token_id,
@@ -169,32 +202,22 @@ class ExecutionEngine:
             order_type=yes_order.order_type,
             strategy=f"{yes_order.strategy}_no_leg",
             signal_id=yes_order.signal_id,
+            metadata={"is_dual_direction_no_leg": True},
         )
 
-        # ── Paper path: atomic simulated fill ────────────────────────
         if self._is_paper:
             yes_filled = await self._simulate_paper_fill(yes_order)
             no_filled = await self._simulate_paper_fill(no_order)
-            # Emit fill events for both legs
             await self._event_bus.emit("order_filled", order=no_filled)
             return yes_filled
 
-        # ── Live path: place YES, then NO with deadline ──────────────
+        # Live path
         await self._rate_limit()
         t0 = time.time()
-        try:
-            yes_placed = await self._client.place_order(yes_order)
-            self._open_orders[yes_placed.order_id] = yes_placed
-        except Exception as e:
-            logger.error(
-                "dual_yes_leg_failed",
-                m=yes_order.market_id[:12],
-                error=str(e),
-            )
-            yes_order.status = OrderStatus.REJECTED
-            return yes_order
+        yes_placed = await self._submit_live_with_retry(yes_order)
+        if yes_placed.status == OrderStatus.REJECTED:
+            return yes_placed
 
-        # Check deadline before placing NO leg
         elapsed_ms = (time.time() - t0) * 1000
         if elapsed_ms > legs_max_age_ms:
             logger.warning(
@@ -203,27 +226,22 @@ class ExecutionEngine:
                 elapsed_ms=round(elapsed_ms, 1),
                 deadline_ms=legs_max_age_ms,
             )
-            # Cancel YES leg (best-effort) and bail out
             await self._safe_cancel(yes_placed)
             yes_placed.status = OrderStatus.CANCELLED
             return yes_placed
 
-        # Place NO leg
-        try:
-            no_placed = await self._client.place_order(no_order)
-            self._open_orders[no_placed.order_id] = no_placed
-            await self._event_bus.emit("order_filled", order=no_placed)
-            return yes_placed
-        except Exception as e:
+        no_placed = await self._submit_live_with_retry(no_order)
+        if no_placed.status == OrderStatus.REJECTED:
             logger.error(
                 "dual_no_leg_failed_rolling_back_yes",
                 m=yes_order.market_id[:12],
-                error=str(e),
             )
-            # Roll back YES leg
             await self._safe_cancel(yes_placed)
             yes_placed.status = OrderStatus.CANCELLED
             return yes_placed
+
+        await self._event_bus.emit("order_filled", order=no_placed)
+        return yes_placed
 
     async def _safe_cancel(self, order: Order) -> None:
         try:
@@ -247,7 +265,6 @@ class ExecutionEngine:
         order.status = OrderStatus.FILLED
         order.created_at = datetime.utcnow()
 
-        # Emit fill so PositionManager + features_logger can react
         try:
             await self._event_bus.emit("order_filled", order=order)
         except Exception as e:
@@ -272,31 +289,12 @@ class ExecutionEngine:
         if self._config.rate_limit_per_second <= 0:
             return
         now = time.time()
-        # Drop entries older than 1s
         self._last_request_ts = [t for t in self._last_request_ts if now - t < 1.0]
         if len(self._last_request_ts) >= self._config.rate_limit_per_second:
             wait = 1.0 - (now - self._last_request_ts[0])
             if wait > 0:
                 await asyncio.sleep(wait)
         self._last_request_ts.append(time.time())
-
-    def _meta_from_strategy(self, order: Order) -> dict:
-        """Pull strategy metadata if attached to the order."""
-        # Original Order model has no metadata field; we reconstruct from
-        # signal_id by checking dual_direction prefixes/suffixes. The proper
-        # fix is to add Order.metadata, but if that's not yet wired up, the
-        # dual-direction path is gated on the strategy name string.
-        meta = {}
-        try:
-            meta = getattr(order, "metadata", None) or {}
-        except Exception:
-            pass
-        # Heuristic fallback — if strategy is dual_direction_arb and metadata
-        # is missing, mark for the standard single-leg path
-        if not meta and order.strategy == "dual_direction_arb":
-            logger.debug("dual_direction_metadata_missing_fallback",
-                         m=order.market_id[:12])
-        return meta if isinstance(meta, dict) else {}
 
     def _emit_exec_block(self, order: Order, reason: str, note: str) -> None:
         try:

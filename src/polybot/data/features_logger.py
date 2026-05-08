@@ -1,290 +1,162 @@
-"""Async SQLite feature logger — persists every trading-loop snapshot for offline analysis.
+"""Feature row logger — writes per-cycle market state for offline analysis.
 
-Writes to ./data/features.db. Batches inserts to avoid per-cycle fsync cost.
-Hook: call log_snapshot() from the main trading loop once per market per cycle.
-Backfill: call backfill_settlement() once resolution is known, to label rows.
+PATCHED: added cleanup_old_rows() for retention. Periodic call from main.py
+prevents features.db from growing unbounded.
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
-from datetime import datetime
+import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
-import aiosqlite
 import structlog
+
+if TYPE_CHECKING:
+    from polybot.data.models import MarketSnapshot, Order, Signal
 
 logger = structlog.get_logger()
 
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS features (
-    ts              INTEGER NOT NULL,
-    market_id       TEXT    NOT NULL,
-    time_remaining  REAL,
-    poly_mid        REAL,
-    poly_spread     REAL,
-    poly_bid_depth  REAL,
-    poly_ask_depth  REAL,
-    poly_trade_imb  REAL,
-    btc_price       REAL,
-    btc_move_5s     REAL,
-    btc_move_30s    REAL,
-    btc_move_300s   REAL,
-    btc_vol_60s     REAL,
-    poly_move_5s    REAL,
-    poly_move_30s   REAL,
-    settled_up      INTEGER,
-    poly_mid_exp    REAL
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    ts_unix REAL NOT NULL,
+    cycle_id TEXT,
+    market_id TEXT,
+    timeframe TEXT,
+    strategy TEXT,
+    direction TEXT,
+    target_price REAL,
+    confidence REAL,
+    edge_bps REAL,
+    fair_value REAL,
+    mid REAL,
+    best_bid REAL,
+    best_ask REAL,
+    spread_bps REAL,
+    btc_move_5s REAL,
+    btc_move_30s REAL,
+    btc_move_60s REAL,
+    poly_burst_5s REAL,
+    time_to_expiry_s REAL,
+    size_usd REAL,
+    fill_price REAL,
+    fill_size REAL,
+    extra_json TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_feat_market_ts ON features(market_id, ts);
-CREATE INDEX IF NOT EXISTS idx_feat_ts ON features(ts);
-CREATE INDEX IF NOT EXISTS idx_feat_unsettled ON features(settled_up) WHERE settled_up IS NULL;
+CREATE INDEX IF NOT EXISTS idx_features_ts_unix ON features (ts_unix);
+CREATE INDEX IF NOT EXISTS idx_features_market_ts ON features (market_id, ts_unix);
+CREATE INDEX IF NOT EXISTS idx_features_strategy ON features (strategy);
 """
 
 
-_INSERT_SQL = (
-    "INSERT INTO features "
-    "(ts, market_id, time_remaining, poly_mid, poly_spread, poly_bid_depth, poly_ask_depth, "
-    "poly_trade_imb, btc_price, btc_move_5s, btc_move_30s, btc_move_300s, btc_vol_60s, "
-    "poly_move_5s, poly_move_30s, settled_up, poly_mid_exp) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-)
-
-
 class FeaturesLogger:
-    """Append-only feature store for every trading cycle snapshot.
+    """SQLite writer for per-cycle feature rows."""
 
-    Usage:
-        logger = FeaturesLogger("./data/features.db")
-        await logger.start()
-        ...
-        await logger.log_snapshot(market_id, snapshot, btc_feed, time_remaining)
-        ...
-        await logger.stop()
-    """
+    def __init__(self, db_path: str = "data/features.db") -> None:
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+        self._writes_since_commit = 0
 
-    def __init__(
+    def log_signal(
         self,
-        db_path: str = "./data/features.db",
-        flush_interval_seconds: float = 5.0,
-        max_buffer_rows: int = 200,
+        snapshot: MarketSnapshot,
+        signal: Signal,
+        order: Order | None = None,
     ) -> None:
-        self._db_path = db_path
-        self._flush_interval = flush_interval_seconds
-        self._max_buffer = max_buffer_rows
-        self._buffer: list[tuple] = []
-        self._db: aiosqlite.Connection | None = None
-        self._flush_task: asyncio.Task | None = None
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._rows_written = 0
-
-    @property
-    def rows_written(self) -> int:
-        return self._rows_written
-
-    async def start(self) -> None:
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self._db_path)
-        await self._db.executescript(_SCHEMA)
-        await self._db.commit()
-        self._running = True
-        self._flush_task = asyncio.create_task(self._periodic_flush())
-        logger.info("features_logger_started", path=self._db_path)
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._flush_task:
-            self._flush_task.cancel()
-            try:
-                await self._flush_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        """Write a single feature row from a signal + optional executed order."""
         try:
-            await self._flush()
-        except Exception as e:
-            logger.error("features_final_flush_err", error=str(e))
-        if self._db:
-            await self._db.close()
-            self._db = None
-        logger.info("features_logger_stopped", rows_written=self._rows_written)
-
-    async def log_snapshot(
-        self,
-        market_id: str,
-        snapshot: Any,
-        btc_feed: Any | None,
-        time_remaining: float,
-    ) -> None:
-        """Log one feature row for a market.
-
-        Safe to call from anywhere; buffers internally and flushes in background.
-        Never raises — errors are swallowed and logged.
-        """
-        try:
-            row = self._build_row(market_id, snapshot, btc_feed, time_remaining)
-        except Exception as e:
-            logger.debug("features_build_err", market_id=market_id[:16], error=str(e))
-            return
-
-        async with self._lock:
-            self._buffer.append(row)
-            over = len(self._buffer) >= self._max_buffer
-        if over:
-            try:
-                await self._flush()
-            except Exception as e:
-                logger.warning("features_flush_threshold_err", error=str(e))
-
-    async def backfill_settlement(
-        self,
-        market_id: str,
-        settled_up: int,
-        poly_mid_exp: float | None = None,
-    ) -> int:
-        """Mark all unsettled rows for this market with the final outcome.
-
-        Returns number of rows updated.
-        """
-        if self._db is None:
-            return 0
-        try:
-            cursor = await self._db.execute(
-                "UPDATE features SET settled_up = ?, "
-                "poly_mid_exp = COALESCE(?, poly_mid_exp) "
-                "WHERE market_id = ? AND settled_up IS NULL",
-                (int(settled_up), poly_mid_exp, market_id),
-            )
-            await self._db.commit()
-            updated = cursor.rowcount or 0
-            if updated > 0:
-                logger.info(
-                    "features_backfilled",
-                    market_id=market_id[:16],
-                    settled_up=settled_up,
-                    rows=updated,
+            ob = snapshot.orderbook
+            now = datetime.now(timezone.utc)
+            row = {
+                "ts": now.isoformat(),
+                "ts_unix": now.timestamp(),
+                "cycle_id": "",
+                "market_id": snapshot.market.id,
+                "timeframe": "",
+                "strategy": signal.strategy,
+                "direction": signal.direction.value,
+                "target_price": signal.target_price,
+                "confidence": signal.confidence,
+                "edge_bps": float((signal.metadata or {}).get("edge_bps", 0.0)),
+                "fair_value": float((signal.metadata or {}).get("fair_value", 0.0)),
+                "mid": ob.mid_price,
+                "best_bid": ob.best_bid,
+                "best_ask": ob.best_ask,
+                "spread_bps": ob.spread * 10000,
+                "btc_move_5s": float((signal.metadata or {}).get("btc_move_5s", 0.0)),
+                "btc_move_30s": float((signal.metadata or {}).get("btc_move_30s", 0.0)),
+                "btc_move_60s": float((signal.metadata or {}).get("btc_move_60s", 0.0)),
+                "poly_burst_5s": float(getattr(snapshot, "poly_move_5s", 0.0) or 0.0),
+                "time_to_expiry_s": float((signal.metadata or {}).get("t_rem", 0.0)),
+                "size_usd": (order.size * order.price) if order else 0.0,
+                "fill_price": order.avg_fill_price if order else 0.0,
+                "fill_size": order.filled_size if order else 0.0,
+                "extra_json": json.dumps(signal.metadata or {}, default=str),
+            }
+            self._conn.execute(
+                """
+                INSERT INTO features (
+                    ts, ts_unix, cycle_id, market_id, timeframe, strategy,
+                    direction, target_price, confidence, edge_bps, fair_value,
+                    mid, best_bid, best_ask, spread_bps,
+                    btc_move_5s, btc_move_30s, btc_move_60s, poly_burst_5s,
+                    time_to_expiry_s, size_usd, fill_price, fill_size, extra_json
+                ) VALUES (
+                    :ts, :ts_unix, :cycle_id, :market_id, :timeframe, :strategy,
+                    :direction, :target_price, :confidence, :edge_bps, :fair_value,
+                    :mid, :best_bid, :best_ask, :spread_bps,
+                    :btc_move_5s, :btc_move_30s, :btc_move_60s, :poly_burst_5s,
+                    :time_to_expiry_s, :size_usd, :fill_price, :fill_size, :extra_json
                 )
-            return updated
+                """,
+                row,
+            )
+            self._writes_since_commit += 1
+            if self._writes_since_commit >= 25:
+                self._conn.commit()
+                self._writes_since_commit = 0
         except Exception as e:
-            logger.error("features_backfill_err", market_id=market_id[:16], error=str(e))
+            logger.warning("features_log_err", error=str(e))
+
+    def cleanup_old_rows(self, keep_days: int = 30) -> int:
+        """Delete rows older than `keep_days`. Returns number of rows deleted.
+
+        Uses ts_unix for fast indexed deletion.
+        """
+        try:
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=keep_days)
+            cutoff_unix = cutoff_dt.timestamp()
+            cur = self._conn.execute(
+                "DELETE FROM features WHERE ts_unix < ?",
+                (cutoff_unix,),
+            )
+            deleted = cur.rowcount or 0
+            self._conn.commit()
+            if deleted > 0:
+                # Run VACUUM after a large cleanup to reclaim disk space.
+                # Only do this for big cleanups to avoid the lock cost.
+                if deleted > 10000:
+                    try:
+                        self._conn.execute("VACUUM")
+                    except sqlite3.OperationalError:
+                        # VACUUM can't run inside a transaction; ignore if it fails
+                        pass
+            return deleted
+        except Exception as e:
+            logger.warning("features_cleanup_err", error=str(e))
             return 0
 
-    async def count_unsettled(self) -> int:
-        if self._db is None:
-            return 0
+    def close(self) -> None:
         try:
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM features WHERE settled_up IS NULL"
-            )
-            row = await cursor.fetchone()
-            return int(row[0]) if row else 0
+            self._conn.commit()
+            self._conn.close()
         except Exception:
-            return 0
-
-    # ──────────────────────────────────────────────────────────────────
-    #  Internals
-    # ──────────────────────────────────────────────────────────────────
-
-    def _build_row(
-        self,
-        market_id: str,
-        snapshot: Any,
-        btc_feed: Any | None,
-        time_remaining: float,
-    ) -> tuple:
-        ob = snapshot.orderbook
-        poly_mid = float(ob.mid_price)
-        poly_spread = float(ob.spread)
-        bid_depth = float(ob.bid_depth)
-        ask_depth = float(ob.ask_depth)
-
-        # Trade imbalance over recent_trades (last 30s)
-        buy_v = 0.0
-        sell_v = 0.0
-        now_dt = datetime.utcnow()
-        for t in snapshot.recent_trades or []:
-            try:
-                ts = t.timestamp
-                if hasattr(ts, "replace") and getattr(ts, "tzinfo", None) is not None:
-                    ts = ts.replace(tzinfo=None)
-                age = (now_dt - ts).total_seconds()
-            except Exception:
-                continue
-            if age < 0 or age > 30:
-                continue
-            side_val = getattr(t.side, "value", str(t.side))
-            if side_val == "BUY":
-                buy_v += float(t.size)
-            else:
-                sell_v += float(t.size)
-        total_v = buy_v + sell_v
-        poly_trade_imb = ((buy_v - sell_v) / total_v) if total_v > 0 else 0.0
-
-        # BTC features
-        btc_price = 0.0
-        btc_move_5s = 0.0
-        btc_move_30s = 0.0
-        btc_move_300s = 0.0
-        btc_vol_60s = 0.0
-        if btc_feed is not None and getattr(btc_feed, "last_price", 0) > 0:
-            btc_price = float(btc_feed.last_price)
-            btc_move_5s = float(btc_feed.price_change_since(5.0))
-            btc_move_30s = float(btc_feed.price_change_since(30.0))
-            elapsed_in_window = max(1.0, 300.0 - max(0.0, float(time_remaining)))
-            btc_move_300s = float(
-                btc_feed.price_change_since(min(300.0, elapsed_in_window))
-            )
-            btc_vol_60s = float(btc_feed.volatility_window(60))
-
-        poly_move_5s = float(getattr(snapshot, "poly_move_5s", 0.0) or 0.0)
-        poly_move_30s = float(getattr(snapshot, "poly_move_30s", 0.0) or 0.0)
-
-        ts_ms = int(time.time() * 1000)
-
-        return (
-            ts_ms,
-            market_id,
-            float(time_remaining),
-            poly_mid,
-            poly_spread,
-            bid_depth,
-            ask_depth,
-            poly_trade_imb,
-            btc_price,
-            btc_move_5s,
-            btc_move_30s,
-            btc_move_300s,
-            btc_vol_60s,
-            poly_move_5s,
-            poly_move_30s,
-            None,
-            None,
-        )
-
-    async def _periodic_flush(self) -> None:
-        while self._running:
-            try:
-                await asyncio.sleep(self._flush_interval)
-                await self._flush()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("features_periodic_flush_err", error=str(e))
-
-    async def _flush(self) -> None:
-        if self._db is None:
-            return
-        async with self._lock:
-            if not self._buffer:
-                return
-            rows = self._buffer
-            self._buffer = []
-        try:
-            await self._db.executemany(_INSERT_SQL, rows)
-            await self._db.commit()
-            self._rows_written += len(rows)
-        except Exception as e:
-            logger.error("features_insert_err", error=str(e), batch_size=len(rows))
+            pass

@@ -1,0 +1,154 @@
+# BTC-Bot configuration — copy to config.yaml and edit.
+# Every section below has sensible defaults; comment items out to use them.
+
+bot:
+  name: "btc-bot"
+  mode: "paper"           # "paper" simulates fills; "live" requires EIP-712 signing (not yet enabled)
+  log_level: "INFO"       # DEBUG | INFO | WARNING | ERROR
+  data_dir: "./data"
+  allow_live: false       # MUST be true to actually run mode=live (extra safety lock)
+
+wallet:
+  # Env-var names; the actual values come from .env or the shell environment.
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  api_key_env: "POLYMARKET_API_KEY"
+
+scanner:
+  interval_seconds: 30
+  min_volume_24h: 0
+  min_liquidity: 10
+  max_spread_pct: 30.0
+  categories_allowlist: []
+  categories_blocklist: []
+  resolution_window_days: [0, 7]
+  btc_updown_only: true
+  btc_timeframes: ["5 min", "15 min", "1 hour", "4 hour", "daily"]
+
+strategies:
+  enabled:
+    - name: "overshoot_reversion"
+      weight: 1.0
+      params:
+        min_btc_move_60s_pct: 0.0008
+        min_btc_move_30s_pct: 0.0005
+        min_poly_burst: 0.003
+        min_overshoot: 0.005
+        max_overshoot: 0.150
+        min_time_remaining: 60.0
+        max_time_remaining: 285.0
+        min_poly_mid: 0.15
+        max_poly_mid: 0.85
+        max_spread: 0.060
+        min_btc_move_confirm: 0.0003
+        size_pct: 0.05
+        confidence_floor: 0.40
+        window_seconds: 300.0
+        fair_value_model: "black_scholes"
+        sigma_lookback_s: 900
+        sigma_halflife_s: 60
+        fee_theta_taker: 0.072
+        edge_floor_bps: 3
+        exchange_symbol: "BTC"
+
+    - name: "dual_direction_arb"
+      weight: 1.0
+      params:
+        min_profit_pct: 0.002
+        max_total_cost: 0.998
+        min_liquidity_each_side: 3.0
+        size_pct: 0.06
+        require_recent_trade_seconds: 60
+
+    - name: "boundary_decay"
+      weight: 1.0
+      params:
+        max_time_remaining: 90.0
+        min_btc_delta_pct: 0.0005
+        fade_above_price: 0.85
+        fade_below_price: 0.15
+        min_edge_cents: 0.008
+        size_pct: 0.06
+        confidence_floor: 0.50
+        sigma_lookback_s: 900
+        sigma_halflife_s: 60
+        fee_theta_taker: 0.072
+        exchange_symbol: "BTC"
+
+    - name: "maker_edge"
+      weight: 0.7
+      params:
+        min_spread: 0.008
+        quote_offset: 0.003
+        max_inventory: 0.20
+        max_position_notional_usd: 30.0
+        min_quote_interval_s: 5.0
+        inventory_skew: 0.5
+        size_pct: 0.04
+        time_of_day_filter: false
+        volume_boost_threshold: 1000.0
+        confidence_floor: 0.50
+
+  aggregation:
+    min_confidence: 0.30
+    conflict_resolution: "weighted_vote"   # weighted_vote | highest_confidence | skip
+    strategy_weights:
+      overshoot_reversion: 0.30
+      dual_direction_arb: 0.30
+      boundary_decay: 0.25
+      maker_edge: 0.15
+    min_net_score: 0.15
+
+risk:
+  max_position_size: 50
+  max_portfolio_exposure: 200
+  max_positions: 6
+  max_daily_loss: 25
+  min_trade_interval_seconds: 1
+  max_order_size: 25
+  max_slippage_pct: 5.0
+  bankroll_usd: 500
+  kelly_fraction: 0.50
+  hard_cap_pct: 0.10
+  edge_floor_bps: 3
+  min_usd: 2.0                 # Sizing floor — Kelly outputs below this are floored to it
+  per_timeframe_cap_pct:
+    "5m": 0.04
+    "15m": 0.05
+    "1h": 0.05
+    "4h": 0.06
+    "daily": 0.06
+  circuit_breakers:
+    consecutive_losses_pause: 8
+    consecutive_losses_size_reduction: 0.5
+    api_errors_per_minute_pause: 15
+    ws_disconnect_cancel_seconds: 30
+
+execution:
+  rate_limit_per_second: 5
+  order_ttl_seconds: 15
+  retry_attempts: 2            # Live-mode place_order retries on transient errors
+  retry_backoff_seconds: [0.5, 1.5]
+  loop_interval_ms: 500
+  max_trades_per_cycle: 10
+  max_trades_per_market_per_cycle: 1
+  cooldown_per_market: true
+  high_conf_override_after_s: 1.0
+  high_conf_override_threshold: 0.85
+  auto_close_before_expiry_s: 20
+
+monitoring:
+  metrics_port: 9090
+  alerts:
+    discord_webhook_env: "DISCORD_WEBHOOK_URL"
+    telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
+    telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+  daily_summary_hour: 18
+
+decision_log:
+  path: "logs/decisions.jsonl"
+  flush_every: 25
+
+features_retention:
+  enabled: true
+  keep_days: 30
+  cleanup_interval_hours: 24

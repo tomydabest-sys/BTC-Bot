@@ -14,6 +14,9 @@ class BotConfig(BaseModel):
     mode: str = "paper"
     log_level: str = "INFO"
     data_dir: str = "./data"
+    # Set to True to bypass the live-mode hard guard. NOT RECOMMENDED until
+    # EIP-712 signing is implemented.
+    allow_live: bool = False
 
 
 class WalletConfig(BaseModel):
@@ -42,10 +45,14 @@ class StrategyItemConfig(BaseModel):
 
 
 class AggregationConfig(BaseModel):
-    min_confidence: float = 0.40
+    min_confidence: float = 0.30
     conflict_resolution: str = "weighted_vote"
     strategy_weights: dict[str, float] = Field(default_factory=dict)
-    min_net_score: float = 0.30
+    # Lowered from 0.30 — single-strategy outputs at typical 0.5-0.7 confidence
+    # multiplied by typical strategy weights of 0.30-0.45 produce net scores
+    # in the 0.15-0.31 band. The previous default of 0.30 was silently
+    # blocking single-strategy signals.
+    min_net_score: float = 0.15
 
 
 class StrategiesConfig(BaseModel):
@@ -70,13 +77,16 @@ class RiskConfig(BaseModel):
     max_slippage_pct: float = 5.0
     # Kelly sizing
     bankroll_usd: float = 500
-    kelly_fraction: float = 0.25
-    hard_cap_pct: float = 0.06
-    edge_floor_bps: float = 10
+    kelly_fraction: float = 0.50
+    hard_cap_pct: float = 0.10
+    edge_floor_bps: float = 3.0
+    # NEW: explicit min_usd field — was previously hidden as a getattr-default.
+    # Setting this in YAML now actually works.
+    min_usd: float = 2.0
     per_timeframe_cap_pct: dict[str, float] = Field(
         default_factory=lambda: {
-            "5m": 0.02,
-            "15m": 0.03,
+            "5m": 0.04,
+            "15m": 0.05,
             "1h": 0.05,
             "4h": 0.06,
             "daily": 0.06,
@@ -89,8 +99,8 @@ class ExecutionConfig(BaseModel):
     rate_limit_per_second: int = 5
     order_ttl_seconds: int = 15
     retry_attempts: int = 1
-    retry_backoff_seconds: list[int] = Field(default_factory=lambda: [1])
-    # Trading-loop tuning (new)
+    retry_backoff_seconds: list[float] = Field(default_factory=lambda: [1.0])
+    # Trading-loop tuning
     loop_interval_ms: int = 500
     max_trades_per_cycle: int = 6
     max_trades_per_market_per_cycle: int = 1
@@ -113,9 +123,16 @@ class MonitoringConfig(BaseModel):
 
 
 class DecisionLogConfig(BaseModel):
-    """NEW: structured decision log configuration."""
+    """Structured decision log configuration."""
     path: str = "logs/decisions.jsonl"
     flush_every: int = 25
+
+
+class FeaturesRetentionConfig(BaseModel):
+    """Settings for periodic features.db cleanup."""
+    enabled: bool = True
+    keep_days: int = 30
+    cleanup_interval_hours: int = 24
 
 
 class Config(BaseModel):
@@ -127,6 +144,7 @@ class Config(BaseModel):
     execution: ExecutionConfig = ExecutionConfig()
     monitoring: MonitoringConfig = MonitoringConfig()
     decision_log: DecisionLogConfig = DecisionLogConfig()
+    features_retention: FeaturesRetentionConfig = FeaturesRetentionConfig()
 
     @property
     def is_live(self) -> bool:

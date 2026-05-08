@@ -1,20 +1,16 @@
 """Maker edge — passive liquidity provision.
 
-PATCHED v2 — fixes from first run observation:
-The previous version fired the SAME signal every 500ms because:
-  1. _inventory was never updated (no fill hook)
-  2. Same orderbook (WS frozen) → same mid/spread → same target → same signal
-  3. Cooldown was per-(strategy, market) at 1s; maker fired every 1s for 13s
-     and accumulated $195 of position before portfolio cap stopped it
+PATCHED v3 (atop v2 patches):
 
-Fixes:
-  1. update_inventory() is now actually called (wire-up in main._on_order_filled
-     adds an inventory tracker per (strategy, market))
-  2. New _last_quote_ts per market — won't re-quote within 5s on same market
-     unless mid/spread materially changed (>2 bps move)
-  3. Self-imposed notional cap: tracks dollar value of open inventory and
-     refuses to add more than max_position_notional_usd ($30 default)
-  4. Decision-log line now includes inventory_notional_usd for visibility
+The v2 fix introduced a notional cap to prevent runaway accumulation, but
+update_inventory was double-counting on round trips:
+  BUY 10 @ 0.5  → inv_shares=+10, inv_notional=$5
+  SELL 10 @ 0.5 → inv_shares=  0, inv_notional=$10  (BUG: should be 0)
+
+Fix: notional is now derived from |inv_shares| × last_price every time
+update_inventory is called, replacing the stale accumulator. This is correct
+for the intent ("how much exposure am I currently holding?") and self-corrects
+when fills arrive in any order.
 """
 
 from __future__ import annotations
@@ -44,11 +40,8 @@ class MakerEdgeStrategy(BaseStrategy):
         time_of_day_filter: bool = False,
         volume_boost_threshold: float = 100.0,
         confidence_floor: float = 0.40,
-        # NEW: dollar cap per market — prevents the $195 runaway
         max_position_notional_usd: float = 30.0,
-        # NEW: minimum seconds between quotes on same market (was implicit cooldown)
         min_quote_interval_s: float = 5.0,
-        # NEW: skip re-quote if mid moved less than this many cents
         min_mid_change_to_requote: float = 0.005,
     ) -> None:
         self._min_spread = float(min_spread)
@@ -63,37 +56,53 @@ class MakerEdgeStrategy(BaseStrategy):
         self._min_quote_interval = float(min_quote_interval_s)
         self._min_mid_change = float(min_mid_change_to_requote)
 
-        # Per-market state
-        self._inventory_shares: dict[str, float] = {}      # net shares (+long YES, -short YES)
-        self._inventory_notional: dict[str, float] = {}    # dollar notional of open inventory
-        self._last_quote_ts: dict[str, float] = {}         # last quote emit time
-        self._last_quote_mid: dict[str, float] = {}        # last quote's mid
+        # Per-market inventory state.
+        # _inventory_shares: signed share count (+long YES, -short YES)
+        # _inventory_last_price: last fill price per market — used to recompute
+        #     notional consistently from |shares| × price
+        self._inventory_shares: dict[str, float] = {}
+        self._inventory_last_price: dict[str, float] = {}
+        self._last_quote_ts: dict[str, float] = {}
+        self._last_quote_mid: dict[str, float] = {}
 
     @property
     def name(self) -> str:
         return "maker_edge"
 
-    def update_inventory(self, market_id: str, delta_shares: float, fill_price: float) -> None:
-        """Hook for the bot to inform us of fills.
+    def update_inventory(
+        self, market_id: str, delta_shares: float, fill_price: float,
+    ) -> None:
+        """Update inventory on a fill. Called by main._on_order_filled.
 
-        Called from main._on_order_filled when a maker_edge order fills.
         delta_shares: positive=we got long YES, negative=we got short YES
+        fill_price: price at which the fill occurred — used for notional calc
         """
-        self._inventory_shares[market_id] = (
-            self._inventory_shares.get(market_id, 0.0) + delta_shares
-        )
-        # Notional uses absolute value — we count both long and short as "exposure"
-        self._inventory_notional[market_id] = (
-            self._inventory_notional.get(market_id, 0.0)
-            + abs(delta_shares) * fill_price
-        )
+        new_shares = self._inventory_shares.get(market_id, 0.0) + delta_shares
+        # Snap to zero if rounding leftovers
+        if abs(new_shares) < 1e-9:
+            new_shares = 0.0
+        self._inventory_shares[market_id] = new_shares
+        if fill_price > 0:
+            self._inventory_last_price[market_id] = fill_price
 
     def reset_inventory(self, market_id: str) -> None:
-        """Called when a position closes."""
+        """Called when a position closes (full exit)."""
         self._inventory_shares.pop(market_id, None)
-        self._inventory_notional.pop(market_id, None)
+        self._inventory_last_price.pop(market_id, None)
         self._last_quote_ts.pop(market_id, None)
         self._last_quote_mid.pop(market_id, None)
+
+    def _current_notional_usd(self, market_id: str, mid_price: float) -> float:
+        """Compute current absolute notional from signed shares × mid (fallback to last fill)."""
+        shares = self._inventory_shares.get(market_id, 0.0)
+        if shares == 0:
+            return 0.0
+        ref_price = mid_price if mid_price > 0 else self._inventory_last_price.get(
+            market_id, 0.0
+        )
+        if ref_price <= 0:
+            return 0.0
+        return abs(shares) * ref_price
 
     async def evaluate(self, snapshot: MarketSnapshot) -> Signal | None:
         cycle_id = f"{int(time.time() * 1000) % 100000:05d}"
@@ -124,7 +133,6 @@ class MakerEdgeStrategy(BaseStrategy):
             "size_usd": 0.0,
         }
 
-        # Time remaining
         try:
             now_dt = datetime.utcnow()
             end = snapshot.market.end_date
@@ -164,8 +172,8 @@ class MakerEdgeStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # ── NEW: Notional cap on this market's inventory ─────────────
-        current_notional = self._inventory_notional.get(market_id, 0.0)
+        # Notional cap on this market's inventory (PATCHED — derived not stored)
+        current_notional = self._current_notional_usd(market_id, mid)
         if current_notional >= self._max_position_notional:
             common["reason"] = BlockReason.POSITION_CAP
             emit(**common, extra={
@@ -174,14 +182,13 @@ class MakerEdgeStrategy(BaseStrategy):
             })
             return None
 
-        # ── NEW: Anti-spam quote interval ────────────────────────────
+        # Anti-spam quote interval
         now_ts = time.time()
         last_ts = self._last_quote_ts.get(market_id, 0.0)
         last_mid = self._last_quote_mid.get(market_id, 0.0)
         if last_ts > 0:
             elapsed = now_ts - last_ts
             mid_change = abs(mid - last_mid)
-            # If we recently quoted AND mid hasn't moved meaningfully → skip
             if elapsed < self._min_quote_interval and mid_change < self._min_mid_change:
                 common["reason"] = BlockReason.COOLDOWN
                 emit(**common, extra={
@@ -191,11 +198,10 @@ class MakerEdgeStrategy(BaseStrategy):
                 })
                 return None
 
-        # ── Inventory-aware side selection ───────────────────────────
+        # Inventory-aware side selection
         inventory_shares = self._inventory_shares.get(market_id, 0.0)
         imbalance = ob.book_imbalance
 
-        # Long → prefer SELL; short → prefer BUY; flat → follow imbalance
         if inventory_shares > self._max_inventory * 0.5:
             direction = Direction.SELL
             outcome = "Yes"
@@ -213,7 +219,6 @@ class MakerEdgeStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # Inventory cap check (shares-based)
         if direction == Direction.BUY and inventory_shares >= self._max_inventory:
             common["reason"] = BlockReason.POSITION_CAP
             emit(**common)
@@ -223,7 +228,6 @@ class MakerEdgeStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        # ── Quote price ──────────────────────────────────────────────
         skew_adj = self._inventory_skew * (
             inventory_shares / max(self._max_inventory, 1e-9)
         )
@@ -249,7 +253,6 @@ class MakerEdgeStrategy(BaseStrategy):
         common["decision"] = direction.value
         common["reason"] = BlockReason.OK
 
-        # Stamp this quote
         self._last_quote_ts[market_id] = now_ts
         self._last_quote_mid[market_id] = mid
 

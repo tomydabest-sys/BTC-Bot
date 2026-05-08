@@ -149,6 +149,12 @@ class Signal:
 
 @dataclass
 class Order:
+    """Order is the unit passed to the execution engine.
+
+    `metadata` is copied verbatim from the originating Signal so the
+    execution engine can read fields like `is_dual_direction`, `no_token_id`,
+    `legs_max_age_ms`, `is_maker_only`, `fair_value`, `edge_bps`, etc.
+    """
     market_id: str
     token_id: str
     side: Side
@@ -163,6 +169,7 @@ class Order:
     expires_at: datetime | None = None
     filled_size: float = 0.0
     avg_fill_price: float = 0.0
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
