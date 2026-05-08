@@ -70,6 +70,20 @@ class DualOutputLogger:
         except Exception:
             pass
 
+    def isatty(self) -> bool:
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        # Delegate any other stream attributes (encoding, closed, etc.) to the
+        # wrapped stream so libraries inspecting sys.stdout don't crash.
+        return getattr(self._stream, name)
+
 
 def validate_system(config) -> bool:
     """Pre-flight checks. Returns True if OK to start."""
