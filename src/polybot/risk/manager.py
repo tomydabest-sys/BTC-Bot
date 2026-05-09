@@ -250,6 +250,16 @@ class RiskManager:
         notional = order.size * max(order.price, 0.01)
         is_exit = _is_exit_order(order)
 
+        # Polymarket prices are bounded (0, 1). Reject anything outside this
+        # range — either side — for both entry and exit orders. A price of
+        # 1.29 or -0.05 cannot be filled on the real exchange and only appears
+        # when a strategy's pricing math has gone off the rails (e.g.
+        # unbounded inventory skew). Catching it here stops the paper engine
+        # from simulating an impossible fill that immediately marks to market
+        # at ~−95%.
+        if not (0.0 < order.price < 1.0):
+            return False, f"price_out_of_range:{order.price:.4f}"
+
         if is_exit:
             if notional <= 0:
                 return False, "exit_zero_notional"

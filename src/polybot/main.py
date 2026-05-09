@@ -235,6 +235,11 @@ class Bot:
         await self._pipeline.start()
         await self._alerts.start()
         await self._storage.initialize()
+        # Paper-mode trade history is ephemeral — clear it so the dashboard
+        # doesn't carry blow-ups (or any prior trades) from earlier sessions
+        # into a fresh $0 P&L. Live mode persists.
+        if self._is_paper:
+            await self._storage.clear_session_data()
 
         # Event subscriptions
         self._event_bus.subscribe("order_filled", self._on_order_filled)

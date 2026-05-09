@@ -51,6 +51,23 @@ class Storage:
         if self._db:
             await self._db.close()
 
+    async def clear_session_data(self) -> None:
+        """Truncate orders / positions / pnl_history.
+
+        Used in paper mode at startup so the dashboard begins each run at
+        $0 P&L. Live mode never calls this — its trade history is real
+        capital and must persist across restarts.
+        """
+        if self._db is None:
+            return
+        for table in ("orders", "positions", "pnl_history"):
+            try:
+                await self._db.execute(f"DELETE FROM {table}")
+            except Exception as e:
+                logger.debug("storage_clear_table_skipped", table=table, error=str(e))
+        await self._db.commit()
+        logger.info("storage_session_cleared", tables=["orders", "positions", "pnl_history"])
+
     async def _migrate_legacy_tables(self) -> None:
         """Rename incompatible pre-existing tables out of the way."""
         assert self._db is not None
