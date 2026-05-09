@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +10,27 @@ import aiosqlite
 import structlog
 
 logger = structlog.get_logger()
+
+
+# Required column sets per table. If a pre-existing DB has a table that's
+# missing any of these, the table is renamed to <name>_legacy_<unix_ts> on
+# startup so the fresh schema can be created cleanly without losing rows.
+_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "orders": frozenset({
+        "order_id", "market_id", "token_id", "side", "price", "size",
+        "order_type", "status", "strategy", "signal_id", "filled_size",
+        "avg_fill_price", "created_at", "updated_at",
+    }),
+    "positions": frozenset({
+        "id", "market_id", "token_id", "outcome", "side", "size",
+        "avg_entry_price", "strategy", "opened_at", "closed_at",
+        "realized_pnl",
+    }),
+    "pnl_history": frozenset({
+        "id", "timestamp", "realized_pnl", "unrealized_pnl",
+        "total_exposure", "num_positions",
+    }),
+}
 
 
 class Storage:
@@ -21,12 +43,43 @@ class Storage:
     async def initialize(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
+        await self._migrate_legacy_tables()
         await self._create_tables()
         logger.info("storage_initialized", path=self._db_path)
 
     async def close(self) -> None:
         if self._db:
             await self._db.close()
+
+    async def _migrate_legacy_tables(self) -> None:
+        """Rename incompatible pre-existing tables out of the way."""
+        assert self._db is not None
+        for table, required in _REQUIRED_COLUMNS.items():
+            cur = await self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if row is None:
+                continue
+
+            cur = await self._db.execute(f"PRAGMA table_info({table})")
+            cols = {r[1] for r in await cur.fetchall()}
+            await cur.close()
+            if required.issubset(cols):
+                continue
+
+            legacy_name = f"{table}_legacy_{int(time.time())}"
+            await self._db.execute(f"ALTER TABLE {table} RENAME TO {legacy_name}")
+            logger.warning(
+                "storage_table_migrated",
+                table=table,
+                legacy_table=legacy_name,
+                missing_cols=sorted(required - cols),
+                note="old rows preserved; schema rebuilt to match current code",
+            )
+        await self._db.commit()
 
     async def _create_tables(self) -> None:
         assert self._db is not None
