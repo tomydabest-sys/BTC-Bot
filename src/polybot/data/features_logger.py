@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -54,6 +55,60 @@ CREATE INDEX IF NOT EXISTS idx_features_strategy ON features (strategy);
 """
 
 
+_REQUIRED_FEATURES_COLUMNS: frozenset[str] = frozenset({
+    "id", "ts", "ts_unix", "cycle_id", "market_id", "timeframe", "strategy",
+    "direction", "target_price", "confidence", "edge_bps", "fair_value",
+    "mid", "best_bid", "best_ask", "spread_bps",
+    "btc_move_5s", "btc_move_30s", "btc_move_60s", "poly_burst_5s",
+    "time_to_expiry_s", "size_usd", "fill_price", "fill_size", "extra_json",
+})
+
+
+def _migrate_legacy_features_table(conn: sqlite3.Connection) -> None:
+    """Rename a pre-existing `features` table out of the way if its columns
+    don't match the current schema.
+
+    Without this, `CREATE TABLE IF NOT EXISTS features (...)` is a no-op on
+    the stale table, and the subsequent `CREATE INDEX … ON features (ts_unix)`
+    raises `sqlite3.OperationalError: no such column: ts_unix`. Renaming
+    preserves the legacy rows under `features_legacy_<unix_ts>` for offline
+    inspection while letting the fresh schema be created cleanly.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='features'"
+    ).fetchone()
+    if row is None:
+        return
+
+    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+    if _REQUIRED_FEATURES_COLUMNS.issubset(existing_cols):
+        return  # already compatible
+
+    # Drop legacy indexes first — some may reference columns we're about to
+    # rename out from under them, and SQLite carries indexes with the table
+    # rename which could collide on the new CREATE INDEX.
+    legacy_indexes = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND tbl_name='features' "
+        "AND name LIKE 'idx_features_%'"
+    ).fetchall()
+    for (idx_name,) in legacy_indexes:
+        try:
+            conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+        except sqlite3.OperationalError:
+            pass
+
+    legacy_name = f"features_legacy_{int(time.time())}"
+    conn.execute(f"ALTER TABLE features RENAME TO {legacy_name}")
+    conn.commit()
+    logger.warning(
+        "features_db_migrated",
+        legacy_table=legacy_name,
+        missing_cols=sorted(_REQUIRED_FEATURES_COLUMNS - existing_cols),
+        note="old rows preserved; schema rebuilt to match current code",
+    )
+
+
 class FeaturesLogger:
     """SQLite writer for per-cycle feature rows."""
 
@@ -61,6 +116,7 @@ class FeaturesLogger:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        _migrate_legacy_features_table(self._conn)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._writes_since_commit = 0
