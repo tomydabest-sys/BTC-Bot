@@ -172,6 +172,50 @@ class Bot:
         return self._is_paper
 
     # ─────────────────────────────────────────────────────────────────
+    #  Public accessors used by the dashboard
+    # ─────────────────────────────────────────────────────────────────
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def config(self) -> Config:
+        return self._config
+
+    @property
+    def circuit_breaker(self) -> CircuitBreaker:
+        return self._circuit_breaker
+
+    @property
+    def scanner(self) -> MarketScanner:
+        return self._scanner
+
+    @property
+    def strategies(self) -> list[BaseStrategy]:
+        return self._strategies
+
+    @property
+    def position_manager(self) -> PositionManager:
+        return self._positions
+
+    @property
+    def data_pipeline(self) -> DataPipeline:
+        return self._pipeline
+
+    @property
+    def exchange_feed(self) -> ExchangeFeed:
+        return self._exchange_feed
+
+    @property
+    def event_bus(self) -> EventBus:
+        return self._event_bus
+
+    @property
+    def execution(self) -> ExecutionEngine:
+        return self._execution
+
+    # ─────────────────────────────────────────────────────────────────
     #  Lifecycle
     # ─────────────────────────────────────────────────────────────────
 

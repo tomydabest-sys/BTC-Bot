@@ -103,6 +103,53 @@ class ExchangeFeed:
     def use_mock(self) -> bool:
         return self._use_mock
 
+    # ─────────────────────────────────────────────────────────────────
+    #  Dashboard-facing surface
+    # ─────────────────────────────────────────────────────────────────
+
+    @property
+    def feeds(self) -> dict[str, "ExchangeFeed"]:
+        """Symbol → feed mapping. Single-symbol today; reserved for
+        multi-symbol expansion. The dashboard iterates this dict."""
+        return {self._symbol: self}
+
+    @property
+    def last_price(self) -> float:
+        return self._state.last_price
+
+    @property
+    def last_update(self) -> float:
+        if self._state.ticks:
+            return self._state.ticks[-1].timestamp
+        return 0.0
+
+    def price_change_pct(self, seconds: float) -> float:
+        """Fractional change over the last `seconds` (e.g. 0.005 = +0.5%)."""
+        return self._state.price_change_since(seconds)
+
+    def volatility_window(self, seconds: float) -> float:
+        """Stdev of prices within the last `seconds`. 0.0 if insufficient."""
+        if not self._state.ticks:
+            return 0.0
+        cutoff = time.time() - seconds
+        prices = [t.price for t in self._state.ticks if t.timestamp >= cutoff]
+        if len(prices) < 2:
+            return 0.0
+        try:
+            import statistics
+            return statistics.stdev(prices)
+        except statistics.StatisticsError:
+            return 0.0
+
+    def momentum_score(self) -> float:
+        """Simple momentum: ratio of short-window change to long-window
+        change, signed. Returns 0.0 when either window is empty."""
+        short = self.price_change_pct(15)
+        long_ = self.price_change_pct(60)
+        if long_ == 0:
+            return short
+        return short - long_
+
     async def start(self) -> None:
         self._running = True
         if self._use_mock:
