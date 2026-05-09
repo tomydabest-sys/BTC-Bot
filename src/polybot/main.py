@@ -600,8 +600,23 @@ class Bot:
         if snapshot is None and not force:
             return
 
-        # Exit price: hit the appropriate side of the book aggressively
-        if snapshot is not None:
+        # Exit price: hit the appropriate side of the position's OWN token
+        # book, never the opposite leg's. Binary markets have two tokens with
+        # mirror books (≈1.0 apart); reading the wrong one would close the
+        # position at ~the inverse price, which is catastrophic.
+        position_ob = self._pipeline.get_orderbook(
+            position.market_id, position.token_id,
+        )
+        if position_ob is not None:
+            if position.side == Side.BUY:
+                exit_price = position_ob.best_bid or position.current_price
+            else:
+                exit_price = position_ob.best_ask or position.current_price
+        elif snapshot is not None and (
+            # Fallback: only use the snapshot's primary book if it actually
+            # belongs to this position's token (single-token markets / tests).
+            getattr(snapshot.orderbook, "market_id", "") == position.token_id
+        ):
             if position.side == Side.BUY:
                 exit_price = snapshot.orderbook.best_bid or position.current_price
             else:
@@ -610,6 +625,29 @@ class Bot:
             exit_price = position.current_price or position.avg_entry_price
 
         exit_price = max(0.001, min(0.999, exit_price))
+
+        # Sanity bound: refuse to exit at a price more than 30% adverse to
+        # entry unless this is a forced auto-close. Catches stale-book and
+        # cross-token mispricing before they realise a 90%+ loss.
+        if not force:
+            entry = position.avg_entry_price
+            if entry > 0:
+                if position.side == Side.BUY:
+                    adverse = (entry - exit_price) / entry
+                else:
+                    adverse = (exit_price - entry) / entry
+                if adverse > 0.30:
+                    logger.warning(
+                        "exit_price_sanity_block",
+                        m=position.market_id[:12],
+                        strat=position.strategy,
+                        entry=round(entry, 4),
+                        exit_px=round(exit_price, 4),
+                        adverse_pct=round(adverse * 100, 1),
+                        reason=reason,
+                        note="refusing to realise; will retry on next exits cycle with fresh book",
+                    )
+                    return
 
         # Flip side
         side = Side.SELL if position.side == Side.BUY else Side.BUY

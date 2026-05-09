@@ -207,8 +207,9 @@ class ExecutionEngine:
 
         if self._is_paper:
             yes_filled = await self._simulate_paper_fill(yes_order)
-            no_filled = await self._simulate_paper_fill(no_order)
-            await self._event_bus.emit("order_filled", order=no_filled)
+            # _simulate_paper_fill emits order_filled internally for each leg;
+            # do not double-emit the no leg here.
+            await self._simulate_paper_fill(no_order)
             return yes_filled
 
         # Live path

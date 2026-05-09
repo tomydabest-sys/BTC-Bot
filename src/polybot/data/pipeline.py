@@ -6,6 +6,17 @@ converts them into typed OrderBook / Trade objects, and stores them in
 per-market ring buffers. Snapshots built from those buffers feed the
 strategies through `get_snapshot`.
 
+PATCHED: orderbooks are now tracked **per token_id**, not per market.
+
+Polymarket binary markets have two tokens (e.g. YES + NO) each with its
+own book. Storing a single OrderBook per market and overwriting on every
+WS frame meant exit pricing could read whichever side most recently
+updated — the catastrophic case being a position opened on YES at 0.07
+that was then "exited" at the NO token's ask of 0.96 because the NO frame
+arrived between fill and exit. Strategies still see a consistent primary
+(YES) book through `MarketSnapshot.orderbook`; the orchestrator can fetch
+the position's specific token book via `get_orderbook(market_id, token_id)`.
+
 Adds a Polymarket mid-price ring buffer per market so strategies can observe
 short-window Polymarket movement (poly_move_5s, poly_move_30s) without
 needing to keep their own state.
@@ -33,7 +44,12 @@ logger = structlog.get_logger()
 
 
 class MarketDataBuffer:
-    """In-memory ring buffer for a single market's data."""
+    """In-memory ring buffer for a single market's data.
+
+    Holds one OrderBook per token_id (binary markets have two), plus a
+    primary token_id (typically the YES leg) used for derived metrics like
+    mid_history and poly_move_*.
+    """
 
     def __init__(
         self,
@@ -44,27 +60,48 @@ class MarketDataBuffer:
         self.trades: deque[Trade] = deque(maxlen=max_trades)
         self.price_history: deque[float] = deque(maxlen=max_prices)
         self.mid_history: deque[tuple[float, float]] = deque(maxlen=max_mid_samples)
-        self.orderbook: OrderBook | None = None
+        self.orderbooks: dict[str, OrderBook] = {}
+        self.primary_token_id: str = ""
         self._last_mid_ts: float = 0.0
+
+    def set_primary(self, token_id: str) -> None:
+        if token_id and not self.primary_token_id:
+            self.primary_token_id = token_id
+
+    @property
+    def primary_orderbook(self) -> OrderBook | None:
+        ob = self.orderbooks.get(self.primary_token_id)
+        if ob is not None:
+            return ob
+        # Fallback: any orderbook (only used before the primary's first frame)
+        for v in self.orderbooks.values():
+            return v
+        return None
 
     def add_trade(self, trade: Trade) -> None:
         self.trades.append(trade)
         self.price_history.append(trade.price)
 
-    def update_orderbook(self, orderbook: OrderBook) -> None:
-        self.orderbook = orderbook
-        now = time.time()
-        if now - self._last_mid_ts >= 0.25:
-            try:
-                mid = float(orderbook.mid_price)
-                if 0.0 < mid < 1.0:
-                    self.mid_history.append((now, mid))
-                    self._last_mid_ts = now
-            except Exception:
-                pass
+    def update_orderbook(self, token_id: str, orderbook: OrderBook) -> None:
+        self.orderbooks[token_id] = orderbook
+        # Track mid_history only for the primary token so poly_move_* and
+        # related derived metrics aren't polluted by mirror-side flips.
+        if token_id and token_id == self.primary_token_id:
+            now = time.time()
+            if now - self._last_mid_ts >= 0.25:
+                try:
+                    mid = float(orderbook.mid_price)
+                    if 0.0 < mid < 1.0:
+                        self.mid_history.append((now, mid))
+                        self._last_mid_ts = now
+                except Exception:
+                    pass
+
+    def get_orderbook(self, token_id: str) -> OrderBook | None:
+        return self.orderbooks.get(token_id)
 
     def poly_move_over(self, seconds: float) -> float:
-        """Polymarket mid change over last N seconds. 0.0 if insufficient data."""
+        """Polymarket primary-token mid change over last N seconds."""
         if len(self.mid_history) < 2:
             return 0.0
         now = time.time()
@@ -111,7 +148,6 @@ class DataPipeline:
     # ─────────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Subscribe to data events from the bus."""
         if self._started:
             return
         if self._event_bus is not None:
@@ -140,6 +176,10 @@ class DataPipeline:
         self._markets[market.id] = market
         if market.id not in self._buffers:
             self._buffers[market.id] = MarketDataBuffer()
+        buf = self._buffers[market.id]
+        # First listed token_id is the primary leg (YES / Up by convention).
+        if market.token_ids:
+            buf.set_primary(market.token_ids[0])
         for token_id in market.token_ids:
             self._token_to_market[token_id] = market.id
 
@@ -153,14 +193,26 @@ class DataPipeline:
     def get_market(self, market_id: str) -> Market | None:
         return self._markets.get(market_id)
 
+    def get_orderbook(self, market_id: str, token_id: str) -> OrderBook | None:
+        """Return the orderbook for a specific token within a market.
+
+        Used by the orchestrator's exit pricing path so a position on the
+        YES leg is closed against the YES book (not whichever side most
+        recently updated).
+        """
+        buf = self._buffers.get(market_id)
+        if buf is None:
+            return None
+        return buf.get_orderbook(token_id)
+
     # ─────────────────────────────────────────────────────────────────
     #  Manual ingestion (also used by event handlers)
     # ─────────────────────────────────────────────────────────────────
 
-    def ingest_orderbook(self, market_id: str, orderbook: OrderBook) -> None:
+    def ingest_orderbook(self, market_id: str, token_id: str, orderbook: OrderBook) -> None:
         buf = self._buffers.get(market_id)
         if buf:
-            buf.update_orderbook(orderbook)
+            buf.update_orderbook(token_id, orderbook)
 
     def ingest_trade(self, market_id: str, trade: Trade) -> None:
         buf = self._buffers.get(market_id)
@@ -200,7 +252,7 @@ class DataPipeline:
             bids=bids,
             asks=asks,
         )
-        self.ingest_orderbook(market_id, ob)
+        self.ingest_orderbook(market_id, token_id, ob)
 
     async def _on_trade_update(self, data: dict, **_) -> None:
         if not isinstance(data, dict):
@@ -239,7 +291,10 @@ class DataPipeline:
     def get_snapshot(self, market_id: str) -> MarketSnapshot | None:
         market = self._markets.get(market_id)
         buf = self._buffers.get(market_id)
-        if not market or not buf or not buf.orderbook:
+        if not market or buf is None:
+            return None
+        primary_ob = buf.primary_orderbook
+        if primary_ob is None:
             return None
 
         now = datetime.utcnow()
@@ -248,7 +303,7 @@ class DataPipeline:
 
         return MarketSnapshot(
             market=market,
-            orderbook=buf.orderbook,
+            orderbook=primary_ob,
             recent_trades=trades_1h,
             vwap_1h=self._compute_vwap(trades_1h),
             vwap_24h=self._compute_vwap(trades_24h),
