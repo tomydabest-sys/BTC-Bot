@@ -228,17 +228,25 @@ class MakerEdgeStrategy(BaseStrategy):
             emit(**common)
             return None
 
-        skew_adj = self._inventory_skew * (
-            inventory_shares / max(self._max_inventory, 1e-9)
-        )
+        # Normalize inventory to [-1, 1] before applying skew. Without the
+        # clamp, an out-of-cap inventory (e.g. -97 shares with max=0.20) blew
+        # skew_adj to ~244 and pushed target_price to 1.29 — outside Polymarket's
+        # [0, 1] range, fillable in paper mode, instant 95% loss on MTM.
+        inv_ratio = inventory_shares / max(self._max_inventory, 1e-9)
+        inv_ratio_clamped = max(-1.0, min(1.0, inv_ratio))
+        skew_adj = self._inventory_skew * inv_ratio_clamped
         half_spread = max(self._quote_offset, spread / 2.0 - 0.001)
         if direction == Direction.BUY:
-            target_price = max(0.01, mid - half_spread - 0.005 * skew_adj)
+            target_price = mid - half_spread - 0.005 * skew_adj
         else:
-            target_price = min(0.99, mid + half_spread + 0.005 * skew_adj)
+            target_price = mid + half_spread + 0.005 * skew_adj
+        # Hard-clamp to a tradable Polymarket price range. Defence in depth
+        # against any future skew/half_spread regression.
+        target_price = max(0.01, min(0.99, target_price))
 
         tick = 0.001 if (mid < 0.04 or mid > 0.96) else 0.01
         target_price = round(target_price / tick) * tick
+        target_price = max(0.01, min(0.99, target_price))
 
         edge = half_spread
         edge_bps = edge * 10000
