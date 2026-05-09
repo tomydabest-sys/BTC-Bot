@@ -159,7 +159,14 @@ async def _run_with_dashboard(args, config) -> None:
             )
             server = uvicorn.Server(ucfg)
             server_task = asyncio.create_task(server.serve())
-            log.info("dashboard_started", url=f"http://{args.host}:{args.port}")
+            # 0.0.0.0 is a bind-all address, not a navigable URL — log a
+            # browser-friendly form (localhost) when binding to all interfaces.
+            display_host = "localhost" if args.host in ("0.0.0.0", "::", "") else args.host
+            log.info(
+                "dashboard_started",
+                url=f"http://{display_host}:{args.port}",
+                bind=f"{args.host}:{args.port}",
+            )
 
         # Wait for stop
         await stop_event.wait()
