@@ -4,104 +4,120 @@ Repo: `tomydabest-sys/BTC-Bot` · default branch:
 `claude/polymarket-bot-design-VFErr` · working branch: `v4-rewrite`
 (everything below has already been merged into default).
 
-## Live performance — 2026-05-09 paper run (20 round-trips, 1h29m uptime)
+## Live performance — 2026-05-09 paper run (14 round-trips in hour 1, then silence)
 
-After PR #7 the bot ran a full paper session. Trade log captured 20
-round-trips. Pricing safety holds end-to-end (no impossible entries, no
-catastrophic single-trade losses). The remaining issue is strategy
-quality, not bot integrity.
+Bot ran for **8h08m** in paper mode. Trade log shows **14 round-trips**,
+**all clustered in the first hour**, then 7+ hours of zero new activity
+despite the dashboard reporting `RUNNING`. The performance during the
+trading window was actually solid — the open question is now *why
+trading stopped*.
 
-### Headlines
+### Headlines (the 14 trades)
 
 | Metric | Value | Read |
 | --- | --- | --- |
-| Total P&L | **−$0.64** | bleeding slowly, not catastrophic |
-| Win rate | 10W / 10L = **50%** | coin flip |
-| Avg win | $0.79 | ≈ avg loss |
-| Avg loss | $0.85 | … so no edge |
-| Profit factor | 7.90 / 8.54 = **0.92** | <1.0 = losing on average |
-| Trades / hour | ≈13 | reasonable cadence |
-| Hold-time range | 1s → 55m | bimodal — see #3 below |
-| Position size range | $2 → $26 | bounded, no runaways |
+| Total P&L | **+$18.45** | profitable session |
+| Win rate | 7W / 7L = **50%** | coin flip |
+| Avg win | **$4.39** | … |
+| Avg loss | $1.76 | … 2.5× smaller than avg win |
+| Profit factor | 30.76 / 12.31 = **2.50** | **good** (>1.5 is the bar) |
+| Largest win | #6: BUY 0.210 → 0.430 = **+$15.29** in 58s | |
+| Largest loss | #5: SELL 0.140 → 0.240 = −$6.38 in 50s | |
+| Position size range | $3 → $69 | wider than prior run |
+| Hold-time range | 2s → 5m | much tighter than prior run |
 
 ### What's working
 
-- **Pricing safety:** every entry / exit ∈ `[0.02, 0.99]`. The
-  cross-token pipeline fix + maker_edge clamp + risk-gate
-  `price_out_of_range` are all doing their job. No more 1.29 entries.
-- **Auto-close before expiry:** trades #3, #12, #19 closed via
-  `auto_close` before resolution — the safety net fires.
-- **Some genuine mean-reversion wins:**
-  - #6: SELL 0.460 → 0.210 = **+$1.59** in 53s
-  - #9: SELL 0.450 → 0.160 = **+$1.93** in 1m
-  Both are >+30% on the position; look like overshoot_reversion catching
-  a real reversal.
-- **Sizing bounded** at $2–$26, no runaway positions.
+- **Asymmetric payoff!** Avg win = 2.5× avg loss. The strategies are
+  catching real moves when they fire — exactly the profile a
+  break-even win-rate system needs to be profitable.
+- **Big wins on low-priced BUY entries.** #3 (BUY 0.110 → 0.370,
+  +$4.73), #4 (BUY 0.080 → 0.280, +$5.00), #6 (BUY 0.210 → 0.430,
+  +$15.29), #8 (BUY 0.230 → 0.690, +$4.00). Buying YES cheap and
+  catching a rally pays out with the same asymmetry that makes
+  out-of-money options profitable.
+- **Pricing safety still holds.** Every entry / exit ∈ `[0.08, 0.99]`.
+  No 1.29 fills, no cross-token blow-ups.
+- **Auto-close working.** #10 and #14 closed via `auto_close` before
+  resolution.
+- **No catastrophic single trade.** Worst loss was −$6.38 vs +$15.29
+  best win.
 
 ### What's not working
 
-#### 1. Asymmetric BUY-side losses on mid-range entries
+#### 1. Trading died after ≈hour 1 (the new headline issue)
+
+Uptime says 8h08m, last update is recent (19:01:40), bot says
+`RUNNING`. But trade #14 (the most recent) is at least **7 hours
+ago**. Possible causes, in order of likelihood:
+
+1. **Market discovery stalled.** Scanner loaded the initial batch of
+   BTC up/down markets, the bot traded them out, and either:
+   - the resolution-window filter (`scanner.resolution_window_days:
+     [0, 7]`) is too narrow once "now" advances,
+   - new markets aren't being parsed (Gamma API schema drift,
+     timestamp slugs going stale),
+   - or `_force_closed_markets` is permanently dedupe-blocking them.
+2. **Positions stuck open.** If exit pricing is being sanity-blocked
+   for a position whose underlying market has closed, the position
+   never clears, eventually consumes the position-count cap, and
+   `can_open_position` rejects every new entry.
+3. **WebSocket silently dead.** No `book` events → no orderbook
+   updates → snapshots return None → strategies can't evaluate.
+4. **Circuit breaker tripped on something other than daily loss.**
+   `consecutive_losses_pause` is 8; we had ≤4 consecutive losses, so
+   probably not — but check.
+
+**First diagnostic to run:** grep the log for `scan_complete`,
+`btc_market_found`, `ws_book_event`, and `exec_blocked` after the
+1-hour mark. The pattern of what stopped tells you which of the four
+above is the culprit.
+
+#### 2. The fast-exit losses are still leaking
 
 | # | Side | Entry | Exit | P&L | Hold |
-| --- | --- | --- | --- | --- | --- |
-| #7 | BUY | 0.450 | 0.110 | −$1.51 | 1m |
-| #8 | BUY | 0.460 | 0.190 | −$1.17 | 1m |
-| #10 | BUY | 0.440 | 0.080 | **−$1.96** | 1m |
-| #17 | BUY | 0.880 | 0.820 | −$0.71 | 36s |
+| --- | --- | --- | --- | --- |
+| #1 | SELL | 0.100 | 0.120 | −$1.25 | **2s** |
+| #2 | BUY | 0.110 | 0.100 | −$0.18 | **8s** |
 
-#10 is a 0.440 → 0.080 move in a minute (BTC moving sharply against the
-prediction). Labelled `stop_loss` but the price moved 36¢ before the
-strategy could pull out. Either the stop threshold is too loose, the
-exits-loop interval (1s polling) is too slow, or these are dual-leg
-arb entries marked-to-market against an already-moved book.
+`maker_adverse_selection` (or similar exit) firing on the very first
+MTM tick — same pattern as the prior run. Adds ~$1.40 of bleed per
+session for nothing.
 
-#### 2. Symmetric profile = no edge
+#### 3. Sizing is now hitting the configured caps
 
-`avg_win ≈ avg_loss` at 50% win rate is the textbook signature of
-"strategies have no edge after costs." Wins (#6, #9, #12) and losses
-(#7, #8, #10) are roughly the same magnitude. There's no asymmetric
-payoff being captured.
+#5 ($64), #6 ($69), #1 ($63) all exceed `max_position_size: 50` from
+the config. Either the cap isn't being enforced for entry sizing, or
+these are accumulated multi-fill positions where the cap is checked
+only on the marginal order. Worth investigating —
+`max_position_size` should bound the *total notional*, not the order.
 
-#### 3. 1-second exits
+#### 4. Still no strategy attribution in the Trade Log
 
-#13: SELL 0.760 → 0.800 in **1 second** = −$1.05. The exit loop is
-firing on essentially the same tick as entry — likely
-`maker_adverse_selection` triggering on the very first MTM after fill.
-That's a "fees + slippage" trap, not a real signal.
-
-#### 4. No strategy attribution in the Trade Log
-
-Every exit is labelled `stop_loss` / `auto_close` but never which
-strategy entered. Without `position.strategy` in the log row, can't
-tell whether #10's −$1.96 came from `dual_direction_arb`,
-`maker_edge`, or `overshoot_reversion`.
-
-#### 5. `maker_edge` still hyperactive
-
-Even with the price clamp, earlier logs showed it re-firing every ~3s
-with `inv` swinging ±100 shares. Churning through the spread + paper
-fees. Probably needs `min_quote_interval_s` raised and `max_inventory`
-reset to a sane multiple of typical Kelly sizing.
+Same point as before: every exit reads `stop_loss` / `auto_close`,
+none surface `position.strategy`. Without that, can't attribute the
++$15.29 on #6 vs the −$6.38 on #5 to a specific strategy.
 
 ### Suggested next steps (impact-ordered)
 
-1. **Add strategy attribution to the Trade Log row.** Pure dashboard
-   change in `dashboard/app.py` and the analytics SQL. ~5 min, unlocks
-   per-strategy analysis.
-2. **Investigate the 1-second exits.** Either tighten
-   `maker_adverse_selection` threshold, add a minimum hold (~5s) before
-   exit checks fire, or skip the exits cycle for the first N seconds
-   after a fill.
-3. **Try disabling `maker_edge` for one session.** If P&L improves,
-   maker_edge is dragging. If it stays flat, the bleed is
-   `dual_direction_arb` / `overshoot_reversion` paying for inferior
-   fills.
-4. **Tighten the stop on BUY entries above 0.40.** A 0.44 → 0.08 move
-   in 1 minute means the existing stop didn't fire fast enough; high
-   absolute-price BUY entries have asymmetric downside.
-5. **Verify `dual_direction_arb` resolution math.** Confirm both legs
-   are being placed and the recorded P&L is for the *combined* arb,
-   not just one leg.
+1. **Diagnose the trading-stalled state.** Pull the bot log,
+   `grep -E 'scan_complete|btc_market_found|ws_book_event|exec_blocked|markets_fetched'`
+   from ~hour 1 onwards, look for what stopped. Most likely the
+   scanner isn't finding new markets after the initial batch resolved.
+   This is the single highest-leverage thing — a profitable strategy
+   that can't keep trading is worthless.
+2. **Add strategy attribution to the Trade Log row** (still
+   outstanding from the prior performance review). Pure dashboard
+   change. Unlocks per-strategy P&L splits — we'd immediately see
+   whether #6's +$15.29 is `overshoot_reversion` or
+   `dual_direction_arb`.
+3. **Plug the 2-second exits.** Add a 5-second minimum hold before
+   exit checks fire on a fresh fill. Saves ~$1-2 per session for
+   zero downside.
+4. **Audit the position-size cap.** Confirm `max_position_size: 50`
+   is enforced against total notional after a fill, and that the
+   $64-$69 positions in #5/#6 are intentional (e.g. dual-leg
+   combined notional) and not a sizing-gate bypass.
 
 ## Run it
 
