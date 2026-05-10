@@ -4,6 +4,105 @@ Repo: `tomydabest-sys/BTC-Bot` · default branch:
 `claude/polymarket-bot-design-VFErr` · working branch: `v4-rewrite`
 (everything below has already been merged into default).
 
+## Live performance — 2026-05-09 paper run (20 round-trips, 1h29m uptime)
+
+After PR #7 the bot ran a full paper session. Trade log captured 20
+round-trips. Pricing safety holds end-to-end (no impossible entries, no
+catastrophic single-trade losses). The remaining issue is strategy
+quality, not bot integrity.
+
+### Headlines
+
+| Metric | Value | Read |
+| --- | --- | --- |
+| Total P&L | **−$0.64** | bleeding slowly, not catastrophic |
+| Win rate | 10W / 10L = **50%** | coin flip |
+| Avg win | $0.79 | ≈ avg loss |
+| Avg loss | $0.85 | … so no edge |
+| Profit factor | 7.90 / 8.54 = **0.92** | <1.0 = losing on average |
+| Trades / hour | ≈13 | reasonable cadence |
+| Hold-time range | 1s → 55m | bimodal — see #3 below |
+| Position size range | $2 → $26 | bounded, no runaways |
+
+### What's working
+
+- **Pricing safety:** every entry / exit ∈ `[0.02, 0.99]`. The
+  cross-token pipeline fix + maker_edge clamp + risk-gate
+  `price_out_of_range` are all doing their job. No more 1.29 entries.
+- **Auto-close before expiry:** trades #3, #12, #19 closed via
+  `auto_close` before resolution — the safety net fires.
+- **Some genuine mean-reversion wins:**
+  - #6: SELL 0.460 → 0.210 = **+$1.59** in 53s
+  - #9: SELL 0.450 → 0.160 = **+$1.93** in 1m
+  Both are >+30% on the position; look like overshoot_reversion catching
+  a real reversal.
+- **Sizing bounded** at $2–$26, no runaway positions.
+
+### What's not working
+
+#### 1. Asymmetric BUY-side losses on mid-range entries
+
+| # | Side | Entry | Exit | P&L | Hold |
+| --- | --- | --- | --- | --- | --- |
+| #7 | BUY | 0.450 | 0.110 | −$1.51 | 1m |
+| #8 | BUY | 0.460 | 0.190 | −$1.17 | 1m |
+| #10 | BUY | 0.440 | 0.080 | **−$1.96** | 1m |
+| #17 | BUY | 0.880 | 0.820 | −$0.71 | 36s |
+
+#10 is a 0.440 → 0.080 move in a minute (BTC moving sharply against the
+prediction). Labelled `stop_loss` but the price moved 36¢ before the
+strategy could pull out. Either the stop threshold is too loose, the
+exits-loop interval (1s polling) is too slow, or these are dual-leg
+arb entries marked-to-market against an already-moved book.
+
+#### 2. Symmetric profile = no edge
+
+`avg_win ≈ avg_loss` at 50% win rate is the textbook signature of
+"strategies have no edge after costs." Wins (#6, #9, #12) and losses
+(#7, #8, #10) are roughly the same magnitude. There's no asymmetric
+payoff being captured.
+
+#### 3. 1-second exits
+
+#13: SELL 0.760 → 0.800 in **1 second** = −$1.05. The exit loop is
+firing on essentially the same tick as entry — likely
+`maker_adverse_selection` triggering on the very first MTM after fill.
+That's a "fees + slippage" trap, not a real signal.
+
+#### 4. No strategy attribution in the Trade Log
+
+Every exit is labelled `stop_loss` / `auto_close` but never which
+strategy entered. Without `position.strategy` in the log row, can't
+tell whether #10's −$1.96 came from `dual_direction_arb`,
+`maker_edge`, or `overshoot_reversion`.
+
+#### 5. `maker_edge` still hyperactive
+
+Even with the price clamp, earlier logs showed it re-firing every ~3s
+with `inv` swinging ±100 shares. Churning through the spread + paper
+fees. Probably needs `min_quote_interval_s` raised and `max_inventory`
+reset to a sane multiple of typical Kelly sizing.
+
+### Suggested next steps (impact-ordered)
+
+1. **Add strategy attribution to the Trade Log row.** Pure dashboard
+   change in `dashboard/app.py` and the analytics SQL. ~5 min, unlocks
+   per-strategy analysis.
+2. **Investigate the 1-second exits.** Either tighten
+   `maker_adverse_selection` threshold, add a minimum hold (~5s) before
+   exit checks fire, or skip the exits cycle for the first N seconds
+   after a fill.
+3. **Try disabling `maker_edge` for one session.** If P&L improves,
+   maker_edge is dragging. If it stays flat, the bleed is
+   `dual_direction_arb` / `overshoot_reversion` paying for inferior
+   fills.
+4. **Tighten the stop on BUY entries above 0.40.** A 0.44 → 0.08 move
+   in 1 minute means the existing stop didn't fire fast enough; high
+   absolute-price BUY entries have asymmetric downside.
+5. **Verify `dual_direction_arb` resolution math.** Confirm both legs
+   are being placed and the recorded P&L is for the *combined* arb,
+   not just one leg.
+
 ## Run it
 
 ```bash
