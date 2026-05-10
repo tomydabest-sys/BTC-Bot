@@ -115,9 +115,15 @@ class RiskManager:
         signal: Signal,
         timeframe: str = "",
         projected_notional: float = 0.0,
+        projected_positions: int = 1,
     ) -> tuple[bool, str]:
         """Return (ok, reason). If projected_notional > 0, check it would not
         cause portfolio exposure to breach the cap.
+
+        projected_positions is the number of *new* positions this signal will
+        create. Defaults to 1; pass 2 for dual-direction arb (YES + NO legs)
+        so the cap check accounts for both legs and we don't blow past
+        max_positions in a single execution.
         """
         self._maybe_reset_daily()
 
@@ -127,9 +133,13 @@ class RiskManager:
                              f"daily_pnl ${total_daily_pnl:.2f}")
             return False, "daily_loss_halt"
 
-        if len(portfolio.positions) >= self._config.max_positions:
-            self._emit_block(signal, BlockReason.POSITION_CAP,
-                             f"{len(portfolio.positions)}/{self._config.max_positions} open")
+        projected_count = len(portfolio.positions) + max(1, projected_positions)
+        if projected_count > self._config.max_positions:
+            self._emit_block(
+                signal, BlockReason.POSITION_CAP,
+                f"{len(portfolio.positions)}+{projected_positions}>"
+                f"{self._config.max_positions}",
+            )
             return False, "position_cap"
 
         # Projected exposure check — uses sized notional if caller passes it
