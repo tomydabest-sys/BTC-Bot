@@ -145,6 +145,39 @@ class TestCanOpenPosition:
         assert ok is False
         assert "exposure" in reason.lower()
 
+    def test_dual_leg_signal_reserves_two_position_slots(
+        self, risk_config, make_signal,
+    ):
+        """A dual-direction signal opens YES+NO legs in one shot. The cap
+        check must reserve both slots up front, otherwise a single dual
+        signal can push the portfolio past max_positions and lock the bot
+        out (held-to-expiry legs never free the slots until auto-close).
+        """
+        from polybot.data.models import Portfolio
+        rm = RiskManager(risk_config)
+        portfolio = Portfolio()
+        # Fill to max_positions - 1 (one slot free)
+        for i in range(risk_config.max_positions - 1):
+            portfolio.positions.append(
+                Position(
+                    market_id=f"m{i}",
+                    token_id=f"t{i}",
+                    side=Side.BUY,
+                    size=10,
+                    avg_entry_price=0.5,
+                    strategy="test",
+                    status=PositionStatus.OPEN,
+                )
+            )
+        sig = make_signal(strategy="dual_direction_arb")
+        # A 1-leg signal would still fit (1 free slot).
+        ok, _ = rm.can_open_position(portfolio, sig, projected_positions=1)
+        assert ok is True
+        # A 2-leg signal must be rejected: 5 + 2 > 6.
+        ok, reason = rm.can_open_position(portfolio, sig, projected_positions=2)
+        assert ok is False
+        assert "position_cap" in reason
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Order-level gate (can_place_order) tests

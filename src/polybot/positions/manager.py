@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import structlog
 
@@ -45,6 +45,9 @@ class PositionManager:
         self._event_bus = event_bus
         self._portfolio = Portfolio()
         self._position_open_ts: dict[str, float] = {}
+        self._daily_reset_at: datetime = datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + timedelta(days=1)
 
     @property
     def portfolio(self) -> Portfolio:
@@ -52,6 +55,21 @@ class PositionManager:
 
     def get_portfolio(self) -> Portfolio:
         return self._portfolio
+
+    def _maybe_reset_daily_pnl(self) -> None:
+        """Zero Portfolio.daily_pnl at the UTC day boundary.
+
+        Without this, daily_pnl accumulates forever and eventually trips the
+        daily-loss circuit breaker on a multi-day run even when each day was
+        net positive.
+        """
+        now = datetime.utcnow()
+        if now >= self._daily_reset_at:
+            self._portfolio.daily_pnl = 0.0
+            self._daily_reset_at = now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(days=1)
+            logger.info("portfolio_daily_pnl_reset", at=self._daily_reset_at.isoformat())
 
     # ─────────────────────────────────────────────────────────────────
     #  Fill handling
@@ -61,6 +79,8 @@ class PositionManager:
         """Update positions from a filled order."""
         if order.filled_size <= 0:
             return
+
+        self._maybe_reset_daily_pnl()
 
         is_exit = order.strategy.startswith("exit_") or order.strategy.startswith("auto_exit")
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from polybot.data.models import (
@@ -183,3 +185,58 @@ class TestExitSignalGeneration:
         exits = pm.check_exits()
         assert len(exits) == 1
         assert "boundary_hard_stop" in exits[0].reason
+
+
+class TestDailyPnLReset:
+    """daily_pnl must roll over at the UTC day boundary.
+
+    Without a reset, accumulated losses from prior days carry into today and
+    eventually trip the daily-loss circuit breaker on a bot that's actually
+    profitable each day in isolation.
+    """
+
+    def test_reset_at_utc_midnight(self):
+        pm = PositionManager(EventBus())
+        # Open + close at a loss
+        pm.update_from_fill(_make_filled_order(side=Side.BUY, price=0.50, size=20))
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.45, size=20,
+            strategy="exit_overshoot_reversion",
+        ))
+        assert pm.portfolio.daily_pnl < 0
+        loss_amount = pm.portfolio.daily_pnl
+        # realized_pnl should match daily_pnl right now
+        assert pm.portfolio.realized_pnl == loss_amount
+
+        # Force the reset boundary into the past — next fill must zero daily_pnl
+        pm._daily_reset_at = datetime.utcnow() - timedelta(seconds=1)
+
+        # New trade after the boundary
+        pm.update_from_fill(_make_filled_order(side=Side.BUY, price=0.50, size=20))
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.55, size=20,
+            strategy="exit_overshoot_reversion",
+        ))
+
+        # daily_pnl should reflect ONLY today's profit, not yesterday's loss
+        assert abs(pm.portfolio.daily_pnl - 1.0) < 1e-6
+        # realized_pnl is lifetime; it accumulates across the boundary
+        assert abs(pm.portfolio.realized_pnl - (loss_amount + 1.0)) < 1e-6
+
+    def test_no_reset_before_boundary(self):
+        pm = PositionManager(EventBus())
+        pm.update_from_fill(_make_filled_order(side=Side.BUY, price=0.50, size=20))
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.55, size=20,
+            strategy="exit_overshoot_reversion",
+        ))
+        first_pnl = pm.portfolio.daily_pnl
+        assert first_pnl > 0
+
+        # Another trade well before the next boundary — must accumulate
+        pm.update_from_fill(_make_filled_order(side=Side.BUY, price=0.50, size=20))
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.55, size=20,
+            strategy="exit_overshoot_reversion",
+        ))
+        assert abs(pm.portfolio.daily_pnl - first_pnl * 2) < 1e-6

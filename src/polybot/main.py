@@ -489,11 +489,20 @@ class Bot:
             if sized_usd <= 0:
                 continue
 
+            # Dual-direction arb opens TWO positions per signal (YES+NO legs);
+            # the position cap must reserve both slots, otherwise a single
+            # dual signal can push the portfolio past max_positions and
+            # permanently lock out subsequent entries (those legs are
+            # held-to-expiry).
+            agg_meta = agg.metadata or {}
+            projected_positions = 2 if agg_meta.get("is_dual_direction") else 1
+
             ok, reason = self._risk.can_open_position(
                 self._positions.portfolio,
                 agg,
                 timeframe=timeframe,
                 projected_notional=sized_usd,
+                projected_positions=projected_positions,
             )
             if not ok:
                 continue
@@ -714,14 +723,20 @@ class Bot:
             metadata={"exit_reason": reason, "force": force},
         )
 
+        # Snapshot realised P&L *before* the exit fill so we can compute the
+        # exact delta this exit produced. Without this the RiskManager and
+        # CircuitBreaker never see real P&L and their loss-tracking gates
+        # are silently disabled.
+        realized_before = self._positions.portfolio.realized_pnl
+
         try:
             executed = await self._execution.execute_order(
                 order, self._positions.portfolio
             )
             if executed.status.value == "FILLED":
-                # Realised PnL bookkeeping
-                pnl_delta = self._positions.portfolio.realized_pnl  # snapshot
-                self._risk.record_pnl(position.strategy, 0.0)  # exact pnl in update_from_fill path
+                pnl_delta = self._positions.portfolio.realized_pnl - realized_before
+                self._risk.record_pnl(position.strategy, pnl_delta)
+                self._circuit_breaker.record_trade_result(pnl_delta)
                 # Daily-loss check
                 if (
                     self._positions.portfolio.daily_pnl
