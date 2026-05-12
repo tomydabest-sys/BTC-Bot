@@ -376,16 +376,18 @@ class Bot:
                         fill_price=order.avg_fill_price,
                     )
 
-            # Exit fills: reset maker inventory if this fully closed the position
-            if order.strategy.startswith("exit_") or order.strategy.startswith("auto_exit"):
-                still_open = any(
-                    p.market_id == order.market_id
-                    for p in self._positions.portfolio.positions
-                )
-                if not still_open:
-                    strat = self._get_strategy_by_name("maker_edge")
-                    if strat is not None and isinstance(strat, MakerEdgeStrategy):
-                        strat.reset_inventory(order.market_id)
+            # Reset maker_edge inventory whenever no position remains on the
+            # market — covers both explicit exit fills AND non-exit fills
+            # that fully netted out an opposite-side position (e.g. a SELL
+            # quote that closed the entire BUY position).
+            still_open = any(
+                p.market_id == order.market_id
+                for p in self._positions.portfolio.positions
+            )
+            if not still_open:
+                strat = self._get_strategy_by_name("maker_edge")
+                if strat is not None and isinstance(strat, MakerEdgeStrategy):
+                    strat.reset_inventory(order.market_id)
 
         except Exception as e:
             logger.error("on_order_filled_err", error=str(e))

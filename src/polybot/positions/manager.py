@@ -93,72 +93,74 @@ class PositionManager:
 
         is_exit = order.strategy.startswith("exit_") or order.strategy.startswith("auto_exit")
 
-        # Find existing position. For exit orders, side flips.
-        target_side = order.side
         if is_exit:
-            target_side = Side.SELL if order.side == Side.BUY else Side.BUY
+            self._apply_exit_fill(order)
+            return
 
+        # Non-exit fill: a maker quote, an overshoot entry, etc.
+        # ── Net out same-market same-token opposite-side first. ──
+        # Strategies like maker_edge alternate BUY/SELL quotes to flatten
+        # inventory. Without netting, each side opens its own Position
+        # object on the same (market, token), eating two cap slots and
+        # de-syncing the strategy's net-inventory tracker from the
+        # PositionManager's two-positions view. With netting, a SELL fill
+        # closes (or reduces) the long position before opening any new
+        # short — matching standard signed-net-position semantics.
+        opposite_side = Side.SELL if order.side == Side.BUY else Side.BUY
+        opposite = None
+        for p in self._portfolio.positions:
+            if (p.market_id == order.market_id
+                    and p.token_id == order.token_id
+                    and p.side == opposite_side):
+                opposite = p
+                break
+
+        remaining_size = order.filled_size
+        if opposite is not None:
+            close_size = min(remaining_size, opposite.size)
+            pnl = self._compute_realised_pnl(
+                opposite, order.avg_fill_price, close_size,
+            )
+            self._portfolio.realized_pnl += pnl
+            self._portfolio.daily_pnl += pnl
+            opposite.size -= close_size
+            if opposite.size <= 1e-9:
+                opposite.status = PositionStatus.CLOSED
+                self._portfolio.positions.remove(opposite)
+                self._position_open_ts.pop(_pos_key(opposite), None)
+                logger.info(
+                    "position_netted_closed",
+                    m=opposite.market_id[:12],
+                    pnl=round(pnl, 4),
+                    strat=opposite.strategy,
+                )
+            else:
+                logger.info(
+                    "position_netted_reduced",
+                    m=opposite.market_id[:12],
+                    new_size=round(opposite.size, 4),
+                    pnl=round(pnl, 4),
+                )
+            remaining_size -= close_size
+
+        if remaining_size <= 1e-9:
+            return  # Fully netted; no new opening.
+
+        # Open or add to a same-side position with whatever's left over.
         existing = None
         for p in self._portfolio.positions:
             if (p.market_id == order.market_id
                     and p.token_id == order.token_id
-                    and p.side == target_side):
+                    and p.side == order.side):
                 existing = p
                 break
 
-        if is_exit and existing is not None:
-            close_size = min(order.filled_size, existing.size)
-            leftover = order.filled_size - close_size
-            if leftover > 1e-9:
-                logger.warning(
-                    "exit_fill_exceeds_position",
-                    m=existing.market_id[:12],
-                    fill_size=round(order.filled_size, 4),
-                    position_size=round(existing.size, 4),
-                    leftover=round(leftover, 4),
-                    note="leftover_size_discarded_did_not_open_reverse_position",
-                )
-            pnl = self._compute_realised_pnl(existing, order.avg_fill_price, close_size)
-            self._portfolio.realized_pnl += pnl
-            self._portfolio.daily_pnl += pnl
-            existing.size -= close_size
-            if existing.size <= 1e-9:
-                existing.status = PositionStatus.CLOSED
-                self._portfolio.positions.remove(existing)
-                self._position_open_ts.pop(_pos_key(existing), None)
-                logger.info(
-                    "position_closed",
-                    m=existing.market_id[:12],
-                    pnl=round(pnl, 4),
-                    strat=existing.strategy,
-                )
-            else:
-                logger.info(
-                    "position_reduced",
-                    m=existing.market_id[:12],
-                    new_size=round(existing.size, 4),
-                    pnl=round(pnl, 4),
-                )
-            return
-
-        if is_exit and existing is None:
-            # Exit fill arrived but no position to close — likely a race
-            # between auto_close and an existing exit having already closed.
-            logger.warning(
-                "exit_fill_no_position",
-                m=order.market_id[:12],
-                strat=order.strategy,
-                size=round(order.filled_size, 4),
-            )
-            return
-
-        # Open or add to position
         if existing is None:
             pos = Position(
                 market_id=order.market_id,
                 token_id=order.token_id,
                 side=order.side,
-                size=order.filled_size,
+                size=remaining_size,
                 avg_entry_price=order.avg_fill_price,
                 current_price=order.avg_fill_price,
                 strategy=order.strategy,
@@ -176,11 +178,11 @@ class PositionManager:
                 strat=pos.strategy,
             )
         else:
-            total_size = existing.size + order.filled_size
+            total_size = existing.size + remaining_size
             if total_size > 0:
                 existing.avg_entry_price = (
                     existing.avg_entry_price * existing.size
-                    + order.avg_fill_price * order.filled_size
+                    + order.avg_fill_price * remaining_size
                 ) / total_size
                 existing.size = total_size
                 logger.info(
@@ -189,6 +191,60 @@ class PositionManager:
                     new_size=round(existing.size, 4),
                     new_avg=round(existing.avg_entry_price, 4),
                 )
+
+    def _apply_exit_fill(self, order: Order) -> None:
+        """Close (or reduce) the position matching this exit order."""
+        target_side = Side.SELL if order.side == Side.BUY else Side.BUY
+
+        existing = None
+        for p in self._portfolio.positions:
+            if (p.market_id == order.market_id
+                    and p.token_id == order.token_id
+                    and p.side == target_side):
+                existing = p
+                break
+
+        if existing is None:
+            logger.warning(
+                "exit_fill_no_position",
+                m=order.market_id[:12],
+                strat=order.strategy,
+                size=round(order.filled_size, 4),
+            )
+            return
+
+        close_size = min(order.filled_size, existing.size)
+        leftover = order.filled_size - close_size
+        if leftover > 1e-9:
+            logger.warning(
+                "exit_fill_exceeds_position",
+                m=existing.market_id[:12],
+                fill_size=round(order.filled_size, 4),
+                position_size=round(existing.size, 4),
+                leftover=round(leftover, 4),
+                note="leftover_size_discarded_did_not_open_reverse_position",
+            )
+        pnl = self._compute_realised_pnl(existing, order.avg_fill_price, close_size)
+        self._portfolio.realized_pnl += pnl
+        self._portfolio.daily_pnl += pnl
+        existing.size -= close_size
+        if existing.size <= 1e-9:
+            existing.status = PositionStatus.CLOSED
+            self._portfolio.positions.remove(existing)
+            self._position_open_ts.pop(_pos_key(existing), None)
+            logger.info(
+                "position_closed",
+                m=existing.market_id[:12],
+                pnl=round(pnl, 4),
+                strat=existing.strategy,
+            )
+        else:
+            logger.info(
+                "position_reduced",
+                m=existing.market_id[:12],
+                new_size=round(existing.size, 4),
+                pnl=round(pnl, 4),
+            )
 
     def update_prices(self, market_id: str, current_price: float) -> None:
         """Mark-to-market all positions in this market."""
