@@ -41,13 +41,22 @@ class ExitSignal:
 class PositionManager:
     """Tracks open positions, computes unrealised P&L, generates exit signals."""
 
-    def __init__(self, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        event_bus: EventBus,
+        max_hold_seconds: float = 3600.0,
+    ) -> None:
         self._event_bus = event_bus
         self._portfolio = Portfolio()
         self._position_open_ts: dict[str, float] = {}
         self._daily_reset_at: datetime = datetime.utcnow().replace(
             hour=0, minute=0, second=0, microsecond=0
         ) + timedelta(days=1)
+        # Safety net: any position held longer than this is force-exited via
+        # the normal exits loop. Prevents the position cap from getting
+        # permanently pegged by held-to-expiry strategies that entered
+        # long-duration (1h / 4h / daily) markets.
+        self._max_hold_seconds = float(max_hold_seconds)
 
     @property
     def portfolio(self) -> Portfolio:
@@ -214,6 +223,15 @@ class PositionManager:
 
     def _exit_reason_for(self, p: Position) -> str | None:
         """Dispatch to strategy-specific exit logic."""
+        # Universal safety net: positions stuck open beyond _max_hold_seconds
+        # are force-exited regardless of strategy. This protects the position
+        # cap from being permanently pegged when held-to-expiry strategies
+        # land in long-duration markets and can no longer rotate trades in.
+        if self._max_hold_seconds > 0:
+            opened = self._position_open_ts.get(_pos_key(p), 0.0)
+            if opened > 0 and (time.time() - opened) >= self._max_hold_seconds:
+                return f"max_hold_exceeded ({(time.time() - opened):.0f}s)"
+
         strat = (p.strategy or "").lower()
 
         if "boundary_decay" in strat:

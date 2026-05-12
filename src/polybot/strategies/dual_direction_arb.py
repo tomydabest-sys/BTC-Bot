@@ -38,6 +38,7 @@ class DualDirectionArbStrategy(BaseStrategy):
         size_pct: float = 0.06,
         require_recent_trade_seconds: float = 30.0,
         legs_max_age_ms: int = 500,
+        max_time_remaining: float = 600.0,
     ) -> None:
         self._min_profit_pct = float(min_profit_pct)
         self._max_total_cost = float(max_total_cost)
@@ -45,6 +46,7 @@ class DualDirectionArbStrategy(BaseStrategy):
         self._size_pct = float(size_pct)
         self._require_recent_trade_s = float(require_recent_trade_seconds)
         self._legs_max_age_ms = int(legs_max_age_ms)
+        self._max_t_rem = float(max_time_remaining)
 
     @property
     def name(self) -> str:
@@ -98,6 +100,14 @@ class DualDirectionArbStrategy(BaseStrategy):
             common["time_to_expiry_s"] = (end - now_dt).total_seconds()
         except Exception:
             pass
+
+        # Dual-direction arb is held to expiry by design. Without an upper
+        # bound on time_remaining, the strategy enters 1h/4h/daily markets
+        # and locks the position cap for hours, halting all other trading.
+        if common["time_to_expiry_s"] > self._max_t_rem:
+            common["reason"] = BlockReason.TIME_REMAINING_TOO_HIGH
+            emit(**common)
+            return None
 
         if ob.best_bid <= 0 or ob.best_ask >= 1.0:
             common["reason"] = BlockReason.INVALID_BOOK
@@ -218,4 +228,5 @@ class DualDirectionArbStrategy(BaseStrategy):
             "size_pct": self._size_pct,
             "require_recent_trade_seconds": self._require_recent_trade_s,
             "legs_max_age_ms": self._legs_max_age_ms,
+            "max_time_remaining": self._max_t_rem,
         }

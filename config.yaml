@@ -54,6 +54,10 @@ strategies:
         min_liquidity_each_side: 3.0
         size_pct: 0.06
         require_recent_trade_seconds: 60
+        # Dual-direction is held to expiry. Without an upper bound the
+        # strategy lands in 1h/4h/daily markets and parks both legs there
+        # until the cap is full, halting all other trading.
+        max_time_remaining: 600.0
 
     # ── BOUNDARY DECAY (extended window) ────────────────────────────────
     - name: "boundary_decay"
@@ -82,6 +86,9 @@ strategies:
         time_of_day_filter: false
         volume_boost_threshold: 1000.0
         confidence_floor: 0.50
+        # Cap entries to short-window markets so inventory doesn't park
+        # in long-duration markets and lock the global position cap.
+        max_time_remaining: 600.0
 
   aggregation:
     min_confidence: 0.30
@@ -129,6 +136,10 @@ execution:
   high_conf_override_after_s: 1.0
   high_conf_override_threshold: 0.85
   auto_close_before_expiry_s: 20
+  # Force-close any position held longer than this. Belt-and-braces against
+  # held-to-expiry positions stuck in long markets (the strategy-level
+  # max_time_remaining filters are the primary defence).
+  max_position_hold_seconds: 1800.0
 
 monitoring:
   metrics_port: 9090

@@ -240,3 +240,58 @@ class TestDailyPnLReset:
             strategy="exit_overshoot_reversion",
         ))
         assert abs(pm.portfolio.daily_pnl - first_pnl * 2) < 1e-6
+
+
+class TestMaxHoldSafetyNet:
+    """Held-to-expiry strategies (dual_direction, boundary_decay) that
+    happen to land in long-duration markets would otherwise park positions
+    for hours and peg the position cap. The safety net force-exits any
+    position open longer than max_hold_seconds.
+    """
+
+    def test_position_held_too_long_emits_exit(self):
+        import time
+        pm = PositionManager(EventBus(), max_hold_seconds=1.0)
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=20,
+            strategy="dual_direction_arb",
+        ))
+        # Fresh position — should not exit
+        assert pm.check_exits() == []
+        # Force the open timestamp into the past
+        key = next(iter(pm._position_open_ts))
+        pm._position_open_ts[key] = time.time() - 2.0
+        exits = pm.check_exits()
+        assert len(exits) == 1
+        assert "max_hold_exceeded" in exits[0].reason
+
+    def test_safety_net_disabled_when_zero(self):
+        import time
+        pm = PositionManager(EventBus(), max_hold_seconds=0.0)
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=20,
+            strategy="dual_direction_arb",
+        ))
+        # Even with a 1-hour-old position, no max_hold exit when disabled
+        key = next(iter(pm._position_open_ts))
+        pm._position_open_ts[key] = time.time() - 3600.0
+        for ex in pm.check_exits():
+            assert "max_hold_exceeded" not in ex.reason
+
+    def test_max_hold_fires_before_strategy_dispatch(self):
+        """Even strategies that normally return None (held-to-expiry) must
+        respect the safety net."""
+        import time
+        pm = PositionManager(EventBus(), max_hold_seconds=1.0)
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=20,
+            strategy="boundary_decay",
+        ))
+        # boundary_decay normally holds forever (no exit when neutral)
+        pm.update_prices("m-test", 0.50)
+        assert pm.check_exits() == []
+        key = next(iter(pm._position_open_ts))
+        pm._position_open_ts[key] = time.time() - 2.0
+        exits = pm.check_exits()
+        assert len(exits) == 1
+        assert "max_hold_exceeded" in exits[0].reason

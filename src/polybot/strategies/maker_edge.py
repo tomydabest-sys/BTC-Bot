@@ -43,6 +43,7 @@ class MakerEdgeStrategy(BaseStrategy):
         max_position_notional_usd: float = 30.0,
         min_quote_interval_s: float = 5.0,
         min_mid_change_to_requote: float = 0.005,
+        max_time_remaining: float = 600.0,
     ) -> None:
         self._min_spread = float(min_spread)
         self._quote_offset = float(quote_offset)
@@ -55,6 +56,7 @@ class MakerEdgeStrategy(BaseStrategy):
         self._max_position_notional = float(max_position_notional_usd)
         self._min_quote_interval = float(min_quote_interval_s)
         self._min_mid_change = float(min_mid_change_to_requote)
+        self._max_t_rem = float(max_time_remaining)
 
         # Per-market inventory state.
         # _inventory_shares: signed share count (+long YES, -short YES)
@@ -146,6 +148,14 @@ class MakerEdgeStrategy(BaseStrategy):
         # Don't quote in last 30s — adverse selection peaks
         if t_rem < 30.0:
             common["reason"] = BlockReason.TIME_REMAINING_TOO_LOW
+            emit(**common)
+            return None
+
+        # Without an upper bound, maker_edge enters 1h/4h/daily markets and
+        # leaves inventory parked across long-duration positions, locking the
+        # global position cap.
+        if t_rem > self._max_t_rem:
+            common["reason"] = BlockReason.TIME_REMAINING_TOO_HIGH
             emit(**common)
             return None
 
@@ -319,5 +329,6 @@ class MakerEdgeStrategy(BaseStrategy):
             "inventory_skew": self._inventory_skew,
             "size_pct": self._size_pct,
             "confidence_floor": self._confidence_floor,
+            "max_time_remaining": self._max_t_rem,
             "force_trade": FORCE_TRADE,
         }
