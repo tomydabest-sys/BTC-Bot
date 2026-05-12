@@ -242,6 +242,105 @@ class TestDailyPnLReset:
         assert abs(pm.portfolio.daily_pnl - first_pnl * 2) < 1e-6
 
 
+class TestSameMarketNetting:
+    """Opposite-side fills on the same (market, token) must net out into
+    a single signed position, not accumulate as two separate Position
+    objects. Strategies like maker_edge track inventory as a signed net
+    value; if PositionManager doesn't net, the strategy's view diverges
+    from PositionManager's, both opposite legs occupy a position-cap
+    slot, and the exit-price-sanity-block can leave the bot fixated on
+    a market it can no longer cleanly close.
+    """
+
+    def test_opposite_fill_fully_nets_position(self):
+        pm = PositionManager(EventBus())
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=10,
+            strategy="maker_edge",
+        ))
+        # Opposite-side non-exit fill must close the BUY, not open a new SELL.
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.60, size=10,
+            strategy="maker_edge",
+        ))
+        assert pm.portfolio.positions == []
+        # Realised: (0.60 - 0.50) * 10 = 1.0
+        assert abs(pm.portfolio.realized_pnl - 1.0) < 1e-6
+        assert abs(pm.portfolio.daily_pnl - 1.0) < 1e-6
+
+    def test_opposite_fill_partially_nets_position(self):
+        pm = PositionManager(EventBus())
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=10,
+            strategy="maker_edge",
+        ))
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.60, size=4,
+            strategy="maker_edge",
+        ))
+        assert len(pm.portfolio.positions) == 1
+        p = pm.portfolio.positions[0]
+        assert p.side == Side.BUY
+        assert abs(p.size - 6.0) < 1e-6
+        # avg_entry_price unchanged on the remaining portion
+        assert abs(p.avg_entry_price - 0.50) < 1e-6
+        # Realised P&L on the closed portion: (0.60 - 0.50) * 4 = 0.4
+        assert abs(pm.portfolio.realized_pnl - 0.4) < 1e-6
+
+    def test_opposite_fill_overflow_flips_side(self):
+        pm = PositionManager(EventBus())
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=10,
+            strategy="maker_edge",
+        ))
+        # SELL larger than existing BUY: close BUY, open SELL with overflow.
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.60, size=15,
+            strategy="maker_edge",
+        ))
+        assert len(pm.portfolio.positions) == 1
+        p = pm.portfolio.positions[0]
+        assert p.side == Side.SELL
+        assert abs(p.size - 5.0) < 1e-6
+        assert abs(p.avg_entry_price - 0.60) < 1e-6
+        # Realised on the closed 10: (0.60 - 0.50) * 10 = 1.0
+        assert abs(pm.portfolio.realized_pnl - 1.0) < 1e-6
+
+    def test_maker_alternation_does_not_accumulate_slots(self):
+        """The actual production failure mode: maker_edge alternates BUY
+        and SELL quotes on the same market while flattening inventory.
+        Each round-trip must collapse back to zero positions, not park
+        an opposing leg in the cap."""
+        pm = PositionManager(EventBus())
+        for px_buy, px_sell in [(0.50, 0.55), (0.48, 0.52), (0.45, 0.50)]:
+            pm.update_from_fill(_make_filled_order(
+                side=Side.BUY, price=px_buy, size=10,
+                strategy="maker_edge",
+            ))
+            assert len(pm.portfolio.positions) == 1
+            pm.update_from_fill(_make_filled_order(
+                side=Side.SELL, price=px_sell, size=10,
+                strategy="maker_edge",
+            ))
+            # Both legs collapsed — no cap consumption between rounds.
+            assert pm.portfolio.positions == []
+
+    def test_exit_path_unchanged_by_netting(self):
+        """Exit-tagged fills must still go through the exit path
+        (looking up by flipped side), not the new netting path."""
+        pm = PositionManager(EventBus())
+        pm.update_from_fill(_make_filled_order(
+            side=Side.BUY, price=0.50, size=20,
+            strategy="overshoot_reversion",
+        ))
+        pm.update_from_fill(_make_filled_order(
+            side=Side.SELL, price=0.55, size=20,
+            strategy="exit_overshoot_reversion",
+        ))
+        assert pm.portfolio.positions == []
+        assert abs(pm.portfolio.realized_pnl - 1.0) < 1e-6
+
+
 class TestMaxHoldSafetyNet:
     """Held-to-expiry strategies (dual_direction, boundary_decay) that
     happen to land in long-duration markets would otherwise park positions
