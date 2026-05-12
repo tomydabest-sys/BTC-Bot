@@ -108,6 +108,10 @@ class ExecutionConfig(BaseModel):
     high_conf_override_after_s: float = 1.0
     high_conf_override_threshold: float = 0.85
     auto_close_before_expiry_s: int = 20
+    # Safety net: positions stuck open beyond this duration are force-exited
+    # by PositionManager so held-to-expiry strategies on long markets can't
+    # permanently lock the global position cap. Set to 0 to disable.
+    max_position_hold_seconds: float = 3600.0
 
 
 class AlertsConfig(BaseModel):

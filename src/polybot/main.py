@@ -130,7 +130,10 @@ class Bot:
         self._exchange_feed = ExchangeFeed(symbol="BTC")
         self._risk = RiskManager(config.risk)
         self._circuit_breaker = CircuitBreaker(config.risk.circuit_breakers)
-        self._positions = PositionManager(self._event_bus)
+        self._positions = PositionManager(
+            self._event_bus,
+            max_hold_seconds=config.execution.max_position_hold_seconds,
+        )
         self._execution = ExecutionEngine(
             self._client,
             self._risk,
@@ -166,6 +169,11 @@ class Bot:
         self._last_signal_ts: dict[str, float] = {}
         self._cycle_count: int = 0
         self._tasks: list[asyncio.Task] = []
+        # Halt diagnostic: tracks how long the position cap has been pegged
+        # so we can surface "bot is throttled because all slots are stuck"
+        # in the logs instead of looking like a silent freeze.
+        self._cap_pegged_since: float | None = None
+        self._last_cap_warning_ts: float = 0.0
 
     @property
     def is_paper(self) -> bool:
@@ -416,6 +424,8 @@ class Bot:
         if not self._circuit_breaker.is_trading_allowed:
             return
 
+        self._check_cap_pegged()
+
         markets = list(self._scanner.active_markets.values())
         if not markets:
             return
@@ -609,6 +619,42 @@ class Bot:
         expired = [m for m, ts in self._force_closed_markets.items() if ts < now]
         for m in expired:
             self._force_closed_markets.pop(m, None)
+
+    def _check_cap_pegged(self) -> None:
+        """Log a warning when the position cap has been full for too long.
+
+        Without this signal the bot looks identical (RUNNING, dashboard
+        ticking) whether it's actively scanning or sitting locked out by
+        held-to-expiry positions.
+        """
+        cap = self._config.risk.max_positions
+        n_open = len(self._positions.portfolio.positions)
+        now = time.time()
+
+        if n_open >= cap:
+            if self._cap_pegged_since is None:
+                self._cap_pegged_since = now
+            elapsed = now - self._cap_pegged_since
+            # Re-warn every 60s while the cap stays pegged so the operator
+            # sees ongoing throttling, not just the first occurrence.
+            if elapsed >= 60.0 and (now - self._last_cap_warning_ts) >= 60.0:
+                self._last_cap_warning_ts = now
+                logger.warning(
+                    "position_cap_pegged",
+                    open=n_open,
+                    cap=cap,
+                    pegged_for_s=round(elapsed, 0),
+                    note="no new entries will be accepted until a slot frees",
+                )
+        else:
+            if self._cap_pegged_since is not None:
+                logger.info(
+                    "position_cap_released",
+                    open=n_open,
+                    cap=cap,
+                    was_pegged_for_s=round(now - self._cap_pegged_since, 0),
+                )
+            self._cap_pegged_since = None
 
     # ─────────────────────────────────────────────────────────────────
     #  Exits + auto-close + settlement

@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
 from polybot.strategies.maker_edge import MakerEdgeStrategy
 from polybot.strategies.overshoot_reversion import OvershootReversionStrategy
 from polybot.strategies.boundary_decay import BoundaryDecayStrategy
@@ -124,3 +125,32 @@ class TestBoundaryDecay:
     async def test_hard_floor_constant(self):
         from polybot.strategies.boundary_decay import _HARD_TIME_FLOOR_S
         assert _HARD_TIME_FLOOR_S == 25.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  max_time_remaining filters — prevent halt from long-market entries
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestMaxTimeRemainingFilters:
+    """Both dual_direction_arb and maker_edge hold inventory across the
+    market's lifetime. Without an upper bound on time_to_expiry they enter
+    1h / 4h / daily markets and park positions there, locking the global
+    position cap and silently halting the bot. These tests pin the upper
+    bound at the strategy level.
+    """
+
+    async def test_dual_direction_arb_rejects_long_market(self, make_snapshot):
+        s = DualDirectionArbStrategy(max_time_remaining=600.0)
+        # 1 hour out = 3600s — must be rejected
+        snap = make_snapshot(end_offset_s=3600.0, mid=0.50)
+        result = await s.evaluate(snap)
+        assert result is None
+
+    async def test_maker_edge_rejects_long_market(self, make_snapshot):
+        s = MakerEdgeStrategy(max_time_remaining=600.0)
+        # 1 hour out = 3600s — must be rejected before the spread/inventory checks
+        snap = make_snapshot(end_offset_s=3600.0, mid=0.50)
+        result = await s.evaluate(snap)
+        assert result is None
