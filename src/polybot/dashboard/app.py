@@ -241,9 +241,13 @@ async def get_exchange_prices() -> dict:
         return {"prices": {}}
     prices = {}
     for symbol, feed in bot.exchange_feed.feeds.items():
+        feed_age = getattr(feed, "feed_age_s", None)
         prices[symbol] = {
             "price": round(feed.last_price, 2),
             "last_update": feed.last_update,
+            "feed_age_s": round(feed_age, 1) if feed_age is not None else None,
+            "is_stale": bool(getattr(feed, "is_stale", False)),
+            "last_source": getattr(feed, "last_source", ""),
             "change_5s": round(feed.price_change_pct(5) * 100, 3),
             "change_30s": round(feed.price_change_pct(30) * 100, 3),
             "change_60s": round(feed.price_change_pct(60) * 100, 3),

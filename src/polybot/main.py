@@ -260,6 +260,7 @@ class Bot:
         self._tasks.append(asyncio.create_task(self._settlement_backfill_loop()))
         self._tasks.append(asyncio.create_task(self._auto_close_loop()))
         self._tasks.append(asyncio.create_task(self._daily_summary_loop()))
+        self._tasks.append(asyncio.create_task(self._status_log_loop()))
 
         if self._config.features_retention.enabled:
             self._tasks.append(
@@ -845,6 +846,50 @@ class Bot:
             except Exception as e:
                 logger.warning("features_cleanup_err", error=str(e))
             await asyncio.sleep(interval_s)
+
+    async def _status_log_loop(self) -> None:
+        """Emit a one-line bot-status heartbeat every minute.
+
+        The bot used to look identical (RUNNING + ticking timestamps) whether
+        it was actively trading, locked out by the position cap, or sitting
+        with a dead BTC feed. This heartbeat surfaces what the bot is
+        actually doing — feed health, open positions, recent block reasons —
+        so the operator can tell *why* no trades are firing without having
+        to grep the decision log.
+        """
+        await asyncio.sleep(30)  # initial settle
+        while self._running:
+            try:
+                self._emit_status()
+            except Exception as e:
+                logger.debug("status_log_err", error=str(e))
+            await asyncio.sleep(60)
+
+    def _emit_status(self) -> None:
+        portfolio = self._positions.portfolio
+        cap = self._config.risk.max_positions
+        n_open = len(portfolio.positions)
+        feed = self._exchange_feed
+        feed_age = feed.feed_age_s
+        cap_pegged_for = None
+        if self._cap_pegged_since is not None:
+            cap_pegged_for = round(time.time() - self._cap_pegged_since, 0)
+        logger.info(
+            "bot_status",
+            mode=self._config.bot.mode,
+            trading_allowed=self._circuit_breaker.is_trading_allowed,
+            active_markets=len(self._scanner.active_markets),
+            open_positions=n_open,
+            max_positions=cap,
+            cap_pegged_for_s=cap_pegged_for,
+            realized_pnl=round(portfolio.realized_pnl, 2),
+            daily_pnl=round(portfolio.daily_pnl, 2),
+            btc_price=round(feed.last_price, 2) if feed.last_price > 0 else None,
+            btc_feed_age_s=round(feed_age, 0) if feed_age is not None else None,
+            btc_feed_stale=feed.is_stale,
+            btc_feed_source=feed.last_source or None,
+            top_block_reasons=block_summary(top_n=5),
+        )
 
     async def _daily_summary_loop(self) -> None:
         """Log a daily summary of decision-log block reasons + portfolio state."""

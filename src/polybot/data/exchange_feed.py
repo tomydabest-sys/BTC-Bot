@@ -3,6 +3,12 @@
 Multiple Binance endpoints are tried in order; falls back to REST polling on
 sustained WS failure. Set BTC_BOT_USE_MOCK_FEED=1 (or pass use_mock=True) to
 substitute a deterministic synthetic feed for offline testing.
+
+PATCHED: REST fallback now tries multiple exchanges (Binance, Coinbase,
+Kraken) because Binance is geo-blocked from many cloud/sandbox IPs, which
+silently kills the BTC-dependent strategies (overshoot_reversion,
+boundary_decay) and the operator sees no obvious cause. Adds a staleness
+watchdog that logs a warning when no tick has arrived for >60s.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import httpx
 import structlog
@@ -31,9 +37,58 @@ BINANCE_WS_ENDPOINTS = [
     "wss://stream.binance.com:443/ws/btcusdt@trade",
     "wss://data-stream.binance.com:9443/ws/btcusdt@trade",
 ]
-BINANCE_REST_PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+
+
+def _parse_binance(body: dict) -> float:
+    return float(body.get("price", 0) or 0)
+
+
+def _parse_coinbase(body: dict) -> float:
+    data = body.get("data") or {}
+    return float(data.get("amount", 0) or 0)
+
+
+def _parse_kraken(body: dict) -> float:
+    result = body.get("result") or {}
+    # Kraken keys BTC/USD as "XXBTZUSD"; tolerate "XBTUSD" too.
+    for key in ("XXBTZUSD", "XBTUSD"):
+        pair = result.get(key)
+        if pair and isinstance(pair, dict):
+            close = pair.get("c") or []
+            if close:
+                try:
+                    return float(close[0])
+                except (TypeError, ValueError, IndexError):
+                    return 0.0
+    return 0.0
+
+
+# Tried in order. First source returning a positive price wins for that poll.
+# Multiple sources protect against Binance being geo-blocked in cloud / sandbox
+# environments (a regular failure mode that silently kills BTC-dependent
+# strategies).
+REST_PRICE_SOURCES: list[tuple[str, str, Callable[[dict], float]]] = [
+    (
+        "binance",
+        "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+        _parse_binance,
+    ),
+    (
+        "coinbase",
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+        _parse_coinbase,
+    ),
+    (
+        "kraken",
+        "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+        _parse_kraken,
+    ),
+]
+
 
 MAX_TICK_HISTORY = 4096
+STALENESS_WARN_S = 60.0
+STALENESS_WARN_INTERVAL_S = 60.0
 
 
 @dataclass
@@ -85,9 +140,13 @@ class ExchangeFeed:
         self._running = False
         self._ws_task: asyncio.Task | None = None
         self._rest_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._mock_task: asyncio.Task | None = None
         self._consecutive_ws_failures = 0
         self._last_ws_msg_ts = 0.0
+        self._started_at = 0.0
+        self._last_stale_warn_ts = 0.0
+        self._last_source_used = ""
         self._health = get_monitor()
 
         # Resolve mock flag
@@ -123,6 +182,24 @@ class ExchangeFeed:
             return self._state.ticks[-1].timestamp
         return 0.0
 
+    @property
+    def feed_age_s(self) -> float | None:
+        """Seconds since the last tick arrived, or None if no tick yet."""
+        if self.last_update <= 0:
+            return None
+        return max(0.0, time.time() - self.last_update)
+
+    @property
+    def is_stale(self) -> bool:
+        """True iff the feed has been silent longer than the warn threshold."""
+        age = self.feed_age_s
+        return age is not None and age > STALENESS_WARN_S
+
+    @property
+    def last_source(self) -> str:
+        """Last source that delivered a tick (for diagnostics)."""
+        return self._last_source_used
+
     def price_change_pct(self, seconds: float) -> float:
         """Fractional change over the last `seconds` (e.g. 0.005 = +0.5%)."""
         return self._state.price_change_since(seconds)
@@ -152,6 +229,7 @@ class ExchangeFeed:
 
     async def start(self) -> None:
         self._running = True
+        self._started_at = time.time()
         if self._use_mock:
             from polybot.data.mock_btc_feed import MockBTCFeed
             mock = MockBTCFeed()
@@ -160,10 +238,16 @@ class ExchangeFeed:
             return
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._rest_task = asyncio.create_task(self._rest_fallback_loop())
+        self._watchdog_task = asyncio.create_task(self._staleness_watchdog_loop())
 
     async def stop(self) -> None:
         self._running = False
-        for t in (self._ws_task, self._rest_task, self._mock_task):
+        for t in (
+            self._ws_task,
+            self._rest_task,
+            self._watchdog_task,
+            self._mock_task,
+        ):
             if t:
                 t.cancel()
                 try:
@@ -194,6 +278,7 @@ class ExchangeFeed:
                             if price > 0:
                                 self._state.push(price)
                                 self._last_ws_msg_ts = time.time()
+                                self._last_source_used = "binance_ws"
                                 self._health.stamp("binance_btc")
                         except (json.JSONDecodeError, ValueError, TypeError):
                             continue
@@ -209,22 +294,95 @@ class ExchangeFeed:
                 backoff *= 1.5
 
     async def _rest_fallback_loop(self) -> None:
-        """Poll Binance REST whenever WS hasn't delivered for >30s."""
+        """Poll alternate exchanges when the WS feed has been silent for >30s.
+
+        Tries Binance, then Coinbase, then Kraken on each cycle and accepts
+        the first positive price. Multiple sources protect against Binance
+        being geo-blocked from cloud / sandbox IPs (a frequent cause of the
+        BTC feed silently dying and the BTC-dependent strategies going dark).
+        """
         async with httpx.AsyncClient(timeout=10.0) as client:
             while self._running:
                 await asyncio.sleep(5)
                 if (time.time() - self._last_ws_msg_ts) < 30:
                     continue
-                try:
-                    resp = await client.get(BINANCE_REST_PRICE_URL)
-                    if resp.status_code == 200:
-                        price = float(resp.json().get("price", 0))
+                got_tick = False
+                for name, url, parse_fn in REST_PRICE_SOURCES:
+                    try:
+                        resp = await client.get(url)
+                        if resp.status_code != 200:
+                            continue
+                        price = parse_fn(resp.json())
                         if price > 0:
                             self._state.push(price)
+                            self._last_source_used = name
                             self._health.stamp("binance_btc")
-                            logger.debug("binance_rest_fallback_tick", price=price)
-                except Exception as e:
-                    logger.debug("binance_rest_err", error=str(e))
+                            logger.debug(
+                                "btc_rest_fallback_tick",
+                                source=name,
+                                price=price,
+                            )
+                            got_tick = True
+                            break
+                    except Exception as e:
+                        logger.debug(
+                            "btc_rest_source_err",
+                            source=name,
+                            error=str(e)[:80],
+                        )
+                if not got_tick:
+                    logger.debug(
+                        "btc_rest_all_sources_failed",
+                        sources=[n for n, _, _ in REST_PRICE_SOURCES],
+                    )
+
+    async def _staleness_watchdog_loop(self) -> None:
+        """Log a warning when the BTC feed has been silent for too long.
+
+        Without this signal, the bot looks alive but the BTC-dependent
+        strategies (overshoot_reversion, boundary_decay) silently block
+        every cycle, and the operator can't tell why no trades are firing.
+        """
+        # Initial grace: don't warn during the first 30s before the feed has
+        # had a fair chance to connect.
+        await asyncio.sleep(30)
+        while self._running:
+            await asyncio.sleep(15)
+            try:
+                now = time.time()
+                if self.last_update <= 0:
+                    # Still no tick at all. Warn every interval.
+                    if (now - self._last_stale_warn_ts) >= STALENESS_WARN_INTERVAL_S:
+                        self._last_stale_warn_ts = now
+                        logger.warning(
+                            "btc_feed_no_ticks_yet",
+                            age_s=round(now - self._started_at, 0),
+                            note=(
+                                "btc-dependent strategies "
+                                "(overshoot_reversion, boundary_decay) "
+                                "are blocked until a tick arrives; check "
+                                "network reachability to Binance/Coinbase/Kraken"
+                            ),
+                        )
+                    continue
+                age = now - self.last_update
+                if age <= STALENESS_WARN_S:
+                    continue
+                if (now - self._last_stale_warn_ts) < STALENESS_WARN_INTERVAL_S:
+                    continue
+                self._last_stale_warn_ts = now
+                logger.warning(
+                    "btc_feed_stale",
+                    age_s=round(age, 0),
+                    last_source=self._last_source_used or "ws",
+                    note=(
+                        "btc-dependent strategies will block until feed recovers"
+                    ),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("btc_feed_watchdog_err", error=str(e))
 
 
 # ───────────────────────────────────────────────────────────────────────────
