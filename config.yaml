@@ -152,3 +152,44 @@ monitoring:
 decision_log:
   path: "logs/decisions.jsonl"
   flush_every: 25
+
+# ─── CLOB V2 settings (Phase 0 migration) ──────────────────────────────────
+# Paper mode still uses the public Gamma/CLOB read endpoints; these only
+# take effect once LIVE_TRADING_ENABLED flips and the V2 SDK is installed.
+clob:
+  version: 2
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  collateral: "pUSD"
+  fee_rate_cache_ttl_s: 30
+  batch_order_limit: 15
+
+# ─── Maker quoting strategy (Phase 1 pivot — default OFF) ──────────────────
+# Flip enabled: true to route the trading loop through the V2 maker quoting
+# stack (MakerQuotingStrategy + QuoteManager + InventoryManager).
+maker:
+  enabled: false
+  primary_markets: ["btc-5m"]
+  min_half_spread_cents: 2.0
+  adverse_selection_buffer_cents: 1.0
+  requote_threshold_cents: 1.5
+  max_quote_lifetime_s: 30
+  flatten_before_expiry_s: 10
+  inventory_skew_factor: 0.5
+  target_fill_rate_pct: 30
+  target_size_shares: 5
+  max_inventory_per_side: 200
+  delta_threshold_uncertain: 0.005
+  delta_threshold_directional: 0.15
+  directional_bet_price: 0.95
+  binance_stale_threshold_s: 2.0
+  clob_ws_reconnect_timeout_s: 5.0
+  latency_warn_p95_ms: 150
+  latency_kill_p95_ms: 200
+  latency_sustained_breach_s: 60
+
+deployment:
+  mode: "paper"
+  vps_region: ""
+  docker: false
+  heartbeat_interval_s: 3600

@@ -18,18 +18,17 @@ import asyncio
 import os
 import signal
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import structlog
 
-from polybot.strategies.aggregator import StrategyAggregator
 from polybot.config import Config, load_config
 from polybot.data.client import (
     LIVE_TRADING_ENABLED,
     LiveTradingNotImplementedError,
     PolymarketClient,
 )
-from polybot.data.exchange_feed import ExchangeFeed, PriceFeedState
+from polybot.data.exchange_feed import ExchangeFeed
 from polybot.data.features_logger import FeaturesLogger
 from polybot.data.models import (
     Direction,
@@ -46,18 +45,28 @@ from polybot.data.websocket import WebSocketManager
 from polybot.diagnostics.decision_log import (
     BlockReason,
     block_summary,
+)
+from polybot.diagnostics.decision_log import (
     configure as configure_decision_log,
+)
+from polybot.diagnostics.decision_log import (
     emit as emit_decision,
+)
+from polybot.diagnostics.decision_log import (
     shutdown as shutdown_decision_log,
 )
 from polybot.events import EventBus
 from polybot.execution.engine import ExecutionEngine
+from polybot.execution.maker_orchestrator import MakerOrchestrator
 from polybot.health_monitor import get_monitor
 from polybot.monitoring.alerts import AlertManager
+from polybot.monitoring.paper_validation import PaperValidationGate
+from polybot.monitoring.telegram_alerts import TelegramAlerter
 from polybot.positions.manager import PositionManager
 from polybot.risk.circuit_breaker import CircuitBreaker
 from polybot.risk.manager import RiskManager
-from polybot.scanner.scanner import MarketScanner, normalize_timeframe
+from polybot.scanner.scanner import MarketScanner
+from polybot.strategies.aggregator import StrategyAggregator
 from polybot.strategies.base import BaseStrategy
 from polybot.strategies.boundary_decay import BoundaryDecayStrategy
 from polybot.strategies.dual_direction_arb import DualDirectionArbStrategy
@@ -144,6 +153,33 @@ class Bot:
         self._alerts = AlertManager(config.monitoring.alerts)
         self._circuit_breaker.set_alert_manager(self._alerts)
 
+        # Maker-mode subsystem (V2). Lazily built only when enabled so the
+        # existing taker-mode bot continues to run without the new wiring.
+        self._maker: MakerOrchestrator | None = None
+        self._telegram: TelegramAlerter | None = None
+        self._validation_gate: PaperValidationGate | None = None
+        if config.maker.enabled:
+            self._telegram = TelegramAlerter(
+                self._alerts,
+                heartbeat_interval_s=config.deployment.heartbeat_interval_s,
+            )
+            self._validation_gate = PaperValidationGate(
+                state_path=os.path.join(
+                    config.bot.data_dir, "paper_validation.json"
+                ),
+                starting_equity_usd=config.risk.bankroll_usd,
+            )
+            self._maker = MakerOrchestrator(
+                maker_cfg=config.maker,
+                scanner=self._scanner,
+                pipeline=self._pipeline,
+                exchange_feed=self._exchange_feed,
+                is_paper=self._is_paper,
+                client=None,  # paper mode; live wiring lands with EIP-712
+                telegram=self._telegram,
+                validation_gate=self._validation_gate,
+            )
+
         self._storage = Storage(db_path=os.path.join(config.bot.data_dir, "bot.db"))
         self._features = FeaturesLogger(
             db_path=os.path.join(config.bot.data_dir, "features.db"),
@@ -223,6 +259,16 @@ class Bot:
     def execution(self) -> ExecutionEngine:
         return self._execution
 
+    @property
+    def maker(self) -> MakerOrchestrator | None:
+        """Maker-mode orchestrator (None when config.maker.enabled=False)."""
+        return self._maker
+
+    @property
+    def validation_gate(self) -> PaperValidationGate | None:
+        """Paper-validation gate (None when maker mode is disabled)."""
+        return self._validation_gate
+
     # ─────────────────────────────────────────────────────────────────
     #  Lifecycle
     # ─────────────────────────────────────────────────────────────────
@@ -262,6 +308,11 @@ class Bot:
         self._tasks.append(asyncio.create_task(self._daily_summary_loop()))
         self._tasks.append(asyncio.create_task(self._status_log_loop()))
 
+        if self._maker is not None:
+            await self._maker.start()
+        if self._telegram is not None:
+            await self._telegram.start()
+
         if self._config.features_retention.enabled:
             self._tasks.append(
                 asyncio.create_task(self._features_cleanup_loop())
@@ -277,7 +328,7 @@ class Bot:
         # Cancel main tasks first; let them drain via the running flag
         try:
             await asyncio.wait_for(self._drain_in_flight(), timeout=_SHUTDOWN_DRAIN_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("shutdown_drain_timeout")
 
         for t in self._tasks:
@@ -289,6 +340,8 @@ class Bot:
             await self._execution.cancel_all()
         except Exception as e:
             logger.warning("cancel_all_err", error=str(e))
+
+        await self._stop_maker_subsystem()
 
         try:
             await self._scanner.stop()
@@ -315,6 +368,24 @@ class Bot:
     async def _drain_in_flight(self) -> None:
         """Best-effort: yield briefly so any in-flight tool calls can ack."""
         await asyncio.sleep(0.5)
+
+    async def _stop_maker_subsystem(self) -> None:
+        """Stop maker orchestrator and telegram alerter, swallowing errors."""
+        if self._maker is not None:
+            try:
+                await self._maker.stop()
+            except Exception as e:
+                logger.warning("maker_stop_err", error=str(e))
+        if self._telegram is not None:
+            try:
+                await self._telegram.stop()
+            except Exception as e:
+                logger.warning("telegram_stop_err", error=str(e))
+        if self._validation_gate is not None:
+            try:
+                self._validation_gate.save()
+            except Exception as e:
+                logger.warning("validation_gate_save_err", error=str(e))
 
     # ─────────────────────────────────────────────────────────────────
     #  Strategy construction
@@ -895,7 +966,7 @@ class Bot:
         """Log a daily summary of decision-log block reasons + portfolio state."""
         target_hour = self._config.monitoring.daily_summary_hour
         while self._running:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
             if now >= target:
                 target = target + timedelta(days=1)

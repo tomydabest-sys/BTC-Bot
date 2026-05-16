@@ -70,6 +70,10 @@ class RiskManager:
         )
         self._zero_size_counter = 0
         self._last_zero_warn_ts = 0.0
+        # ATH-drawdown kill switch state. `_peak_equity` tracks the running
+        # high-water mark; `_ath_killed` latches True permanently once tripped.
+        self._peak_equity: float = float(config.bankroll_usd)
+        self._ath_killed: bool = False
 
     @property
     def config(self) -> RiskConfig:
@@ -106,6 +110,47 @@ class RiskManager:
             self._open_by_strategy[strategy] = 0.0
 
     # ─────────────────────────────────────────────────────────────────
+    #  ATH drawdown kill switch
+    # ─────────────────────────────────────────────────────────────────
+
+    def record_equity(self, equity_usd: float) -> None:
+        """Update the high-water mark and trip the kill switch if we've
+        fallen below the configured threshold.
+
+        Calling code (Bot._status_log_loop or the maker orchestrator)
+        should poke this every minute or so with portfolio.balance +
+        unrealised P&L. A threshold of 0 disables the check entirely.
+        """
+        if equity_usd > self._peak_equity:
+            self._peak_equity = equity_usd
+        threshold = float(self._config.ath_drawdown_kill_pct)
+        if threshold <= 0 or self._peak_equity <= 0:
+            return
+        drawdown = (self._peak_equity - equity_usd) / self._peak_equity
+        if drawdown >= threshold and not self._ath_killed:
+            self._ath_killed = True
+            logger.critical(
+                "ath_drawdown_kill",
+                peak=round(self._peak_equity, 2),
+                current=round(equity_usd, 2),
+                drawdown_pct=round(drawdown * 100, 2),
+                threshold_pct=round(threshold * 100, 2),
+            )
+
+    @property
+    def ath_killed(self) -> bool:
+        return self._ath_killed
+
+    @property
+    def peak_equity(self) -> float:
+        return self._peak_equity
+
+    def reset_ath_kill(self) -> None:
+        """Manual reset — operator only. Use when restarting after a kill."""
+        self._ath_killed = False
+        self._peak_equity = float(self._config.bankroll_usd)
+
+    # ─────────────────────────────────────────────────────────────────
     #  Pre-trade gates (entry signals)
     # ─────────────────────────────────────────────────────────────────
 
@@ -126,6 +171,13 @@ class RiskManager:
         max_positions in a single execution.
         """
         self._maybe_reset_daily()
+
+        if self._ath_killed:
+            self._emit_block(
+                signal, BlockReason.KILL_SWITCH,
+                f"ath_drawdown_kill peak=${self._peak_equity:.2f}",
+            )
+            return False, "ath_drawdown_kill"
 
         total_daily_pnl = sum(self._daily_pnl_by_strategy.values())
         if total_daily_pnl <= -abs(self._config.max_daily_loss):

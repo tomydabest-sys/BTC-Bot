@@ -31,6 +31,19 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.8",
 ]
+# Live trading on CLOB V2. The SDK package name is the post-Apr-2026
+# release; the wrapper in src/polybot/api/clob_v2_client.py guards the
+# import so paper mode keeps working without these.
+live = [
+    "py-clob-client-v2",
+    "web3>=6",
+    "eth-account>=0.10",
+    "keyring>=24",
+]
+# Secrets helper alone (no live trading)
+secrets = [
+    "keyring>=24",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

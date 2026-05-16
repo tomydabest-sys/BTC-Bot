@@ -185,6 +185,8 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
     <button class="tab" data-tab="signals">Signal Analysis</button>
     <button class="tab" data-tab="risk">Risk</button>
     <button class="tab" data-tab="trades">Trade Log</button>
+    <button class="tab" data-tab="maker" id="tab-btn-maker" style="display:none">Maker</button>
+    <button class="tab" data-tab="validation" id="tab-btn-validation" style="display:none">Paper Validation</button>
   </div>
 
   <!-- OVERVIEW -->
@@ -328,6 +330,89 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
         <div>#</div><div>SIDE</div><div>ENTRY</div><div>EXIT</div><div>SIZE</div><div>P&L</div><div>HOLD / EXIT</div>
       </div>
       <div id="tradesList"><div class="empty">No trades yet</div></div>
+    </div>
+  </div>
+
+  <!-- MAKER -->
+  <div class="tab-content" id="tab-maker">
+    <div class="grid grid-4" style="margin-bottom:14px">
+      <div class="hero-stat">
+        <div class="stat-label">QUOTE UPTIME</div>
+        <div class="stat-value" id="m-uptime">—</div>
+        <div class="stat-sub">target &gt;80%</div>
+      </div>
+      <div class="hero-stat">
+        <div class="stat-label">P95 LATENCY</div>
+        <div class="stat-value" id="m-p95">—</div>
+        <div class="stat-sub">kill &gt;200ms</div>
+      </div>
+      <div class="hero-stat">
+        <div class="stat-label">FILLS TODAY</div>
+        <div class="stat-value" id="m-fills">0</div>
+        <div class="stat-sub" id="m-fills-sub">across markets</div>
+      </div>
+      <div class="hero-stat">
+        <div class="stat-label">NET INVENTORY</div>
+        <div class="stat-value" id="m-inv">0</div>
+        <div class="stat-sub">YES shares (signed)</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">ACTIVE MAKER MARKETS <span class="sub" id="m-active">0 markets</span></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th class="t-num">Strike</th>
+            <th class="t-num">Mid</th>
+            <th class="t-num">Inventory</th>
+            <th class="t-num">Resting</th>
+            <th class="t-num">Fills</th>
+          </tr>
+        </thead>
+        <tbody id="m-marketsTable"><tr><td colspan="6" class="empty">Maker mode disabled</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- VALIDATION -->
+  <div class="tab-content" id="tab-validation">
+    <div class="grid grid-4" style="margin-bottom:14px">
+      <div class="hero-stat">
+        <div class="stat-label">STATUS</div>
+        <div class="stat-value" id="v-status">—</div>
+        <div class="stat-sub" id="v-status-sub">awaiting data</div>
+      </div>
+      <div class="hero-stat">
+        <div class="stat-label">DURATION</div>
+        <div class="stat-value" id="v-duration">—</div>
+        <div class="stat-sub">≥30 days required</div>
+      </div>
+      <div class="hero-stat">
+        <div class="stat-label">PAPER TRADES</div>
+        <div class="stat-value" id="v-trades">—</div>
+        <div class="stat-sub">≥500 required</div>
+      </div>
+      <div class="hero-stat">
+        <div class="stat-label">NET P&L</div>
+        <div class="stat-value" id="v-pnl">—</div>
+        <div class="stat-sub">after fees</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">PHASE 4 GATES <span class="sub">all must pass before live</span></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th class="t-num">Current</th>
+            <th class="t-num">Threshold</th>
+            <th>Cmp</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="v-metricsTable"><tr><td colspan="5" class="empty">Maker mode disabled</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -545,12 +630,92 @@ function extractBtcPrice(payload) {
   return 0;
 }
 
+function renderMaker(data) {
+  if (!data || !data.enabled) {
+    document.getElementById('tab-btn-maker').style.display = 'none';
+    return;
+  }
+  document.getElementById('tab-btn-maker').style.display = '';
+  const v = data.vitals || {};
+  document.getElementById('m-uptime').textContent = (v.quote_uptime_pct || 0).toFixed(0) + '%';
+  document.getElementById('m-uptime').className = 'stat-value ' + (v.quote_uptime_pct >= 80 ? 'green' : v.quote_uptime_pct >= 50 ? 'amber' : 'red');
+
+  const p95 = v.p95_latency_ms || 0;
+  document.getElementById('m-p95').textContent = p95.toFixed(0) + 'ms';
+  document.getElementById('m-p95').className = 'stat-value ' + (p95 < 150 ? 'green' : p95 < 200 ? 'amber' : 'red');
+
+  document.getElementById('m-fills').textContent = v.fills_today || 0;
+  document.getElementById('m-inv').textContent = (v.net_inventory_shares || 0).toFixed(0);
+  document.getElementById('m-active').textContent = (v.active_markets || 0) + ' markets';
+
+  const rows = (data.markets || []).map(m =>
+    '<tr>' +
+    '<td>' + (m.slug || m.market_id || '').slice(0, 32) + '</td>' +
+    '<td class="t-num">' + (m.strike || 0).toFixed(0) + '</td>' +
+    '<td class="t-num">' + (m.last_mid || 0).toFixed(3) + '</td>' +
+    '<td class="t-num">' + (m.net_inventory_shares || 0).toFixed(0) + '</td>' +
+    '<td class="t-num">' + (m.resting_orders || 0) + '</td>' +
+    '<td class="t-num">' + (m.fills_today || 0) + '</td>' +
+    '</tr>'
+  ).join('');
+  document.getElementById('m-marketsTable').innerHTML = rows ||
+    '<tr><td colspan="6" class="empty">No active maker markets</td></tr>';
+}
+
+function renderValidation(data) {
+  if (!data || !data.enabled) {
+    document.getElementById('tab-btn-validation').style.display = 'none';
+    return;
+  }
+  document.getElementById('tab-btn-validation').style.display = '';
+  const statusEl = document.getElementById('v-status');
+  const status = data.status || 'INSUFFICIENT_DATA';
+  statusEl.textContent = status;
+  statusEl.className = 'stat-value ' + (
+    status === 'READY' ? 'green' :
+    status === 'NOT_READY' ? 'red' : 'amber'
+  );
+  document.getElementById('v-status-sub').textContent =
+    (data.failed || []).length + ' failed gates';
+  document.getElementById('v-duration').textContent = (data.duration_days || 0).toFixed(1) + 'd';
+
+  const metrics = data.metrics || [];
+  const tradesM = metrics.find(m => m.name === 'trades');
+  const pnlM = metrics.find(m => m.name === 'net_pnl_usd');
+  document.getElementById('v-trades').textContent = tradesM ? tradesM.value.toFixed(0) : '0';
+  document.getElementById('v-pnl').textContent = pnlM ? fmtMoney(pnlM.value) : '—';
+
+  const cmpLabel = c => c === 'gte' ? '≥' : c === 'lt' ? '<' : '=';
+  const fmtVal = (name, v) => {
+    if (name === 'duration_days') return v.toFixed(1) + 'd';
+    if (name === 'trades') return v.toFixed(0);
+    if (name === 'net_pnl_usd') return fmtMoney(v);
+    if (name === 'sharpe_daily') return v.toFixed(2);
+    if (name.endsWith('_pct')) return v.toFixed(1) + '%';
+    if (name.endsWith('_ms')) return v.toFixed(0) + 'ms';
+    return v.toFixed(2);
+  };
+  const rows = metrics.map(m =>
+    '<tr>' +
+    '<td>' + m.name + '</td>' +
+    '<td class="t-num">' + fmtVal(m.name, m.value) + '</td>' +
+    '<td class="t-num">' + fmtVal(m.name, m.threshold) + '</td>' +
+    '<td>' + cmpLabel(m.comparator) + '</td>' +
+    '<td><span class="' + (m.passed ? 'green' : 'red') + '">' + (m.passed ? 'PASS' : 'FAIL') + '</span></td>' +
+    '</tr>'
+  ).join('');
+  document.getElementById('v-metricsTable').innerHTML = rows ||
+    '<tr><td colspan="5" class="empty">No data</td></tr>';
+}
+
 async function refreshAll() {
-  const [analytics, status, prices, portfolio] = await Promise.all([
+  const [analytics, status, prices, portfolio, maker, validation] = await Promise.all([
     fetchJSON('/api/analytics'),
     fetchJSON('/api/status'),
     fetchJSON('/api/exchange-prices'),
     fetchJSON('/api/portfolio'),
+    fetchJSON('/api/maker'),
+    fetchJSON('/api/validation'),
   ]);
 
   if (status) {
@@ -579,6 +744,9 @@ async function refreshAll() {
     renderRisk(analytics);
     renderTrades(analytics);
   }
+
+  renderMaker(maker);
+  renderValidation(validation);
 
   document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('en-GB', {hour12: false});
 }

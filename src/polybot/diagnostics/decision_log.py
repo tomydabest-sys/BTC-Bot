@@ -116,6 +116,17 @@ class BlockReason:
     OVR_07_OVERSHOOT_RANGE = "ovr_07_overshoot_range"
     OVR_08_EDGE = "ovr_08_edge"
 
+    # Maker-quoting lifecycle (V2)
+    SPREAD_UNECONOMIC = "spread_uneconomic"
+    INVENTORY_LIMIT = "inventory_limit"
+    QUOTE_STALE = "quote_stale"
+    FLATTEN_TRIGGERED = "flatten_triggered"
+    CANCEL_REPLACE_SLOW = "cancel_replace_slow"
+    FEED_DISCONNECT = "feed_disconnect"
+    FEE_RATE_CHANGED = "fee_rate_changed"
+    BATCH_LIMIT_EXCEEDED = "batch_limit_exceeded"
+    SDK_NOT_INSTALLED = "sdk_not_installed"
+
 
 # Process-wide block-reason counter
 block_counter: Counter[str] = Counter()
