@@ -83,6 +83,11 @@ class RiskConfig(BaseModel):
     # NEW: explicit min_usd field — was previously hidden as a getattr-default.
     # Setting this in YAML now actually works.
     min_usd: float = 2.0
+    # ATH drawdown kill — 0.0 disables (default). Percent expressed as a
+    # fraction (0.40 = 40%). When equity falls this far from the watermark
+    # the bot halts permanently until manually restarted.
+    ath_drawdown_kill_pct: float = 0.0
+    daily_loss_stop_pct: float = 0.0  # 0 disables; e.g. 0.10 for 10%
     per_timeframe_cap_pct: dict[str, float] = Field(
         default_factory=lambda: {
             "5m": 0.04,
@@ -139,6 +144,63 @@ class FeaturesRetentionConfig(BaseModel):
     cleanup_interval_hours: int = 24
 
 
+class ClobV2Config(BaseModel):
+    """CLOB V2 SDK + API surface settings.
+
+    The V2 migration is non-negotiable for live trading (V1 endpoints
+    were sunset 28 Apr 2026), but paper mode still runs against the
+    public Gamma / CLOB read endpoints and ignores these.
+    """
+
+    version: int = 2
+    host: str = "https://clob.polymarket.com"
+    chain_id: int = 137
+    collateral: str = "pUSD"
+    fee_rate_cache_ttl_s: float = 30.0
+    batch_order_limit: int = 15
+
+
+class MakerConfig(BaseModel):
+    """Two-sided maker-quoting strategy settings.
+
+    Default `enabled: False` so the v1 paper loop keeps running until
+    the maker pivot is explicitly turned on in config.
+    """
+
+    enabled: bool = False
+    primary_markets: list[str] = Field(default_factory=lambda: ["btc-5m"])
+    min_half_spread_cents: float = 2.0
+    adverse_selection_buffer_cents: float = 1.0
+    requote_threshold_cents: float = 1.5
+    max_quote_lifetime_s: float = 30.0
+    flatten_before_expiry_s: float = 10.0
+    inventory_skew_factor: float = 0.5
+    target_fill_rate_pct: float = 30.0
+    target_size_shares: float = 5.0
+
+    # Inventory / flatten thresholds
+    max_inventory_per_side: float = 200.0
+    delta_threshold_uncertain: float = 0.005
+    delta_threshold_directional: float = 0.15
+    directional_bet_price: float = 0.95
+
+    # Feed-health timeouts (seconds without a tick → cancel-all)
+    binance_stale_threshold_s: float = 2.0
+    clob_ws_reconnect_timeout_s: float = 5.0
+
+    # Latency auto-disable thresholds
+    latency_warn_p95_ms: float = 150.0
+    latency_kill_p95_ms: float = 200.0
+    latency_sustained_breach_s: float = 60.0
+
+
+class DeploymentConfig(BaseModel):
+    mode: str = "paper"        # paper | live (mirrors bot.mode but explicit)
+    vps_region: str = ""        # informational
+    docker: bool = False
+    heartbeat_interval_s: float = 3600.0
+
+
 class Config(BaseModel):
     bot: BotConfig = BotConfig()
     wallet: WalletConfig = WalletConfig()
@@ -149,10 +211,15 @@ class Config(BaseModel):
     monitoring: MonitoringConfig = MonitoringConfig()
     decision_log: DecisionLogConfig = DecisionLogConfig()
     features_retention: FeaturesRetentionConfig = FeaturesRetentionConfig()
+    clob: ClobV2Config = ClobV2Config()
+    maker: MakerConfig = MakerConfig()
+    deployment: DeploymentConfig = DeploymentConfig()
 
     @property
     def is_live(self) -> bool:
         return self.bot.mode == "live"
+
+    model_config = {"extra": "ignore"}
 
 
 def load_config(path: str = "config.yaml") -> Config:
