@@ -276,6 +276,43 @@ async def api_analytics():
         return {"error": str(e), "edge": {}, "signal_analysis": {}, "risk": {}}
 
 
+@app.get("/api/maker")
+async def api_maker() -> dict:
+    """Maker-mode vitals: quote uptime, fills, inventory, latency.
+
+    Returns enabled=false when the bot is running in legacy taker mode
+    so the dashboard can suppress the Maker tab.
+    """
+    bot = get_bot()
+    if bot is None or bot.maker is None:
+        return {"enabled": False}
+    v = bot.maker.vitals()
+    market_states = []
+    for state in bot.maker.markets.values():
+        market_states.append({
+            "market_id": state.market.id,
+            "slug": state.market.slug,
+            "question": state.market.question[:80],
+            "strike": round(state.strike, 2),
+            "last_mid": round(state.last_mid, 4),
+            "net_inventory_shares": state.inventory.net_yes_shares,
+            "fills_today": state.fills_today,
+            "resting_orders": len(state.quote_manager.state.resting),
+        })
+    return {
+        "enabled": True,
+        "vitals": {
+            "quote_uptime_pct": round(v.quote_uptime_pct, 1),
+            "fills_today": v.fills_today,
+            "net_inventory_shares": v.net_inventory_shares,
+            "p95_latency_ms": round(v.p95_latency_ms, 1),
+            "active_markets": v.active_markets,
+            "latency_breaching": v.extras.get("latency_breaching", False),
+        },
+        "markets": market_states,
+    }
+
+
 @app.post("/api/bot/stop")
 async def stop_bot() -> dict:
     bot = get_bot()
