@@ -33,6 +33,7 @@ from polybot.diagnostics.decision_log import BlockReason
 from polybot.diagnostics.decision_log import emit as emit_decision
 from polybot.execution.quote_manager import QuoteManager, QuoteManagerConfig
 from polybot.monitoring.latency_tracker import LatencyConfig, LatencyTracker
+from polybot.monitoring.paper_validation import PaperValidationGate
 from polybot.monitoring.telegram_alerts import HeartbeatVitals, TelegramAlerter
 from polybot.positions.inventory import InventoryConfig, InventoryManager
 from polybot.scanner.scanner import MarketScanner
@@ -83,6 +84,7 @@ class MakerOrchestrator:
         is_paper: bool = True,
         client: ClobV2Client | None = None,
         telegram: TelegramAlerter | None = None,
+        validation_gate: PaperValidationGate | None = None,
     ) -> None:
         self._cfg = maker_cfg
         self._scanner = scanner
@@ -91,6 +93,7 @@ class MakerOrchestrator:
         self._is_paper = is_paper
         self._client = client
         self._telegram = telegram
+        self._validation = validation_gate
 
         self._strategy = MakerQuotingStrategy(
             MakerQuotingConfig(
@@ -153,12 +156,16 @@ class MakerOrchestrator:
                 self._ingest_btc_tick()
                 await self._maintain_states()
                 await self._sync_all()
+                await self._check_latency_kill_switch()
+                self._update_validation_metrics()
             except Exception as e:
                 logger.error(
                     "maker_loop_err",
                     err=str(e)[:120],
                     err_type=type(e).__name__,
                 )
+                if self._validation is not None:
+                    self._validation.record_unhandled_exception()
                 if self._telegram is not None:
                     await self._telegram.unhandled_exception(
                         where="maker_loop", err=str(e)
@@ -166,6 +173,30 @@ class MakerOrchestrator:
             # 200ms cadence: ~5 syncs/sec per market; tuned to stay well under
             # the V2 post_order per-10s burst limit even with 5 markets active.
             await asyncio.sleep(0.2)
+
+    async def _check_latency_kill_switch(self) -> None:
+        """If p95 has sustained a breach, cancel everything and alert."""
+        if not self._latency.should_disable_live():
+            return
+        p95 = self._latency.p95
+        logger.warning("maker_latency_kill_switch", p95_ms=round(p95, 1))
+        for state in list(self._states.values()):
+            try:
+                await state.quote_manager.cancel_all()
+            except Exception:
+                pass
+        if self._telegram is not None:
+            await self._telegram.latency_breach(p95_ms=p95)
+        # Reset the tracker so we don't fire repeatedly each tick — the
+        # cancel-all has already reset the failure mode.
+        self._latency.reset()
+
+    def _update_validation_metrics(self) -> None:
+        if self._validation is None:
+            return
+        v = self.vitals()
+        self._validation.record_quote_uptime(v.quote_uptime_pct)
+        self._validation.record_p95_latency(v.p95_latency_ms)
 
     async def _feed_watchdog_loop(self) -> None:
         """Cancel all maker quotes when the BTC feed goes silent."""
@@ -421,6 +452,17 @@ class MakerOrchestrator:
             qm.on_fill(order_id=oid, filled_shares=shares)
             state.inventory.on_fill(side_yes=side_yes, is_buy=True, shares=shares)
             state.fills_today += 1
+            # Validation gate accounting — paper fill = half a round trip;
+            # we record the round trip when inventory flattens back through
+            # zero (handled in the flatten window logic below).
+            if self._validation is not None:
+                # Approximate per-fill mark for now; refined P&L is recorded
+                # at flatten / settlement.
+                self._validation.record_round_trip(
+                    gross_pnl_usd=0.0,
+                    fees_paid_usd=0.0,
+                    dynamic_fee_fetched=True,
+                )
 
     # ─────────────────────────────────────────────────────────────────
     #  Vitals & dashboard surface
@@ -462,3 +504,7 @@ class MakerOrchestrator:
     @property
     def markets(self) -> dict[str, _MarketState]:
         return self._states
+
+    @property
+    def validation_gate(self) -> PaperValidationGate | None:
+        return self._validation

@@ -276,6 +276,19 @@ async def api_analytics():
         return {"error": str(e), "edge": {}, "signal_analysis": {}, "risk": {}}
 
 
+@app.get("/api/validation")
+async def api_validation() -> dict:
+    """Paper-validation gate state + per-metric verdict.
+
+    Returns enabled=false when maker mode (and therefore the gate) is off.
+    """
+    bot = get_bot()
+    if bot is None or bot.validation_gate is None:
+        return {"enabled": False}
+    report = bot.validation_gate.evaluate()
+    return {"enabled": True, **report.as_dict()}
+
+
 @app.get("/api/maker")
 async def api_maker() -> dict:
     """Maker-mode vitals: quote uptime, fills, inventory, latency.

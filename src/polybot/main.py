@@ -60,6 +60,7 @@ from polybot.execution.engine import ExecutionEngine
 from polybot.execution.maker_orchestrator import MakerOrchestrator
 from polybot.health_monitor import get_monitor
 from polybot.monitoring.alerts import AlertManager
+from polybot.monitoring.paper_validation import PaperValidationGate
 from polybot.monitoring.telegram_alerts import TelegramAlerter
 from polybot.positions.manager import PositionManager
 from polybot.risk.circuit_breaker import CircuitBreaker
@@ -156,10 +157,17 @@ class Bot:
         # existing taker-mode bot continues to run without the new wiring.
         self._maker: MakerOrchestrator | None = None
         self._telegram: TelegramAlerter | None = None
+        self._validation_gate: PaperValidationGate | None = None
         if config.maker.enabled:
             self._telegram = TelegramAlerter(
                 self._alerts,
                 heartbeat_interval_s=config.deployment.heartbeat_interval_s,
+            )
+            self._validation_gate = PaperValidationGate(
+                state_path=os.path.join(
+                    config.bot.data_dir, "paper_validation.json"
+                ),
+                starting_equity_usd=config.risk.bankroll_usd,
             )
             self._maker = MakerOrchestrator(
                 maker_cfg=config.maker,
@@ -169,6 +177,7 @@ class Bot:
                 is_paper=self._is_paper,
                 client=None,  # paper mode; live wiring lands with EIP-712
                 telegram=self._telegram,
+                validation_gate=self._validation_gate,
             )
 
         self._storage = Storage(db_path=os.path.join(config.bot.data_dir, "bot.db"))
@@ -254,6 +263,11 @@ class Bot:
     def maker(self) -> MakerOrchestrator | None:
         """Maker-mode orchestrator (None when config.maker.enabled=False)."""
         return self._maker
+
+    @property
+    def validation_gate(self) -> PaperValidationGate | None:
+        """Paper-validation gate (None when maker mode is disabled)."""
+        return self._validation_gate
 
     # ─────────────────────────────────────────────────────────────────
     #  Lifecycle
@@ -367,6 +381,11 @@ class Bot:
                 await self._telegram.stop()
             except Exception as e:
                 logger.warning("telegram_stop_err", error=str(e))
+        if self._validation_gate is not None:
+            try:
+                self._validation_gate.save()
+            except Exception as e:
+                logger.warning("validation_gate_save_err", error=str(e))
 
     # ─────────────────────────────────────────────────────────────────
     #  Strategy construction
