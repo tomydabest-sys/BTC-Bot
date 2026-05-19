@@ -684,6 +684,21 @@ class MakerOrchestrator:
             qm.on_fill(order_id=oid, filled_shares=shares)
             state.inventory.on_fill(side_yes=side_yes, is_buy=True, shares=shares)
             state.fills_today += 1
+            # Honest gate: a maker paper fill is a real executed trade, so
+            # log it with reason=OK. This makes `python -m polybot.analyze`
+            # and the dashboard reflect actual maker activity instead of
+            # showing zero (maker fills bypass the taker execution engine
+            # and never hit bot.db's orders table).
+            emit_decision(
+                cycle_id=f"maker-{int(time.time())}",
+                strategy="maker_quoting",
+                market_id=state.market.id,
+                decision="BUY",
+                reason=BlockReason.OK,
+                mid=mid,
+                size_usd=shares * price,
+                extra={"side_yes": side_yes, "fill_price": price},
+            )
             # Feed the fill into the per-market round-trip tracker. Only
             # when a fill *closes* against an earlier open lot do we record
             # a round-trip on the validation gate — the previous code

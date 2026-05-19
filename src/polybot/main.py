@@ -608,6 +608,21 @@ class Bot:
                 self._risk.record_open_exposure(
                     agg.strategy, executed.filled_size * executed.avg_fill_price
                 )
+                # Honest gate: `ok` in the decision log means a trade
+                # ACTUALLY executed — emitted here, after aggregation + risk
+                # + execution all passed. Strategies emit `signal_proposed`
+                # for their candidates; only this line counts as a trade.
+                emit_decision(
+                    cycle_id=f"{self._cycle_count:05d}",
+                    strategy=agg.strategy,
+                    market_id=market.id,
+                    timeframe=timeframe,
+                    mid=executed.avg_fill_price,
+                    confidence=agg.confidence,
+                    decision=executed.side.value,
+                    reason=BlockReason.OK,
+                    size_usd=executed.filled_size * executed.avg_fill_price,
+                )
                 # Log features (best-effort)
                 try:
                     self._features.log_signal(snapshot, agg, executed)

@@ -170,7 +170,7 @@ class DualDirectionArbStrategy(BaseStrategy):
         confidence = max(confidence, 0.7)  # near-riskless
         common["confidence"] = confidence
         common["decision"] = Direction.BUY.value
-        common["reason"] = BlockReason.OK
+        common["reason"] = BlockReason.SIGNAL_PROPOSED
 
         emit(**common, extra={
             "yes_ask": yes_ask,

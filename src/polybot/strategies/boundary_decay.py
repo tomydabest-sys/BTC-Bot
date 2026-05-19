@@ -254,7 +254,7 @@ class BoundaryDecayStrategy(BaseStrategy):
 
         size_pct_final = self._size_pct * confidence
         common["decision"] = direction.value
-        common["reason"] = BlockReason.OK
+        common["reason"] = BlockReason.SIGNAL_PROPOSED
 
         emit(**common, extra={
             "p_yes": p_yes,

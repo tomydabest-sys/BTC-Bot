@@ -95,11 +95,25 @@ def health_check(decisions: list[dict]) -> list[str]:
             f"likely Cause B (Kelly under min_usd floor). Apply risk/sizing.py min_usd=2 patch."
         )
 
+    # `ok` now means a trade ACTUALLY executed (post aggregator/risk/exec).
+    # `signal_proposed` means a strategy produced a candidate that has NOT
+    # necessarily cleared the conversion gate. Distinguishing the two lets
+    # us tell "no strategy is firing" apart from "strategies fire but the
+    # aggregator/risk gate eats everything" — the latter looks identical
+    # on the old dashboard but is a completely different bug.
     ok = reasons.get("ok", 0)
-    if ok == 0 and n > 100:
+    proposed = reasons.get("signal_proposed", 0)
+    if ok == 0 and proposed == 0 and n > 100:
         warnings.append(
-            f"[CRITICAL] 0 OK decisions in {n} entries — no strategy is producing signals. "
-            f"Engage force-trade mode: $env:BOT_FORCE_TRADE='1'"
+            f"[CRITICAL] 0 OK + 0 proposed in {n} entries — no strategy is producing "
+            f"signals. Engage force-trade mode: $env:BOT_FORCE_TRADE='1'"
+        )
+    elif ok == 0 and proposed > 0:
+        warnings.append(
+            f"[CRITICAL] {proposed} signals PROPOSED but 0 EXECUTED — strategies fire "
+            f"but the conversion gate eats everything. Check the aggregator "
+            f"min_net_score vs per-strategy weights (a lone signal needs "
+            f"confidence x weight >= min_net_score), then the risk gate."
         )
 
     return warnings
@@ -183,11 +197,14 @@ def print_report(decisions: list[dict], since_s: float | None) -> None:
             print(f"    {reason:<28} {count:>5} ({pct:5.1f}%)")
     print()
 
-    # Trade rate projection
+    # Trade rate projection — based on EXECUTED trades (reason == "ok"),
+    # not strategy proposals. This is the number that used to lie.
     rates = trade_rate_projection(decisions, since_s)
-    print("PROJECTED TRADE RATE (OK signals per hour):")
+    print("EXECUTED TRADE RATE (filled trades per hour):")
     total_rate = 0.0
     for strat, rate in sorted(rates.items(), key=lambda x: -x[1]):
+        if rate <= 0:
+            continue
         print(f"  {strat:<30} {rate:>8.2f}/hr")
         total_rate += rate
     print(f"  {'TOTAL':<30} {total_rate:>8.2f}/hr")
@@ -196,11 +213,26 @@ def print_report(decisions: list[dict], since_s: float | None) -> None:
         print(f"  Hours to 100 trades: {hours_to_100:.1f}")
     print()
 
-    # Recent BUY/SELL decisions
-    actionable = [d for d in decisions if d.get("decision") in ("BUY", "SELL")]
-    print(f"ACTIONABLE DECISIONS: {len(actionable)} of {n} ({len(actionable)/n:.1%})")
+    # Proposed (strategy-level) vs executed (post-gate) — the gap is the
+    # conversion gate's kill rate.
+    executed = [d for d in decisions if d.get("reason") == "ok"]
+    proposed = [d for d in decisions if d.get("reason") == "signal_proposed"]
+    print(
+        f"SIGNALS PROPOSED: {len(proposed)}   |   "
+        f"TRADES EXECUTED: {len(executed)}"
+    )
+    if proposed and not executed:
+        print(
+            "  [!] Strategies are firing but NOTHING converts to a trade — "
+            "the aggregator / risk gate is blocking 100% of signals."
+        )
+    print()
+
+    # Recent executed trades
+    actionable = executed
+    print(f"ACTIONABLE (EXECUTED) DECISIONS: {len(actionable)} of {n} ({len(actionable)/n:.1%})")
     if actionable:
-        print("\n  Last 10:")
+        print("\n  Last 10 executed:")
         for d in actionable[-10:]:
             ts = datetime.fromtimestamp(d.get("ts", 0)).strftime("%H:%M:%S")
             print(

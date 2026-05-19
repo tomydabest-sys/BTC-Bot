@@ -45,6 +45,12 @@ class BlockReason:
 
     OK = "ok"
     NO_SIGNAL = "no_signal"
+    # A strategy produced a candidate signal that passed its OWN gates but
+    # has NOT yet cleared the aggregator / risk / execution pipeline. Only
+    # `OK` means a trade actually executed — `signal_proposed` is upstream
+    # of the conversion gate. Counting proposals as trades is what made the
+    # dashboard's "trade rate" lie.
+    SIGNAL_PROPOSED = "signal_proposed"
 
     # Threshold gates
     BELOW_MIN_EDGE = "below_min_edge"
