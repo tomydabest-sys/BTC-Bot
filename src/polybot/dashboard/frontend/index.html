@@ -142,9 +142,12 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
 }
 
 .trade-row{
-  display:grid;grid-template-columns:45px 70px 60px 60px 60px 80px 1fr;
+  display:grid;grid-template-columns:45px 120px 70px 60px 60px 60px 80px 1fr;
   gap:10px;padding:8px 10px;font-family:var(--font-mono);font-size:0.74rem;
   border-bottom:1px solid rgba(255,255,255,0.03);align-items:center;
+}
+.trade-row .t-strat{
+  color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 .trade-row:hover{background:rgba(255,255,255,0.02)}
 .pill{
@@ -296,6 +299,11 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
         <div id="bucket-exit"><div class="empty">Waiting for trades</div></div>
       </div>
     </div>
+
+    <div class="panel">
+      <div class="panel-title">PER-STRATEGY EDGE <span class="sub">which entry strategy is driving P&amp;L?</span></div>
+      <div id="per-strategy-edge"><div class="empty">Waiting for trades</div></div>
+    </div>
   </div>
 
   <!-- RISK -->
@@ -327,7 +335,7 @@ td{padding:8px 10px;color:var(--t1);border-bottom:1px solid rgba(255,255,255,0.0
     <div class="panel">
       <div class="panel-title">RECENT TRADES <span class="sub" id="trade-count">0 round-trips</span></div>
       <div class="trade-row" style="background:var(--bg-2);font-weight:600;color:var(--t3);text-transform:uppercase;font-size:0.65rem;letter-spacing:0.5px">
-        <div>#</div><div>SIDE</div><div>ENTRY</div><div>EXIT</div><div>SIZE</div><div>P&L</div><div>HOLD / EXIT</div>
+        <div>#</div><div>STRATEGY</div><div>SIDE</div><div>ENTRY</div><div>EXIT</div><div>SIZE</div><div>P&L</div><div>HOLD / EXIT</div>
       </div>
       <div id="tradesList"><div class="empty">No trades yet</div></div>
     </div>
@@ -538,6 +546,36 @@ function renderSignals(data) {
   renderBucket('bucket-side', sa.by_side);
   renderBucket('bucket-strategy', sa.by_strategy);
   renderBucket('bucket-exit', sa.by_exit_reason);
+  renderPerStrategy(data.per_strategy || {});
+}
+
+function renderPerStrategy(perStrategy) {
+  const c = document.getElementById('per-strategy-edge');
+  if (!c) return;
+  const names = Object.keys(perStrategy);
+  if (names.length === 0) {
+    c.innerHTML = '<div class="empty">No completed trades yet</div>';
+    return;
+  }
+  // Bucket-row reuse: STRATEGY | win-rate bar | trades | PnL · PF
+  const maxTrades = Math.max(...names.map(n => perStrategy[n].total_trades || 0));
+  const html = names
+    .sort((a, b) => (perStrategy[b].total_pnl || 0) - (perStrategy[a].total_pnl || 0))
+    .map(n => {
+      const m = perStrategy[n];
+      const trades = m.total_trades || 0;
+      const widthPct = maxTrades > 0 ? (trades / maxTrades) * 100 : 0;
+      const wr = m.win_rate || 0;
+      const winColor = wr >= 50 ? '' : 'red';
+      const pnlCls = m.total_pnl > 0 ? 't-green' : m.total_pnl < 0 ? 't-red' : 't-dim';
+      const pf = (m.profit_factor || 0).toFixed(2);
+      return '<div class="bucket-row"><div title="' + n + '">' + n + '</div>'
+        + '<div class="bucket-bar"><div class="bucket-bar-fill ' + winColor + '" style="width:' + widthPct + '%"></div></div>'
+        + '<div class="t-num">' + trades + ' trades</div>'
+        + '<div class="t-num ' + pnlCls + '">' + wr.toFixed(0) + '% / ' + fmtMoney(m.total_pnl) + ' · PF ' + pf + '</div>'
+        + '</div>';
+    }).join('');
+  c.innerHTML = html;
 }
 
 function renderRisk(data) {
@@ -564,7 +602,8 @@ function renderTrades(data) {
     const sidePill = t.side === 'BUY' ? 'pill-buy' : 'pill-sell';
     const pnlCls = t.pnl > 0 ? 't-green' : t.pnl < 0 ? 't-red' : '';
     const reasonPill = t.exit_reason === 'auto_close' ? 'pill-auto' : t.exit_reason === 'stop_loss' ? 'pill-stop' : '';
-    return '<div class="trade-row"><div class="t-dim">#' + (trades.length - i) + '</div><div><span class="pill ' + sidePill + '">' + t.side + '</span></div><div>' + t.entry_price.toFixed(3) + '</div><div>' + t.exit_price.toFixed(3) + '</div><div>$' + t.size.toFixed(0) + '</div><div class="' + pnlCls + '">' + fmtMoney(t.pnl) + '</div><div class="t-dim">' + fmtTime(t.hold_seconds) + ' · <span class="pill ' + reasonPill + '">' + t.exit_reason + '</span></div></div>';
+    const strat = t.strategy || 'unknown';
+    return '<div class="trade-row"><div class="t-dim">#' + (trades.length - i) + '</div><div class="t-strat" title="' + strat + '">' + strat + '</div><div><span class="pill ' + sidePill + '">' + t.side + '</span></div><div>' + t.entry_price.toFixed(3) + '</div><div>' + t.exit_price.toFixed(3) + '</div><div>$' + t.size.toFixed(0) + '</div><div class="' + pnlCls + '">' + fmtMoney(t.pnl) + '</div><div class="t-dim">' + fmtTime(t.hold_seconds) + ' · <span class="pill ' + reasonPill + '">' + t.exit_reason + '</span></div></div>';
   }).join('');
   document.getElementById('tradesList').innerHTML = html;
 }

@@ -116,6 +116,95 @@ Risk envelope defaults:
 
 ---
 
+## Paper Validation Run
+
+The bot ships a 30-day paper validation gate (see
+`src/polybot/monitoring/paper_validation.py`) that is the gating
+mechanism for any decision to flip the bot live. The gate evaluates
+nine pass/fail metrics and only returns `READY` when every one of them
+clears.
+
+### 1. Start the run
+
+```bash
+python -m polybot.dashboard.launcher \
+    --config config.maker_paper.yaml --mode paper --mock-btc-feed
+```
+
+`config.maker_paper.yaml` ships with `maker.enabled: true` and an
+empty `strategies.enabled: []`, so the V2 maker stack (MakerOrchestrator
++ QuoteManager + InventoryManager + PaperValidationGate) is the
+only income path under test. The shared risk envelope (bankroll
+$500, hard cap 10%, daily loss cap $25, ATH drawdown kill at 40%)
+mirrors `config.yaml` so the validation result is comparable.
+
+State persists to `data/paper_validation.json`. The gate's 30-day
+clock starts on the first run and survives restarts; it only resets
+on an explicit call to `PaperValidationGate.reset()`. The gate
+auto-saves every 5 minutes from the running bot.
+
+### 2. Check progress
+
+```bash
+python scripts/validation_status.py
+```
+
+Sample output:
+
+```
+========================================================================
+  BTC-BOT 30-DAY PAPER VALIDATION GATE
+========================================================================
+  Status:       NOT_READY
+  Started:      2026-05-19T...
+  Duration:     6.42 days
+  Net P&L:      $+12.10
+------------------------------------------------------------------------
+  Metric                       Pass  Current        Threshold      ETA
+------------------------------------------------------------------------
+  duration_days                FAIL  6.42d          >= 30d         ~23.6d more
+  trades                       FAIL  108            >= 500         392 more trades (~23.3d at current pace)
+  net_pnl_usd                  OK    $+12.10        >= $0.00       —
+  ...
+```
+
+Exit codes: `0` = `READY`, `1` = `NOT_READY`, `2` = `INSUFFICIENT_DATA`.
+Use `--json` for a machine-readable form.
+
+### 3. The nine gate metrics
+
+| Metric                  | Threshold        | Why it gates the live flip |
+|-------------------------|------------------|----------------------------|
+| `duration_days`         | ≥ 30 days        | Smooths out single-week regime artefacts. |
+| `trades`                | ≥ 500 round-trips| Statistical significance — at <500 round-trips the observed edge is dominated by sample noise. |
+| `net_pnl_usd`           | > $0             | After-fee profitability — the bare minimum for a strategy to be worth running. |
+| `sharpe_daily`          | ≥ 1.5            | Risk-adjusted return must be acceptable; rules out "lucky once" runs. |
+| `max_drawdown_pct`      | < 15%            | Limits how brutal the worst observed loss path was. |
+| `quote_uptime_pct`      | > 80%            | The maker stack must actually be quoting — uptime is the prerequisite for everything else. |
+| `p95_latency_ms`        | < 150 ms         | Cancel/replace latency tail directly drives adverse selection; >150 ms p95 is unsafe in live. |
+| `unhandled_exceptions`  | == 0             | Any crashed loop or untrapped exception during paper is a guaranteed crash in live. |
+| `fee_consistency_pct`   | == 100 %         | Every order must have priced against a freshly-fetched fee rate. Hardcoded fees on even one trade contaminate the P&L attribution. |
+
+### 4. Going live (do NOT do this until READY)
+
+`LIVE_TRADING_ENABLED` in `src/polybot/data/client.py` is the final
+flag. It MUST remain `False` until `scripts/validation_status.py`
+reports `status: READY`. Flipping it earlier wires the live
+order-placement code path and the bot will start signing real EIP-712
+orders against real USDC.e on Polygon.
+
+The recommended pre-flip checklist is:
+
+1. `python scripts/validation_status.py` returns exit code 0.
+2. Review the failing-metric tail of the last 7 days — `READY`
+   should not be a freshly-flipped boolean.
+3. Inspect `data/paper_validation.json` directly and confirm
+   `unhandled_exceptions == 0` over the full run.
+4. Only then: edit `LIVE_TRADING_ENABLED` and install the
+   `[live]` extras (`pip install -e ".[live]"`).
+
+---
+
 ## Live mode (NOT YET ENABLED)
 
 Live trading requires:
