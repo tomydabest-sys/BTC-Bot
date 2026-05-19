@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import structlog
 
@@ -49,6 +50,19 @@ from polybot.strategies.maker_quoting import (
 )
 
 logger = structlog.get_logger()
+
+
+def _as_naive_utc(dt: datetime) -> datetime:
+    """Coerce a datetime to naive UTC so it can be subtracted from another.
+
+    Gamma parses market end_dates as tz-aware (the `Z`→`+00:00` swap),
+    while the pipeline stamps orderbooks with naive `datetime.utcnow()`.
+    Subtracting the two raises "can't subtract offset-naive and
+    offset-aware datetimes". Normalising both operands here is the fix.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 @dataclass
@@ -573,9 +587,11 @@ class MakerOrchestrator:
         snapshot = self._pipeline.get_snapshot(market.id)
         if snapshot is None:
             return
-        now_utc = snapshot.orderbook.timestamp
-        end_dt = market.end_date
-        # tz-aware: pipeline snapshots use UTC.
+        # Both operands normalised to naive UTC — Gamma end_dates are
+        # tz-aware, pipeline timestamps are naive, and subtracting the two
+        # raw raises a TypeError on every loop iteration.
+        now_utc = _as_naive_utc(snapshot.orderbook.timestamp)
+        end_dt = _as_naive_utc(market.end_date)
         t_rem = max(0.0, (end_dt - now_utc).total_seconds())
 
         # Strike: lock on first sight using the snapshot mid as a proxy.

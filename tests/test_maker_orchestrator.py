@@ -324,3 +324,80 @@ async def test_vitals_aggregate_correctly(market_5m, maker_cfg):
         assert v.p95_latency_ms >= 0
     finally:
         await orch.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Regression: mixed tz-awareness between Gamma end_date (aware) and pipeline
+#  orderbook timestamp (naive) used to throw on every loop iteration, which
+#  also poisoned the validation gate's unhandled_exceptions counter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _NaiveTimestampSnapshot:
+    """Mirrors production: pipeline stamps orderbooks with naive utcnow()."""
+
+    def __init__(self, market: Market, mid: float) -> None:
+        self.market = market
+        spread = 0.02
+        self.orderbook = OrderBook(
+            market_id=market.id,
+            timestamp=datetime.utcnow(),  # NAIVE, like the real pipeline
+            bids=[PriceLevel(price=mid - spread / 2, size=100)],
+            asks=[PriceLevel(price=mid + spread / 2, size=100)],
+        )
+
+
+class _NaivePipelineProxy:
+    def __init__(self, markets: dict[str, Market], mid: float) -> None:
+        self._markets = markets
+        self._mid = mid
+
+    def get_snapshot(self, market_id: str):
+        m = self._markets.get(market_id)
+        if m is None:
+            return None
+        return _NaiveTimestampSnapshot(m, self._mid)
+
+
+@pytest.mark.asyncio
+async def test_mixed_tz_does_not_throw_or_poison_validation_gate(
+    market_5m, maker_cfg, tmp_path
+):
+    from polybot.monitoring.paper_validation import PaperValidationGate
+
+    # Gamma-style aware end_date + naive orderbook timestamp.
+    aware_market = market_5m  # fixture already uses datetime.now(UTC)
+    assert aware_market.end_date.tzinfo is not None
+
+    markets = {aware_market.id: aware_market}
+    scanner = _FakeScanner(markets)
+    pipeline = _NaivePipelineProxy(markets, mid=0.50)
+    feed = _FakeFeed()
+    gate = PaperValidationGate(
+        state_path=str(tmp_path / "v.json"), starting_equity_usd=500.0
+    )
+
+    orch = MakerOrchestrator(
+        maker_cfg=maker_cfg,
+        scanner=scanner,
+        pipeline=pipeline,
+        exchange_feed=feed,
+        is_paper=True,
+        client=None,
+        telegram=None,
+        validation_gate=gate,
+    )
+    await orch.start()
+    try:
+        await asyncio.sleep(0.6)
+        # Before the fix this raised TypeError every iteration, recording an
+        # unhandled exception each time and placing zero quotes.
+        assert gate.state.unhandled_exceptions == 0, (
+            "mixed-tz subtraction must not raise into the loop's except handler"
+        )
+        state = orch.markets[aware_market.id]
+        assert len(state.quote_manager.state.resting) >= 1, (
+            "quotes should be placed once t_rem computes cleanly"
+        )
+    finally:
+        await orch.stop()
