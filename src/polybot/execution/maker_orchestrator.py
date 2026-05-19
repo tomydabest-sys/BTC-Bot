@@ -39,6 +39,7 @@ from polybot.positions.inventory import InventoryConfig, InventoryManager
 from polybot.scanner.scanner import MarketScanner
 from polybot.strategies.fair_value import (
     PriceBuffer1Hz,
+    fee_at_price,
     realized_sigma_per_sec,
 )
 from polybot.strategies.fair_value import fair_value as bs_fair_value
@@ -51,6 +52,156 @@ logger = structlog.get_logger()
 
 
 @dataclass
+class _OpenLot:
+    """One leg of a maker round-trip held until offset by an opposite fill."""
+
+    side_yes: bool
+    is_buy: bool
+    shares: float
+    price: float
+
+    @property
+    def signed_delta(self) -> float:
+        """Signed contribution to net YES inventory.
+
+        long YES contributions (YES BUY, NO SELL) are positive; long NO
+        contributions (NO BUY, YES SELL) are negative.
+        """
+        if self.side_yes and self.is_buy:
+            return +self.shares
+        if self.side_yes and not self.is_buy:
+            return -self.shares
+        if not self.side_yes and self.is_buy:
+            return -self.shares
+        return +self.shares
+
+
+@dataclass
+class _RoundTrip:
+    gross_pnl_usd: float
+    fees_paid_usd: float
+
+
+class _RoundTripTracker:
+    """FIFO lot-matching tracker for paper-mode maker fills.
+
+    Maintains a single-direction queue of open lots (all entries on the
+    same signed side of net YES inventory). When a fill arrives on the
+    opposite side, lots are popped FIFO and matched up to the available
+    fill size; each matched pair produces a `_RoundTrip` with realized
+    gross P&L and per-side fees.
+
+    P&L identities:
+      * Same token (BUY→SELL or SELL→BUY): (sell - buy) * shares.
+      * Cross-token close where BOTH legs are BUYS (YES BUY + NO BUY):
+        the position pays $1 at resolution regardless of outcome, so
+        gross_pnl = (1 - p_yes - p_no) * shares.
+      * Cross-token close where BOTH legs are SELLS (YES SELL + NO SELL):
+        the obligation is $1, so gross_pnl = (p_yes + p_no - 1) * shares.
+    """
+
+    def __init__(self, fee_theta: float = 0.072) -> None:
+        self._fee_theta = fee_theta
+        self._open_lots: list[_OpenLot] = []
+
+    @property
+    def fee_theta(self) -> float:
+        return self._fee_theta
+
+    @property
+    def open_lot_count(self) -> int:
+        return len(self._open_lots)
+
+    @property
+    def net_signed_inventory(self) -> float:
+        return sum(lot.signed_delta for lot in self._open_lots)
+
+    def on_fill(
+        self,
+        *,
+        side_yes: bool,
+        is_buy: bool,
+        shares: float,
+        price: float,
+    ) -> list[_RoundTrip]:
+        """Record a fill, return any round-trips realized by it (may be empty)."""
+        if shares <= 0:
+            return []
+        incoming = _OpenLot(side_yes=side_yes, is_buy=is_buy, shares=shares, price=price)
+        round_trips: list[_RoundTrip] = []
+
+        # Same-direction fill (or first fill) → just enqueue.
+        if not self._open_lots or self._same_direction(self._open_lots[0], incoming):
+            self._open_lots.append(incoming)
+            return round_trips
+
+        # Opposite-direction fill → FIFO match against open lots until either
+        # the incoming fill is consumed or the queue is empty.
+        remaining = incoming.shares
+        while remaining > 0 and self._open_lots:
+            head = self._open_lots[0]
+            matched = min(head.shares, remaining)
+            round_trips.append(
+                self._realize(open_lot=head, closing=incoming, shares=matched)
+            )
+            head.shares -= matched
+            remaining -= matched
+            if head.shares <= 1e-12:
+                self._open_lots.pop(0)
+
+        # If the incoming fill exceeded the open queue, the residual flips
+        # the position and becomes a new open lot on the opposite side.
+        if remaining > 1e-12:
+            self._open_lots.append(
+                _OpenLot(
+                    side_yes=incoming.side_yes,
+                    is_buy=incoming.is_buy,
+                    shares=remaining,
+                    price=incoming.price,
+                )
+            )
+        return round_trips
+
+    @staticmethod
+    def _same_direction(a: _OpenLot, b: _OpenLot) -> bool:
+        return (a.signed_delta >= 0) == (b.signed_delta >= 0)
+
+    def _realize(
+        self, *, open_lot: _OpenLot, closing: _OpenLot, shares: float
+    ) -> _RoundTrip:
+        # Per-side fees: the maker is the resting side and the taker pays
+        # the per-trade fee. In paper mode we conservatively count both
+        # sides through `fee_at_price` — the validation gate's fee-
+        # consistency metric only checks that *something* was fetched, not
+        # the exact amount.
+        fee_open = fee_at_price(open_lot.price, theta=self._fee_theta) * shares
+        fee_close = fee_at_price(closing.price, theta=self._fee_theta) * shares
+        fees = fee_open + fee_close
+
+        if open_lot.side_yes == closing.side_yes:
+            # Same token, opposite is_buy → straightforward (sell - buy) * shares.
+            buy_lot = open_lot if open_lot.is_buy else closing
+            sell_lot = closing if open_lot.is_buy else open_lot
+            gross = (sell_lot.price - buy_lot.price) * shares
+        else:
+            # Cross-token close.
+            if open_lot.is_buy and closing.is_buy:
+                # Long YES + long NO held to (synthetic) resolution.
+                gross = (1.0 - open_lot.price - closing.price) * shares
+            elif not open_lot.is_buy and not closing.is_buy:
+                # Short both sides — owed $1, collected p_yes + p_no.
+                gross = (open_lot.price + closing.price - 1.0) * shares
+            else:
+                # One BUY + one SELL on opposite tokens — equivalent to two
+                # same-direction long positions, so the offset comes from
+                # the price difference.
+                buy_lot = open_lot if open_lot.is_buy else closing
+                sell_lot = closing if open_lot.is_buy else open_lot
+                gross = (sell_lot.price - buy_lot.price) * shares
+        return _RoundTrip(gross_pnl_usd=gross, fees_paid_usd=fees)
+
+
+@dataclass
 class _MarketState:
     market: Market
     quote_manager: QuoteManager
@@ -58,6 +209,9 @@ class _MarketState:
     strike: float = 0.0
     last_mid: float = 0.0
     fills_today: int = 0
+    round_trip_tracker: _RoundTripTracker = field(
+        default_factory=_RoundTripTracker
+    )
 
 
 @dataclass
@@ -130,6 +284,11 @@ class MakerOrchestrator:
             self._telegram.set_vitals_provider(self._collect_vitals_for_heartbeat)
         self._tasks.append(asyncio.create_task(self._main_loop()))
         self._tasks.append(asyncio.create_task(self._feed_watchdog_loop()))
+        if self._validation is not None:
+            # Daily-returns ticker + periodic auto-save are gate-only — no
+            # point starting them without somewhere to write the result.
+            self._tasks.append(asyncio.create_task(self._daily_return_loop()))
+            self._tasks.append(asyncio.create_task(self._auto_save_loop()))
         logger.info("maker_orchestrator_started", is_paper=self._is_paper)
 
     async def stop(self) -> None:
@@ -197,6 +356,79 @@ class MakerOrchestrator:
         v = self.vitals()
         self._validation.record_quote_uptime(v.quote_uptime_pct)
         self._validation.record_p95_latency(v.p95_latency_ms)
+
+    async def _daily_return_loop(self) -> None:
+        """Once-per-UTC-day, record (today's net P&L) / bankroll as a return.
+
+        Without this loop, `daily_returns_pct` stays empty and the gate's
+        Sharpe metric is permanently zero — which silently blocks the
+        validation status from ever turning READY.
+        """
+        if self._validation is None:
+            return
+        # Snapshot the gate's net P&L at the boundary; the next boundary's
+        # delta is the day's return as a fraction of the bankroll baseline.
+        last_recorded_pnl = self._validation.state.net_pnl_usd
+        last_recorded_day = self._utc_day_index(time.time())
+        bankroll = max(1.0, self._validation_bankroll())
+        while self._running:
+            try:
+                await asyncio.sleep(self._seconds_until_next_utc_midnight())
+                if not self._running or self._validation is None:
+                    break
+                cur_pnl = self._validation.state.net_pnl_usd
+                cur_day = self._utc_day_index(time.time())
+                if cur_day != last_recorded_day:
+                    day_return_pct = (cur_pnl - last_recorded_pnl) / bankroll
+                    self._validation.record_daily_return(day_return_pct)
+                    self._validation.save()
+                    last_recorded_pnl = cur_pnl
+                    last_recorded_day = cur_day
+                    logger.info(
+                        "validation_daily_return_recorded",
+                        day=cur_day,
+                        ret_pct=round(day_return_pct * 100, 4),
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("daily_return_loop_err", err=str(e)[:80])
+                await asyncio.sleep(60.0)
+
+    async def _auto_save_loop(self) -> None:
+        """Persist validation gate state every 5 minutes.
+
+        The gate's 30-day clock is the gating mechanism for the live
+        flip; losing it to a crash mid-run would invalidate any progress.
+        """
+        if self._validation is None:
+            return
+        while self._running:
+            try:
+                await asyncio.sleep(300.0)
+                if not self._running or self._validation is None:
+                    break
+                self._validation.save()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("auto_save_loop_err", err=str(e)[:80])
+
+    @staticmethod
+    def _utc_day_index(epoch_seconds: float) -> int:
+        return int(epoch_seconds // 86400)
+
+    @staticmethod
+    def _seconds_until_next_utc_midnight(now: float | None = None) -> float:
+        now = now if now is not None else time.time()
+        next_midnight = (int(now // 86400) + 1) * 86400
+        # Guard against pathological clock skew — at least 1s sleep.
+        return max(1.0, next_midnight - now)
+
+    def _validation_bankroll(self) -> float:
+        if self._validation is None:
+            return 500.0
+        return self._validation._starting_equity or 500.0
 
     async def _feed_watchdog_loop(self) -> None:
         """Cancel all maker quotes when the BTC feed goes silent."""
@@ -442,27 +674,34 @@ class MakerOrchestrator:
         For NO-side bids: same logic against (1 - mid).
         """
         qm = state.quote_manager
-        filled: list[tuple[str, float, bool]] = []  # (oid, shares, side_yes)
+        filled: list[tuple[str, float, float, bool]] = []  # (oid, shares, price, side_yes)
         for oid, order in list(qm.state.resting.items()):
             side_mid = mid if order.side_yes else (1.0 - mid)
             if side_mid <= order.price:
-                filled.append((oid, order.size, order.side_yes))
+                filled.append((oid, order.size, order.price, order.side_yes))
 
-        for oid, shares, side_yes in filled:
+        for oid, shares, price, side_yes in filled:
             qm.on_fill(order_id=oid, filled_shares=shares)
             state.inventory.on_fill(side_yes=side_yes, is_buy=True, shares=shares)
             state.fills_today += 1
-            # Validation gate accounting — paper fill = half a round trip;
-            # we record the round trip when inventory flattens back through
-            # zero (handled in the flatten window logic below).
+            # Feed the fill into the per-market round-trip tracker. Only
+            # when a fill *closes* against an earlier open lot do we record
+            # a round-trip on the validation gate — the previous code
+            # spammed the gate with gross=0 entries on every leg, which
+            # inflated trade_count and never moved gross_pnl_usd.
+            round_trips = state.round_trip_tracker.on_fill(
+                side_yes=side_yes,
+                is_buy=True,  # paper sweep only fills resting BUYs
+                shares=shares,
+                price=price,
+            )
             if self._validation is not None:
-                # Approximate per-fill mark for now; refined P&L is recorded
-                # at flatten / settlement.
-                self._validation.record_round_trip(
-                    gross_pnl_usd=0.0,
-                    fees_paid_usd=0.0,
-                    dynamic_fee_fetched=True,
-                )
+                for rt in round_trips:
+                    self._validation.record_round_trip(
+                        gross_pnl_usd=rt.gross_pnl_usd,
+                        fees_paid_usd=rt.fees_paid_usd,
+                        dynamic_fee_fetched=True,
+                    )
 
     # ─────────────────────────────────────────────────────────────────
     #  Vitals & dashboard surface

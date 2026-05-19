@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Paper-validation configuration for the V2 maker stack.
+#
+#  Inherits the structure of config.yaml but with two material differences:
+#    1. maker.enabled: true            — routes through MakerOrchestrator +
+#                                        QuoteManager + InventoryManager.
+#    2. strategies.enabled: []         — disables the legacy taker stack so
+#                                        the maker subsystem is the only
+#                                        income path under test.
+#
+#  Risk envelope (bankroll, kelly_fraction, hard_cap_pct, daily-loss cap)
+#  mirrors config.yaml so the paper run is comparable to the legacy run.
+#
+#  Run this with:
+#    python -m polybot.dashboard.launcher --config config.maker_paper.yaml \
+#        --mode paper --mock-btc-feed
+#  See README.md → "Paper Validation Run".
+# ─────────────────────────────────────────────────────────────────────────────
+
+bot:
+  name: "btc-bot-maker"
+  mode: "paper"
+  log_level: "INFO"
+  data_dir: "./data"
+
+wallet:
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  api_key_env: "POLYMARKET_API_KEY"
+
+scanner:
+  interval_seconds: 30
+  min_volume_24h: 0
+  min_liquidity: 10
+  max_spread_pct: 30.0
+  categories_allowlist: []
+  categories_blocklist: []
+  resolution_window_days: [0, 7]
+  btc_updown_only: true
+  btc_timeframes: ["5 min", "15 min", "1 hour", "4 hour", "daily"]
+
+strategies:
+  # Empty — the V2 maker stack is the income path under this config. The
+  # legacy taker strategies (overshoot_reversion, dual_direction_arb,
+  # boundary_decay, maker_edge) are not constructed.
+  enabled: []
+  aggregation:
+    min_confidence: 0.30
+    conflict_resolution: "weighted_vote"
+    strategy_weights: {}
+    min_net_score: 0.15
+
+risk:
+  max_position_size: 50
+  max_portfolio_exposure: 200
+  max_positions: 6
+  max_daily_loss: 25
+  min_trade_interval_seconds: 1
+  max_order_size: 25
+  max_slippage_pct: 5.0
+  bankroll_usd: 500
+  kelly_fraction: 0.50
+  hard_cap_pct: 0.10
+  edge_floor_bps: 3
+  # ATH-kill threshold: halt permanently if equity falls 40% below
+  # the running high-water mark. Sampled every 60s from _status_log_loop.
+  ath_drawdown_kill_pct: 0.40
+  per_timeframe_cap_pct:
+    "5m": 0.04
+    "15m": 0.05
+    "1h": 0.05
+    "4h": 0.06
+    "daily": 0.06
+  circuit_breakers:
+    consecutive_losses_pause: 8
+    consecutive_losses_size_reduction: 0.5
+    api_errors_per_minute_pause: 15
+    ws_disconnect_cancel_seconds: 30
+
+execution:
+  rate_limit_per_second: 5
+  order_ttl_seconds: 15
+  retry_attempts: 1
+  retry_backoff_seconds: [1]
+  loop_interval_ms: 500
+  max_trades_per_cycle: 10
+  max_trades_per_market_per_cycle: 1
+  cooldown_per_market: true
+  high_conf_override_after_s: 1.0
+  high_conf_override_threshold: 0.85
+  auto_close_before_expiry_s: 20
+  max_position_hold_seconds: 1800.0
+
+monitoring:
+  metrics_port: 9090
+  alerts:
+    discord_webhook_env: "DISCORD_WEBHOOK_URL"
+    telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
+    telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+  daily_summary_hour: 18
+
+decision_log:
+  path: "logs/decisions.jsonl"
+  flush_every: 25
+
+clob:
+  version: 2
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  collateral: "pUSD"
+  fee_rate_cache_ttl_s: 30
+  batch_order_limit: 15
+
+# ─── Maker quoting strategy — ENABLED in this config ──────────────────────
+maker:
+  enabled: true
+  primary_markets: ["btc-5m"]
+  min_half_spread_cents: 2.0
+  adverse_selection_buffer_cents: 1.0
+  requote_threshold_cents: 1.5
+  max_quote_lifetime_s: 30
+  flatten_before_expiry_s: 10
+  inventory_skew_factor: 0.5
+  target_fill_rate_pct: 30
+  target_size_shares: 5
+  max_inventory_per_side: 200
+  delta_threshold_uncertain: 0.005
+  delta_threshold_directional: 0.15
+  directional_bet_price: 0.95
+  binance_stale_threshold_s: 2.0
+  clob_ws_reconnect_timeout_s: 5.0
+  latency_warn_p95_ms: 150
+  latency_kill_p95_ms: 200
+  latency_sustained_breach_s: 60
+
+deployment:
+  mode: "paper"
+  vps_region: ""
+  docker: false
+  heartbeat_interval_s: 3600

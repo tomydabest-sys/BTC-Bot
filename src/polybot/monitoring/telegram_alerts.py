@@ -127,8 +127,8 @@ class TelegramAlerter:
         repeat_after_s: float = 300.0,
     ) -> None:
         now = time.monotonic()
-        last = self._sent_alerts.get(key, 0.0)
-        if (now - last) < repeat_after_s:
+        last = self._sent_alerts.get(key)
+        if last is not None and (now - last) < repeat_after_s:
             return
         self._sent_alerts[key] = now
         await self._manager.send_alert(level, message, data or {})

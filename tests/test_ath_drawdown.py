@@ -92,3 +92,38 @@ def test_manual_reset_clears_kill(signal):
     assert rm.ath_killed is False
     ok, _ = rm.can_open_position(Portfolio(), signal)
     assert ok is True
+
+
+def test_bot_status_loop_ticks_record_equity(tmp_path):
+    """Regression: prior to Phase 4 the ATH kill switch was defined but
+    never called from the running bot. Confirm `_emit_status` now feeds
+    equity into RiskManager.record_equity on every tick."""
+    from polybot.config import (
+        BotConfig,
+        Config,
+        MakerConfig,
+    )
+    from polybot.main import Bot
+
+    cfg = Config(
+        bot=BotConfig(mode="paper", data_dir=str(tmp_path / "data")),
+        maker=MakerConfig(enabled=False),
+    )
+    # Set the threshold so we can verify the wiring trips at the right point.
+    cfg.risk.ath_drawdown_kill_pct = 0.40
+    cfg.risk.bankroll_usd = 500.0
+    bot = Bot(cfg)
+    assert bot._risk.peak_equity == 500.0
+    assert bot._risk.ath_killed is False
+
+    # First tick at par — should set peak.
+    bot._emit_status()
+    assert bot._risk.peak_equity >= 500.0
+
+    # Engineer a 40% drawdown via realized P&L. _effective_bankroll returns
+    # config.risk.bankroll_usd; the equity sample = bankroll + realized_pnl.
+    bot._positions.portfolio.realized_pnl = -200.0  # equity = 300
+    bot._emit_status()
+    assert bot._risk.ath_killed is True, (
+        "ATH kill switch must trip when _emit_status ticks record_equity"
+    )

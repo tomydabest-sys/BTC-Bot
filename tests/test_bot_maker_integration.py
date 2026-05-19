@@ -171,3 +171,40 @@ async def test_bot_without_maker_does_not_init_orchestrator(temp_data_dir):
 
     bot = Bot(cfg)
     assert bot.maker is None
+
+
+def test_shipped_maker_paper_config_constructs_v2_stack(temp_data_dir, monkeypatch):
+    """The repo's `config.maker_paper.yaml` must wire the V2 maker stack
+    and ship with the legacy taker stack disabled. This is the file the
+    paper validation run uses, so a regression that silently re-enables
+    taker strategies or de-wires the gate would invalidate the 30-day
+    clock."""
+    import os
+
+    from polybot.config import load_config
+    from polybot.main import Bot
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    cfg_path = os.path.join(repo_root, "config.maker_paper.yaml")
+    cfg = load_config(cfg_path)
+    # Redirect data_dir into tmp so we don't pollute the repo's ./data.
+    cfg = cfg.model_copy(update={
+        "bot": cfg.bot.model_copy(update={"data_dir": temp_data_dir}),
+    })
+
+    # Surfaces the intent of the file: maker on, taker stack empty.
+    assert cfg.maker.enabled is True
+    assert cfg.strategies.enabled == []
+    assert cfg.risk.bankroll_usd == 500
+
+    bot = Bot(cfg)
+    try:
+        assert bot.maker is not None, "MakerOrchestrator should be constructed"
+        assert bot.validation_gate is not None, (
+            "PaperValidationGate should be constructed alongside maker"
+        )
+        # No legacy taker strategies — the maker stack is the income path.
+        assert bot.strategies == []
+    finally:
+        # No start() was called, so nothing to stop, but be defensive.
+        pass

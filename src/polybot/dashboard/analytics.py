@@ -409,6 +409,25 @@ def compute_overshoot_metrics(pairs: list[TradePair]) -> dict[str, Any]:
     }
 
 
+def compute_per_strategy_breakdown(pairs: list[TradePair]) -> dict[str, dict[str, Any]]:
+    """Return `compute_edge_metrics` bucketed by the **entry** strategy.
+
+    Closes the SESSION_HANDOFF observability gap: today exits are labelled
+    `stop_loss`/`auto_close` while the operator cannot tell which strategy
+    entered the position. The TradePair already carries `strategy` from the
+    entry order, so we group on it and run the standard edge calculator over
+    each bucket.
+    """
+    by_strategy: dict[str, list[TradePair]] = defaultdict(list)
+    for p in pairs:
+        key = p.strategy or "unknown"
+        by_strategy[key].append(p)
+    return {
+        strategy: compute_edge_metrics(group)
+        for strategy, group in by_strategy.items()
+    }
+
+
 def get_full_analytics(db_path: str = "./data/bot.db") -> dict[str, Any]:
     """Main entry point — returns the complete analytics payload."""
     orders = _load_orders(db_path, limit=5000)
@@ -417,13 +436,14 @@ def get_full_analytics(db_path: str = "./data/bot.db") -> dict[str, Any]:
     return {
         "edge": compute_edge_metrics(pairs),
         "signal_analysis": compute_signal_analysis(pairs),
+        "per_strategy": compute_per_strategy_breakdown(pairs),
         "risk": compute_risk_metrics(pairs),
         "time_buckets": compute_time_buckets(pairs),
         "overshoot_metrics": compute_overshoot_metrics(pairs),
         "recent_trades": [
             {
                 "market_id": p.market_id[:16],
-                "strategy": p.strategy,
+                "strategy": p.strategy or "unknown",
                 "side": p.side,
                 "entry_price": round(p.entry_price, 4),
                 "exit_price": round(p.exit_price, 4),

@@ -945,6 +945,30 @@ class Bot:
         cap_pegged_for = None
         if self._cap_pegged_since is not None:
             cap_pegged_for = round(time.time() - self._cap_pegged_since, 0)
+
+        # ATH-drawdown kill switch tick. RiskManager.record_equity()
+        # updates the peak watermark and trips _ath_killed if equity has
+        # fallen the configured threshold below peak. Without this call
+        # the switch can never fire — the value the gate compares against
+        # is never updated. The 60-second cadence of this loop is fast
+        # enough for the kill semantics (intra-minute equity moves of the
+        # required magnitude on a paper bankroll don't exist).
+        equity_usd = self._effective_bankroll() + portfolio.realized_pnl
+        try:
+            self._risk.record_equity(equity_usd)
+        except Exception as e:
+            logger.warning("record_equity_err", err=str(e)[:80])
+
+        # Paper validation gate: periodic auto-save runs from
+        # MakerOrchestrator when maker mode is on, but a quick best-effort
+        # save here means single-process crashes lose no more than the
+        # current minute's progress.
+        if self._validation_gate is not None:
+            try:
+                self._validation_gate.save()
+            except Exception as e:
+                logger.warning("validation_gate_save_err", err=str(e)[:80])
+
         logger.info(
             "bot_status",
             mode=self._config.bot.mode,
@@ -959,6 +983,9 @@ class Bot:
             btc_feed_age_s=round(feed_age, 0) if feed_age is not None else None,
             btc_feed_stale=feed.is_stale,
             btc_feed_source=feed.last_source or None,
+            ath_killed=self._risk.ath_killed,
+            peak_equity=round(self._risk.peak_equity, 2),
+            current_equity=round(equity_usd, 2),
             top_block_reasons=block_summary(top_n=5),
         )
 

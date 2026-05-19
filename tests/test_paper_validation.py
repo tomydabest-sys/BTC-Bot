@@ -163,3 +163,97 @@ def test_report_dict_serialises_cleanly(tmp_path):
     assert "metrics" in report_dict
     assert isinstance(report_dict["metrics"], list)
     assert all("name" in m for m in report_dict["metrics"])
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Round-trip P&L tracker — Phase 3 wiring
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_round_trip_tracker_yes_buy_then_yes_sell_reports_gross_pnl(tmp_path):
+    """YES BUY @ 0.45 followed by YES SELL @ 0.50 on 10 shares must surface
+    as a single round-trip with gross_pnl = (0.50 - 0.45) * 10 = $0.50.
+
+    This is the brief's canonical case: closing inventory back through
+    zero on the same token via an opposite-side fill.
+    """
+    from polybot.execution.maker_orchestrator import _RoundTripTracker
+
+    tracker = _RoundTripTracker(fee_theta=0.072)
+    opened = tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.45)
+    assert opened == []  # opening leg, no round-trip yet
+    closed = tracker.on_fill(side_yes=True, is_buy=False, shares=10, price=0.50)
+    assert len(closed) == 1
+    rt = closed[0]
+    assert rt.gross_pnl_usd == pytest.approx(0.50, abs=1e-6)
+    # Fees should be non-zero (fee_at_price > 0 in the 0.4-0.5 band) but
+    # the gate cares about net so we only sanity-check sign.
+    assert rt.fees_paid_usd > 0.0
+    # Inventory tracker should be flat after the close.
+    assert tracker.open_lot_count == 0
+
+
+def test_round_trip_tracker_cross_token_buy_buy(tmp_path):
+    """YES BUY 10 @ 0.45 + NO BUY 10 @ 0.50: net YES inventory back through
+    zero via the mirror token. Gross P&L = (1 - 0.45 - 0.50) * 10 = $0.50."""
+    from polybot.execution.maker_orchestrator import _RoundTripTracker
+
+    tracker = _RoundTripTracker(fee_theta=0.072)
+    tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.45)
+    closed = tracker.on_fill(side_yes=False, is_buy=True, shares=10, price=0.50)
+    assert len(closed) == 1
+    assert closed[0].gross_pnl_usd == pytest.approx(0.50, abs=1e-6)
+    assert tracker.open_lot_count == 0
+
+
+def test_round_trip_tracker_partial_close_then_residual(tmp_path):
+    """Open 10, close 6 → one round-trip for 6, 4 still open."""
+    from polybot.execution.maker_orchestrator import _RoundTripTracker
+
+    tracker = _RoundTripTracker(fee_theta=0.0)  # no fees for clarity
+    tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.45)
+    closed = tracker.on_fill(side_yes=True, is_buy=False, shares=6, price=0.50)
+    assert len(closed) == 1
+    assert closed[0].gross_pnl_usd == pytest.approx(0.05 * 6, abs=1e-6)
+    assert tracker.open_lot_count == 1
+    # Net inventory should still be +4 long YES.
+    assert tracker.net_signed_inventory == pytest.approx(4.0)
+
+
+def test_paper_fill_sweep_records_real_pnl_through_validation_gate(tmp_path):
+    """End-to-end: feed two opposing fills into a market state via the
+    tracker on the orchestrator and verify the gate sees a non-zero P&L."""
+    from polybot.execution.maker_orchestrator import _RoundTripTracker
+
+    gate = _make_gate(tmp_path)
+    # Simulate the sweep accounting by hand (the sweep glues these calls
+    # together; here we test the validation hand-off in isolation).
+    state_tracker = _RoundTripTracker(fee_theta=0.0)
+
+    # YES BUY @ 0.45 — opens.
+    rts = state_tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.45)
+    assert rts == []
+
+    # NO BUY @ 0.50 — closes via the mirror token.
+    rts = state_tracker.on_fill(side_yes=False, is_buy=True, shares=10, price=0.50)
+    assert len(rts) == 1
+    for rt in rts:
+        gate.record_round_trip(
+            gross_pnl_usd=rt.gross_pnl_usd,
+            fees_paid_usd=rt.fees_paid_usd,
+            dynamic_fee_fetched=True,
+        )
+
+    assert gate.state.gross_pnl_usd == pytest.approx(0.50, abs=1e-6)
+    assert gate.state.trade_count == 1
+
+
+def test_seconds_until_next_utc_midnight_is_positive():
+    """Smoke check on the daily-returns ticker's scheduling helper."""
+    from polybot.execution.maker_orchestrator import MakerOrchestrator
+
+    # Just past midnight UTC → should be ~86400s until the next.
+    just_past_midnight = 86400.0 * 12345 + 5.0
+    assert MakerOrchestrator._seconds_until_next_utc_midnight(just_past_midnight) == (
+        86400.0 - 5.0
+    )
