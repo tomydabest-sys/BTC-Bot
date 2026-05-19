@@ -269,7 +269,7 @@ class MakerEdgeStrategy(BaseStrategy):
         common["confidence"] = confidence
         common["fair_value"] = mid
         common["decision"] = direction.value
-        common["reason"] = BlockReason.OK
+        common["reason"] = BlockReason.SIGNAL_PROPOSED
 
         self._last_quote_ts[market_id] = now_ts
         self._last_quote_mid[market_id] = mid

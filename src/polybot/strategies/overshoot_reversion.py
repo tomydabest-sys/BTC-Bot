@@ -332,7 +332,7 @@ class OvershootReversionStrategy(BaseStrategy):
 
         size_pct_final = self._size_pct * confidence
         common["decision"] = direction.value
-        common["reason"] = BlockReason.OK
+        common["reason"] = BlockReason.SIGNAL_PROPOSED
 
         reason_str = (
             f"burst={poly_burst:+.4f} btc10s={btc_move_10s:+.4%} "
