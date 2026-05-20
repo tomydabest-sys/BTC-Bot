@@ -324,3 +324,190 @@ async def test_vitals_aggregate_correctly(market_5m, maker_cfg):
         assert v.p95_latency_ms >= 0
     finally:
         await orch.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Regression: mixed tz-awareness between Gamma end_date (aware) and pipeline
+#  orderbook timestamp (naive) used to throw on every loop iteration, which
+#  also poisoned the validation gate's unhandled_exceptions counter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _NaiveTimestampSnapshot:
+    """Mirrors production: pipeline stamps orderbooks with naive utcnow()."""
+
+    def __init__(self, market: Market, mid: float) -> None:
+        self.market = market
+        spread = 0.02
+        self.orderbook = OrderBook(
+            market_id=market.id,
+            timestamp=datetime.utcnow(),  # NAIVE, like the real pipeline
+            bids=[PriceLevel(price=mid - spread / 2, size=100)],
+            asks=[PriceLevel(price=mid + spread / 2, size=100)],
+        )
+
+
+class _NaivePipelineProxy:
+    def __init__(self, markets: dict[str, Market], mid: float) -> None:
+        self._markets = markets
+        self._mid = mid
+
+    def get_snapshot(self, market_id: str):
+        m = self._markets.get(market_id)
+        if m is None:
+            return None
+        return _NaiveTimestampSnapshot(m, self._mid)
+
+
+@pytest.mark.asyncio
+async def test_mixed_tz_does_not_throw_or_poison_validation_gate(
+    market_5m, maker_cfg, tmp_path
+):
+    from polybot.monitoring.paper_validation import PaperValidationGate
+
+    # Gamma-style aware end_date + naive orderbook timestamp.
+    aware_market = market_5m  # fixture already uses datetime.now(UTC)
+    assert aware_market.end_date.tzinfo is not None
+
+    markets = {aware_market.id: aware_market}
+    scanner = _FakeScanner(markets)
+    pipeline = _NaivePipelineProxy(markets, mid=0.50)
+    feed = _FakeFeed()
+    gate = PaperValidationGate(
+        state_path=str(tmp_path / "v.json"), starting_equity_usd=500.0
+    )
+
+    orch = MakerOrchestrator(
+        maker_cfg=maker_cfg,
+        scanner=scanner,
+        pipeline=pipeline,
+        exchange_feed=feed,
+        is_paper=True,
+        client=None,
+        telegram=None,
+        validation_gate=gate,
+    )
+    await orch.start()
+    try:
+        await asyncio.sleep(0.6)
+        # Before the fix this raised TypeError every iteration, recording an
+        # unhandled exception each time and placing zero quotes.
+        assert gate.state.unhandled_exceptions == 0, (
+            "mixed-tz subtraction must not raise into the loop's except handler"
+        )
+        state = orch.markets[aware_market.id]
+        assert len(state.quote_manager.state.resting) >= 1, (
+            "quotes should be placed once t_rem computes cleanly"
+        )
+    finally:
+        await orch.stop()
+
+
+@pytest.mark.asyncio
+async def test_inventory_bounded_at_soft_limit_in_crash(market_5m, maker_cfg):
+    """Regression for one-sided accumulation: in a crashing market the
+    maker must stop adding to the heavy side at the soft inventory limit
+    (0.5 x cap) instead of running to the hard cap. Previously it filled
+    YES all the way down and froze at the cap (97% inventory_limit)."""
+    import itertools
+
+    # Small cap so the test is quick: soft = 0.5 * 40 = 20 shares.
+    cfg = maker_cfg.model_copy(update={
+        "max_inventory_per_side": 40.0,
+        "target_size_shares": 5.0,
+    })
+    markets = {market_5m.id: market_5m}
+    scanner = _FakeScanner(markets)
+    pipeline_inner = _FakePipeline()
+    pipeline = _PipelineProxy(pipeline_inner, markets)
+    feed = _FakeFeed(start_price=95_000.0)
+
+    orch = MakerOrchestrator(
+        maker_cfg=cfg, scanner=scanner, pipeline=pipeline,
+        exchange_feed=feed, is_paper=True, client=None, telegram=None,
+    )
+    # Crash the mid downward so YES bids keep getting filled adversely.
+    mids = itertools.cycle([0.50, 0.42, 0.34, 0.26, 0.18, 0.12, 0.08, 0.06])
+    await orch.start()
+    try:
+        peak = 0.0
+        for _ in range(25):
+            pipeline_inner.set_mid(market_5m.id, next(mids))
+            await asyncio.sleep(0.15)
+            st = orch.markets.get(market_5m.id)
+            if st is not None:
+                peak = max(peak, abs(st.inventory.net_yes_shares))
+        # Must NOT run to the hard cap (40). Soft limit is 20; allow one
+        # extra fill of slack (suppression triggers AT the soft limit, so a
+        # fill in flight can push slightly past it).
+        assert peak <= 20.0 + cfg.target_size_shares + 1e-6, (
+            f"inventory ran past the soft limit: peak={peak}"
+        )
+        assert peak >= 5.0, f"expected some accumulation, got peak={peak}"
+    finally:
+        await orch.stop()
+
+
+def test_projected_fair_drift_detects_downtrend(market_5m, maker_cfg):
+    """The orchestrator must turn a falling fair-value history into a
+    negative projected drift (which compute_quotes uses to pull the YES
+    bid). Deterministic: we pre-seed the history with an explicit old
+    timestamp so we don't depend on async timing."""
+    import time
+
+    from polybot.execution.maker_orchestrator import _MarketState
+    from polybot.execution.quote_manager import QuoteManager
+    from polybot.positions.inventory import InventoryManager
+    from polybot.strategies.maker_quoting import (
+        MakerQuotingConfig,
+        MakerQuotingStrategy,
+    )
+
+    cfg = maker_cfg.model_copy(update={"max_quote_lifetime_s": 30.0})
+    orch = MakerOrchestrator(
+        maker_cfg=cfg, scanner=_FakeScanner({}), pipeline=object(),
+        exchange_feed=_FakeFeed(), is_paper=True, client=None, telegram=None,
+    )
+    qm = QuoteManager(
+        market_id=market_5m.id, yes_token_id="y", no_token_id="n",
+        strategy=MakerQuotingStrategy(MakerQuotingConfig()),
+        client=None, is_paper=True,
+    )
+    state = _MarketState(
+        market=market_5m, quote_manager=qm,
+        inventory=InventoryManager(market_id=market_5m.id),
+    )
+    # Fair was 0.50 twenty seconds ago.
+    state.fair_history.append((time.monotonic() - 20.0, 0.50))
+    # Now it's 0.30 → drift_rate -0.01/s, projected over 30s ≈ -0.30.
+    drift = orch._projected_fair_drift(state, 0.30)
+    assert drift < 0, "falling fair must yield a negative projected drift"
+    assert drift == pytest.approx(-0.30, abs=0.05)
+
+
+def test_projected_fair_drift_returns_zero_without_baseline(market_5m, maker_cfg):
+    """No drift signal until enough history accumulates (no startup-noise
+    firing)."""
+    from polybot.execution.maker_orchestrator import _MarketState
+    from polybot.execution.quote_manager import QuoteManager
+    from polybot.positions.inventory import InventoryManager
+    from polybot.strategies.maker_quoting import (
+        MakerQuotingConfig,
+        MakerQuotingStrategy,
+    )
+
+    orch = MakerOrchestrator(
+        maker_cfg=maker_cfg, scanner=_FakeScanner({}), pipeline=object(),
+        exchange_feed=_FakeFeed(), is_paper=True, client=None, telegram=None,
+    )
+    qm = QuoteManager(
+        market_id=market_5m.id, yes_token_id="y", no_token_id="n",
+        strategy=MakerQuotingStrategy(MakerQuotingConfig()),
+        client=None, is_paper=True,
+    )
+    state = _MarketState(
+        market=market_5m, quote_manager=qm,
+        inventory=InventoryManager(market_id=market_5m.id),
+    )
+    # First sample → no baseline → zero.
+    assert orch._projected_fair_drift(state, 0.50) == 0.0

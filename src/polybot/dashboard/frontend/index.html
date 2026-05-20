@@ -757,35 +757,48 @@ async function refreshAll() {
     fetchJSON('/api/validation'),
   ]);
 
-  if (status) {
-    const badge = document.getElementById('modeBadge');
-    badge.textContent = (status.mode || 'paper').toUpperCase();
-    badge.className = 'badge ' + (status.mode === 'live' ? 'badge-live' : 'badge-paper');
-    document.getElementById('statusText').textContent = status.running ? 'RUNNING' : 'OFFLINE';
-    document.getElementById('statusText').className = status.running ? 'green' : 'red';
-    document.getElementById('pulseEl').style.background = status.running ? 'var(--green)' : 'var(--red)';
-  }
+  // Each panel renders in isolation: a throw in one (bad field, stale
+  // cached JS, unexpected payload) must NOT block the others, freeze the
+  // LAST UPDATE clock, or leave the Maker/Validation tabs hidden.
+  const safe = (label, fn) => {
+    try { fn(); } catch (err) { console.error('render failed:', label, err); }
+  };
 
-  const btc = extractBtcPrice(prices);
-  document.getElementById('btcPrice').textContent = btc
-    ? '$' + btc.toLocaleString(undefined, { maximumFractionDigits: 0 })
-    : '—';
+  safe('status', () => {
+    if (status) {
+      const badge = document.getElementById('modeBadge');
+      badge.textContent = (status.mode || 'paper').toUpperCase();
+      badge.className = 'badge ' + (status.mode === 'live' ? 'badge-live' : 'badge-paper');
+      document.getElementById('statusText').textContent = status.running ? 'RUNNING' : 'OFFLINE';
+      document.getElementById('statusText').className = status.running ? 'green' : 'red';
+      document.getElementById('pulseEl').style.background = status.running ? 'var(--green)' : 'var(--red)';
+    }
+  });
 
-  if (portfolio) {
-    document.getElementById('r-exposure').textContent = '$' + (portfolio.total_exposure || 0).toFixed(0);
-    document.getElementById('r-exposuresub').textContent = (portfolio.num_positions || (portfolio.positions || []).length || 0) + ' positions';
-  }
+  safe('btc', () => {
+    const btc = extractBtcPrice(prices);
+    document.getElementById('btcPrice').textContent = btc
+      ? '$' + btc.toLocaleString(undefined, { maximumFractionDigits: 0 })
+      : '—';
+  });
+
+  safe('portfolio', () => {
+    if (portfolio) {
+      document.getElementById('r-exposure').textContent = '$' + (portfolio.total_exposure || 0).toFixed(0);
+      document.getElementById('r-exposuresub').textContent = (portfolio.num_positions || (portfolio.positions || []).length || 0) + ' positions';
+    }
+  });
 
   if (analytics && !analytics.error) {
-    renderOverview(analytics);
-    renderEdge(analytics);
-    renderSignals(analytics);
-    renderRisk(analytics);
-    renderTrades(analytics);
+    safe('overview', () => renderOverview(analytics));
+    safe('edge', () => renderEdge(analytics));
+    safe('signals', () => renderSignals(analytics));
+    safe('risk', () => renderRisk(analytics));
+    safe('trades', () => renderTrades(analytics));
   }
 
-  renderMaker(maker);
-  renderValidation(validation);
+  safe('maker', () => renderMaker(maker));
+  safe('validation', () => renderValidation(validation));
 
   document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('en-GB', {hour12: false});
 }

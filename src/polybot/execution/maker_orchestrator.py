@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import structlog
 
@@ -51,29 +53,17 @@ from polybot.strategies.maker_quoting import (
 logger = structlog.get_logger()
 
 
-@dataclass
-class _OpenLot:
-    """One leg of a maker round-trip held until offset by an opposite fill."""
+def _as_naive_utc(dt: datetime) -> datetime:
+    """Coerce a datetime to naive UTC so it can be subtracted from another.
 
-    side_yes: bool
-    is_buy: bool
-    shares: float
-    price: float
-
-    @property
-    def signed_delta(self) -> float:
-        """Signed contribution to net YES inventory.
-
-        long YES contributions (YES BUY, NO SELL) are positive; long NO
-        contributions (NO BUY, YES SELL) are negative.
-        """
-        if self.side_yes and self.is_buy:
-            return +self.shares
-        if self.side_yes and not self.is_buy:
-            return -self.shares
-        if not self.side_yes and self.is_buy:
-            return -self.shares
-        return +self.shares
+    Gamma parses market end_dates as tz-aware (the `Z`→`+00:00` swap),
+    while the pipeline stamps orderbooks with naive `datetime.utcnow()`.
+    Subtracting the two raises "can't subtract offset-naive and
+    offset-aware datetimes". Normalising both operands here is the fix.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
 
 
 @dataclass
@@ -83,26 +73,34 @@ class _RoundTrip:
 
 
 class _RoundTripTracker:
-    """FIFO lot-matching tracker for paper-mode maker fills.
+    """YES-equivalent position tracker for paper-mode maker fills.
 
-    Maintains a single-direction queue of open lots (all entries on the
-    same signed side of net YES inventory). When a fill arrives on the
-    opposite side, lots are popped FIFO and matched up to the available
-    fill size; each matched pair produces a `_RoundTrip` with realized
-    gross P&L and per-side fees.
+    Every fill is converted to a signed YES position at a YES-equivalent
+    price, since a binary market's two tokens are mirror images:
 
-    P&L identities:
-      * Same token (BUY→SELL or SELL→BUY): (sell - buy) * shares.
-      * Cross-token close where BOTH legs are BUYS (YES BUY + NO BUY):
-        the position pays $1 at resolution regardless of outcome, so
-        gross_pnl = (1 - p_yes - p_no) * shares.
-      * Cross-token close where BOTH legs are SELLS (YES SELL + NO SELL):
-        the obligation is $1, so gross_pnl = (p_yes + p_no - 1) * shares.
+        YES BUY  @ p  ->  long  YES  @ p
+        YES SELL @ p  ->  short YES  @ p
+        NO  BUY  @ p  ->  short YES  @ (1 - p)   (buying NO == shorting YES)
+        NO  SELL @ p  ->  long  YES  @ (1 - p)
+
+    We hold ONE net position with a volume-weighted average entry price.
+    A fill that reduces the magnitude realizes P&L for the closed portion
+    at the fill price; a fill that grows or flips the position updates the
+    average entry.
+
+    Crucially, inventory still open when the market rolls off is realized
+    via `realize_remaining(exit_price_yes=...)`. That is where one-sided
+    "caught a falling knife" accumulation (YES bids filled all the way
+    down a crashing mid) finally books its real loss — the previous
+    lot-pairing model only ever realized the hedged-pair legs and let the
+    naked inventory's loss vanish, which is what produced the fake
+    +13%-in-15-minutes paper P&L.
     """
 
     def __init__(self, fee_theta: float = 0.072) -> None:
         self._fee_theta = fee_theta
-        self._open_lots: list[_OpenLot] = []
+        self._net: float = 0.0   # signed YES-equivalent shares (+long / -short)
+        self._avg: float = 0.0   # volume-weighted avg YES entry price
 
     @property
     def fee_theta(self) -> float:
@@ -110,11 +108,33 @@ class _RoundTripTracker:
 
     @property
     def open_lot_count(self) -> int:
-        return len(self._open_lots)
+        # Back-compat with existing tests: 0 when flat, 1 when a position is open.
+        return 0 if abs(self._net) < 1e-12 else 1
 
     @property
     def net_signed_inventory(self) -> float:
-        return sum(lot.signed_delta for lot in self._open_lots)
+        return self._net
+
+    @property
+    def avg_entry_yes(self) -> float:
+        return self._avg
+
+    @staticmethod
+    def _to_yes(side_yes: bool, is_buy: bool, price: float) -> tuple[float, float]:
+        """Map a fill to (direction, yes_equivalent_price).
+
+        direction is +1 for a long-YES contribution, -1 for short-YES.
+        """
+        if side_yes:
+            return (1.0 if is_buy else -1.0), price
+        # NO token: buying NO shorts YES; price mirrors to (1 - p).
+        return (-1.0 if is_buy else 1.0), (1.0 - price)
+
+    def _fees(self, price_a: float, price_b: float, shares: float) -> float:
+        return (
+            fee_at_price(price_a, theta=self._fee_theta)
+            + fee_at_price(price_b, theta=self._fee_theta)
+        ) * shares
 
     def on_fill(
         self,
@@ -127,78 +147,62 @@ class _RoundTripTracker:
         """Record a fill, return any round-trips realized by it (may be empty)."""
         if shares <= 0:
             return []
-        incoming = _OpenLot(side_yes=side_yes, is_buy=is_buy, shares=shares, price=price)
+        direction, yes_price = self._to_yes(side_yes, is_buy, price)
+        signed = direction * shares
         round_trips: list[_RoundTrip] = []
 
-        # Same-direction fill (or first fill) → just enqueue.
-        if not self._open_lots or self._same_direction(self._open_lots[0], incoming):
-            self._open_lots.append(incoming)
+        if abs(self._net) < 1e-12 or (self._net > 0) == (signed > 0):
+            # Flat, or same direction → grow the position and re-average.
+            total = abs(self._net) + abs(signed)
+            self._avg = (abs(self._net) * self._avg + abs(signed) * yes_price) / total
+            self._net += signed
             return round_trips
 
-        # Opposite-direction fill → FIFO match against open lots until either
-        # the incoming fill is consumed or the queue is empty.
-        remaining = incoming.shares
-        while remaining > 0 and self._open_lots:
-            head = self._open_lots[0]
-            matched = min(head.shares, remaining)
-            round_trips.append(
-                self._realize(open_lot=head, closing=incoming, shares=matched)
+        # Opposite direction → realize P&L against the existing position for
+        # the overlapping portion, at the fill's YES-equivalent price.
+        closing = min(abs(self._net), abs(signed))
+        if self._net > 0:
+            gross = (yes_price - self._avg) * closing      # closed a long
+        else:
+            gross = (self._avg - yes_price) * closing      # closed a short
+        round_trips.append(
+            _RoundTrip(
+                gross_pnl_usd=gross,
+                fees_paid_usd=self._fees(self._avg, yes_price, closing),
             )
-            head.shares -= matched
-            remaining -= matched
-            if head.shares <= 1e-12:
-                self._open_lots.pop(0)
+        )
 
-        # If the incoming fill exceeded the open queue, the residual flips
-        # the position and becomes a new open lot on the opposite side.
-        if remaining > 1e-12:
-            self._open_lots.append(
-                _OpenLot(
-                    side_yes=incoming.side_yes,
-                    is_buy=incoming.is_buy,
-                    shares=remaining,
-                    price=incoming.price,
-                )
-            )
+        residual = abs(signed) - closing
+        self._net += signed
+        if abs(self._net) < 1e-12:
+            self._net = 0.0
+            self._avg = 0.0
+        elif residual > 1e-12:
+            # The fill flipped the position; the residual opens fresh.
+            self._avg = yes_price
         return round_trips
 
-    @staticmethod
-    def _same_direction(a: _OpenLot, b: _OpenLot) -> bool:
-        return (a.signed_delta >= 0) == (b.signed_delta >= 0)
+    def realize_remaining(self, *, exit_price_yes: float) -> _RoundTrip | None:
+        """Close any open inventory at a YES exit price (flatten / expiry).
 
-    def _realize(
-        self, *, open_lot: _OpenLot, closing: _OpenLot, shares: float
-    ) -> _RoundTrip:
-        # Per-side fees: the maker is the resting side and the taker pays
-        # the per-trade fee. In paper mode we conservatively count both
-        # sides through `fee_at_price` — the validation gate's fee-
-        # consistency metric only checks that *something* was fetched, not
-        # the exact amount.
-        fee_open = fee_at_price(open_lot.price, theta=self._fee_theta) * shares
-        fee_close = fee_at_price(closing.price, theta=self._fee_theta) * shares
-        fees = fee_open + fee_close
-
-        if open_lot.side_yes == closing.side_yes:
-            # Same token, opposite is_buy → straightforward (sell - buy) * shares.
-            buy_lot = open_lot if open_lot.is_buy else closing
-            sell_lot = closing if open_lot.is_buy else open_lot
-            gross = (sell_lot.price - buy_lot.price) * shares
+        Returns the realized round-trip, or None if already flat. This is
+        the call that books the naked-inventory loss the old model dropped.
+        """
+        if abs(self._net) < 1e-12:
+            return None
+        exit_px = max(0.0, min(1.0, exit_price_yes))
+        closing = abs(self._net)
+        if self._net > 0:
+            gross = (exit_px - self._avg) * closing
         else:
-            # Cross-token close.
-            if open_lot.is_buy and closing.is_buy:
-                # Long YES + long NO held to (synthetic) resolution.
-                gross = (1.0 - open_lot.price - closing.price) * shares
-            elif not open_lot.is_buy and not closing.is_buy:
-                # Short both sides — owed $1, collected p_yes + p_no.
-                gross = (open_lot.price + closing.price - 1.0) * shares
-            else:
-                # One BUY + one SELL on opposite tokens — equivalent to two
-                # same-direction long positions, so the offset comes from
-                # the price difference.
-                buy_lot = open_lot if open_lot.is_buy else closing
-                sell_lot = closing if open_lot.is_buy else open_lot
-                gross = (sell_lot.price - buy_lot.price) * shares
-        return _RoundTrip(gross_pnl_usd=gross, fees_paid_usd=fees)
+            gross = (self._avg - exit_px) * closing
+        rt = _RoundTrip(
+            gross_pnl_usd=gross,
+            fees_paid_usd=self._fees(self._avg, exit_px, closing),
+        )
+        self._net = 0.0
+        self._avg = 0.0
+        return rt
 
 
 @dataclass
@@ -212,6 +216,8 @@ class _MarketState:
     round_trip_tracker: _RoundTripTracker = field(
         default_factory=_RoundTripTracker
     )
+    # Rolling (monotonic_ts, fair_value) samples for the trend filter.
+    fair_history: deque = field(default_factory=lambda: deque(maxlen=600))
 
 
 @dataclass
@@ -298,11 +304,42 @@ class MakerOrchestrator:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         for state in list(self._states.values()):
+            # Book any open inventory before tearing the state down so the
+            # gate's P&L reflects positions that were live at shutdown.
+            self._realize_position_on_close(state, reason="shutdown")
             try:
                 await state.quote_manager.cancel_all()
             except Exception:
                 pass
         logger.info("maker_orchestrator_stopped")
+
+    def _realize_position_on_close(
+        self, state: _MarketState, *, reason: str
+    ) -> None:
+        """Realize a market's open inventory at its last mid and record the
+        round-trip on the validation gate. Idempotent once flat."""
+        exit_px = state.last_mid if state.last_mid > 0 else 0.5
+        rt = state.round_trip_tracker.realize_remaining(exit_price_yes=exit_px)
+        if rt is None:
+            return
+        try:
+            state.inventory.reset()
+        except Exception:
+            pass
+        logger.info(
+            "maker_position_realized",
+            market=state.market.id[:12],
+            reason=reason,
+            exit_mid=round(exit_px, 4),
+            gross_pnl=round(rt.gross_pnl_usd, 4),
+            fees=round(rt.fees_paid_usd, 4),
+        )
+        if self._validation is not None:
+            self._validation.record_round_trip(
+                gross_pnl_usd=rt.gross_pnl_usd,
+                fees_paid_usd=rt.fees_paid_usd,
+                dynamic_fee_fetched=True,
+            )
 
     # ─────────────────────────────────────────────────────────────────
     #  Loops
@@ -472,6 +509,11 @@ class MakerOrchestrator:
         stale = [mid for mid in self._states if mid not in seen]
         for mid in stale:
             state = self._states.pop(mid)
+            # Realize any inventory still open at rolloff against the last
+            # observed mid — this is where naked one-sided accumulation
+            # (caught-falling-knife) books its real P&L on the gate instead
+            # of being silently abandoned with the discarded state.
+            self._realize_position_on_close(state, reason="market_rolloff")
             try:
                 await state.quote_manager.cancel_all()
             except Exception:
@@ -573,9 +615,11 @@ class MakerOrchestrator:
         snapshot = self._pipeline.get_snapshot(market.id)
         if snapshot is None:
             return
-        now_utc = snapshot.orderbook.timestamp
-        end_dt = market.end_date
-        # tz-aware: pipeline snapshots use UTC.
+        # Both operands normalised to naive UTC — Gamma end_dates are
+        # tz-aware, pipeline timestamps are naive, and subtracting the two
+        # raw raises a TypeError on every loop iteration.
+        now_utc = _as_naive_utc(snapshot.orderbook.timestamp)
+        end_dt = _as_naive_utc(market.end_date)
         t_rem = max(0.0, (end_dt - now_utc).total_seconds())
 
         # Strike: lock on first sight using the snapshot mid as a proxy.
@@ -590,15 +634,25 @@ class MakerOrchestrator:
             else snapshot.orderbook.mid_price
         )
 
+        # Trend filter input: project the recent fair-value drift over the
+        # quote lifetime. Persistence assumption — if fair fell X over the
+        # last `lifetime` seconds, expect ~X more over the next one.
+        trend_drift = self._projected_fair_drift(state, fair)
+
         # Paper-mode fill simulation: cross check against mid moves.
         if self._is_paper:
             self._paper_fill_sweep(state, snapshot.orderbook.mid_price)
         state.last_mid = snapshot.orderbook.mid_price
 
-        # Pre-flight: would this fill push us past the cap on either side?
-        # If yes, force flatten-only mode by skipping new quotes.
         size = self._cfg.target_size_shares
         inv = state.inventory
+
+        # Observability only: note when we're over the soft inventory limit.
+        # We no longer hard-return here — that froze BOTH sides and held the
+        # adverse position to expiry (the 97%-inventory_limit stall). Instead
+        # we pass net/cap into sync_quotes so the strategy suppresses only the
+        # side that would grow the position and keeps quoting the reducing
+        # side, letting fills flatten us.
         if abs(inv.net_yes_shares) >= self._cfg.max_inventory_per_side:
             emit_decision(
                 cycle_id=f"maker-{int(time.time())}",
@@ -610,7 +664,6 @@ class MakerOrchestrator:
                 fair_value=fair,
                 extra={"net_inventory": inv.net_yes_shares},
             )
-            return
 
         # Use a fee rate fetched live when in live mode; default to crypto
         # taker theta in paper mode (no network call).
@@ -628,6 +681,9 @@ class MakerOrchestrator:
             time_remaining_s=t_rem,
             inventory_skew_cents=inv.skew_cents() * 100.0,
             size_shares=size,
+            net_inventory_shares=inv.net_yes_shares,
+            max_inventory_shares=self._cfg.max_inventory_per_side,
+            trend_drift=trend_drift,
         )
 
         # Flatten window: turn inventory into either a directional bet or
@@ -661,6 +717,31 @@ class MakerOrchestrator:
         self._loop_uptime_total += 1.0
         if isinstance(result, dict) and result.get("action") == "synced":
             self._loop_synced_total += 1.0
+
+    def _projected_fair_drift(self, state: _MarketState, fair: float) -> float:
+        """Project recent fair-value drift over the quote lifetime.
+
+        Records a (ts, fair) sample, measures the net move over the trailing
+        `max_quote_lifetime_s` window, and projects it forward one lifetime
+        (persistence). Returns 0 until enough history accumulates so the
+        filter doesn't fire on startup noise. Negative = fair falling.
+        """
+        now = time.monotonic()
+        hist = state.fair_history
+        hist.append((now, fair))
+        window = max(1.0, float(self._cfg.max_quote_lifetime_s))
+        cutoff = now - window
+        while len(hist) > 1 and hist[0][0] < cutoff:
+            hist.popleft()
+        if len(hist) < 2:
+            return 0.0
+        oldest_ts, oldest_fair = hist[0]
+        elapsed = now - oldest_ts
+        # Require a meaningful baseline before trusting a drift estimate.
+        if elapsed < min(window * 0.5, 10.0):
+            return 0.0
+        drift_rate = (fair - oldest_fair) / elapsed
+        return drift_rate * window
 
     # ─────────────────────────────────────────────────────────────────
     #  Paper-mode fill simulation

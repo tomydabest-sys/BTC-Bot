@@ -42,6 +42,19 @@ class MakerQuotingConfig:
     # Wider on higher-vol regimes. Multiplied by ann.vol / reference vol.
     reference_annual_vol: float = 0.45
     vol_scaling_max: float = 2.5
+    # Inventory soft-limit: once |net inventory| exceeds this fraction of the
+    # per-side cap, stop quoting the side that would ADD to the position and
+    # only quote the reducing side. Prevents one-directional accumulation
+    # (catching a falling knife) and the hard-cap stall where both sides
+    # freeze and the position is held to expiry.
+    inventory_soft_limit_ratio: float = 0.5
+    # Trend filter: when fair value is drifting directionally, the bid on the
+    # side losing value gets picked off on every tick. We widen that exposed
+    # side's bid by the projected adverse drift, and suppress it entirely once
+    # that drift reaches `trend_suppress_ratio` x half-spread (the spread can
+    # no longer cover the move). The half-spread is vol-scaled, so the trip
+    # point auto-loosens in high-vol regimes — the "vol-scaled" trend filter.
+    trend_suppress_ratio: float = 1.0
 
 
 @dataclass
@@ -134,6 +147,9 @@ class MakerQuotingStrategy:
         time_remaining_s: float,
         size_shares: float,
         inventory_skew_cents: float = 0.0,
+        net_inventory_shares: float = 0.0,
+        max_inventory_shares: float = 0.0,
+        trend_drift: float = 0.0,
     ) -> tuple[Quote, Quote]:
         """Return (yes_bid, no_bid). Raises NoQuote when neither side is viable.
 
@@ -142,6 +158,16 @@ class MakerQuotingStrategy:
 
         `inventory_skew_cents` shifts both sides in the same direction
         (positive = lean against long YES position).
+
+        `net_inventory_shares` / `max_inventory_shares` enable inventory-aware
+        one-sided quoting: once the position exceeds the soft limit, the side
+        that would grow it is suppressed (size 0) so only reducing fills can
+        occur. A YES BUY grows long YES; a NO BUY reduces it.
+
+        `trend_drift` is the projected signed change in fair value over the
+        quote lifetime (negative = fair falling). The side losing value is
+        widened by the adverse drift and pulled entirely once it exceeds
+        `trend_suppress_ratio` x half-spread.
         """
         if not (0.0 < fair_value < 1.0):
             raise NoQuoteError(f"fair_value {fair_value:.4f} outside (0,1)")
@@ -158,18 +184,43 @@ class MakerQuotingStrategy:
         )
         skew = inventory_skew_cents / 100.0
 
-        # YES bid = fair - half_spread - skew (skew>0 ⇒ lean against long YES)
-        yes_bid = fair_value - half - skew
-        # NO bid = (1 - fair) - half_spread + skew (the mirror)
-        no_bid = (1.0 - fair_value) - half + skew
+        # Trend filter: a falling fair (-drift) picks off the YES bid; a
+        # rising fair (+drift) picks off the NO bid. Widen the exposed side by
+        # the adverse drift, and flag it for suppression once the move exceeds
+        # the spread cushion.
+        adverse_yes = max(0.0, -trend_drift)
+        adverse_no = max(0.0, trend_drift)
+        trip = self._config.trend_suppress_ratio * half
+        trend_suppress_yes = trip > 0 and adverse_yes >= trip
+        trend_suppress_no = trip > 0 and adverse_no >= trip
 
-        yes_q = self._maybe_quote(
+        # YES bid = fair - half_spread - skew (skew>0 ⇒ lean against long YES);
+        # widened further by sub-trip adverse drift.
+        yes_bid = fair_value - half - skew - (0.0 if trend_suppress_yes else adverse_yes)
+        # NO bid = (1 - fair) - half_spread + skew (the mirror).
+        no_bid = (1.0 - fair_value) - half + skew - (0.0 if trend_suppress_no else adverse_no)
+
+        # Inventory-aware one-sided suppression. Suppress whichever side would
+        # ADD to an already-heavy position; keep quoting the reducing side so
+        # fills flatten us instead of freezing at the cap.
+        inv_suppress_yes, inv_suppress_no = self._inventory_suppression(
+            net_inventory_shares, max_inventory_shares
+        )
+        suppress_yes = inv_suppress_yes or trend_suppress_yes
+        suppress_no = inv_suppress_no or trend_suppress_no
+
+        yes_q = None if suppress_yes else self._maybe_quote(
             yes_bid, size_shares, side_yes=True, fair_value=fair_value
         )
-        no_q = self._maybe_quote(
+        no_q = None if suppress_no else self._maybe_quote(
             no_bid, size_shares, side_yes=False, fair_value=fair_value
         )
         if yes_q is None and no_q is None:
+            # If suppression nuked the only viable side, that's intentional
+            # (inventory-capped, or a strong trend on the exposed side) — not
+            # an error condition, just a deliberate stand-down.
+            if suppress_yes or suppress_no:
+                raise NoQuoteError("suppressed (inventory/trend); no quotable side")
             raise NoQuoteError("both sides outside valid price range")
         return (
             yes_q
@@ -191,6 +242,25 @@ class MakerQuotingStrategy:
                 reference_mid=1.0 - fair_value,
             ),
         )
+
+    def _inventory_suppression(
+        self, net_inventory_shares: float, max_inventory_shares: float
+    ) -> tuple[bool, bool]:
+        """Return (suppress_yes, suppress_no).
+
+        Beyond the soft limit we stop quoting the side that would grow the
+        position: long YES (net > 0) suppresses the YES bid; short YES
+        (net < 0, i.e. long NO) suppresses the NO bid. The reducing side
+        keeps quoting so fills flatten us toward zero.
+        """
+        if max_inventory_shares <= 0:
+            return False, False
+        soft = self._config.inventory_soft_limit_ratio * max_inventory_shares
+        if net_inventory_shares >= soft:
+            return True, False   # heavy long YES → stop buying YES
+        if net_inventory_shares <= -soft:
+            return False, True   # heavy short YES (long NO) → stop buying NO
+        return False, False
 
     @staticmethod
     def _maybe_quote(
