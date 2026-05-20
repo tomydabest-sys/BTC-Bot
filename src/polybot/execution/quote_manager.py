@@ -122,6 +122,8 @@ class QuoteManager:
         time_remaining_s: float,
         inventory_skew_cents: float = 0.0,
         size_shares: float | None = None,
+        net_inventory_shares: float = 0.0,
+        max_inventory_shares: float = 0.0,
     ) -> dict[str, object]:
         """Recompute target quotes and (cancel+replace) into the book.
 
@@ -144,6 +146,8 @@ class QuoteManager:
                     time_remaining_s=time_remaining_s,
                     size_shares=size,
                     inventory_skew_cents=inventory_skew_cents,
+                    net_inventory_shares=net_inventory_shares,
+                    max_inventory_shares=max_inventory_shares,
                 )
             except NoQuote as e:
                 cancelled = await self._cancel_all_locked()

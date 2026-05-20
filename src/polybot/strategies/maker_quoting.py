@@ -42,6 +42,12 @@ class MakerQuotingConfig:
     # Wider on higher-vol regimes. Multiplied by ann.vol / reference vol.
     reference_annual_vol: float = 0.45
     vol_scaling_max: float = 2.5
+    # Inventory soft-limit: once |net inventory| exceeds this fraction of the
+    # per-side cap, stop quoting the side that would ADD to the position and
+    # only quote the reducing side. Prevents one-directional accumulation
+    # (catching a falling knife) and the hard-cap stall where both sides
+    # freeze and the position is held to expiry.
+    inventory_soft_limit_ratio: float = 0.5
 
 
 @dataclass
@@ -134,6 +140,8 @@ class MakerQuotingStrategy:
         time_remaining_s: float,
         size_shares: float,
         inventory_skew_cents: float = 0.0,
+        net_inventory_shares: float = 0.0,
+        max_inventory_shares: float = 0.0,
     ) -> tuple[Quote, Quote]:
         """Return (yes_bid, no_bid). Raises NoQuote when neither side is viable.
 
@@ -142,6 +150,11 @@ class MakerQuotingStrategy:
 
         `inventory_skew_cents` shifts both sides in the same direction
         (positive = lean against long YES position).
+
+        `net_inventory_shares` / `max_inventory_shares` enable inventory-aware
+        one-sided quoting: once the position exceeds the soft limit, the side
+        that would grow it is suppressed (size 0) so only reducing fills can
+        occur. A YES BUY grows long YES; a NO BUY reduces it.
         """
         if not (0.0 < fair_value < 1.0):
             raise NoQuoteError(f"fair_value {fair_value:.4f} outside (0,1)")
@@ -163,13 +176,25 @@ class MakerQuotingStrategy:
         # NO bid = (1 - fair) - half_spread + skew (the mirror)
         no_bid = (1.0 - fair_value) - half + skew
 
-        yes_q = self._maybe_quote(
+        # Inventory-aware one-sided suppression. Suppress whichever side would
+        # ADD to an already-heavy position; keep quoting the reducing side so
+        # fills flatten us instead of freezing at the cap.
+        suppress_yes, suppress_no = self._inventory_suppression(
+            net_inventory_shares, max_inventory_shares
+        )
+
+        yes_q = None if suppress_yes else self._maybe_quote(
             yes_bid, size_shares, side_yes=True, fair_value=fair_value
         )
-        no_q = self._maybe_quote(
+        no_q = None if suppress_no else self._maybe_quote(
             no_bid, size_shares, side_yes=False, fair_value=fair_value
         )
         if yes_q is None and no_q is None:
+            # If suppression nuked the only viable side, that's intentional
+            # (we're capped and waiting for a reducing fill on the other
+            # side that isn't currently fillable) — not an error condition.
+            if suppress_yes or suppress_no:
+                raise NoQuoteError("inventory-capped; reducing side not viable")
             raise NoQuoteError("both sides outside valid price range")
         return (
             yes_q
@@ -191,6 +216,25 @@ class MakerQuotingStrategy:
                 reference_mid=1.0 - fair_value,
             ),
         )
+
+    def _inventory_suppression(
+        self, net_inventory_shares: float, max_inventory_shares: float
+    ) -> tuple[bool, bool]:
+        """Return (suppress_yes, suppress_no).
+
+        Beyond the soft limit we stop quoting the side that would grow the
+        position: long YES (net > 0) suppresses the YES bid; short YES
+        (net < 0, i.e. long NO) suppresses the NO bid. The reducing side
+        keeps quoting so fills flatten us toward zero.
+        """
+        if max_inventory_shares <= 0:
+            return False, False
+        soft = self._config.inventory_soft_limit_ratio * max_inventory_shares
+        if net_inventory_shares >= soft:
+            return True, False   # heavy long YES → stop buying YES
+        if net_inventory_shares <= -soft:
+            return False, True   # heavy short YES (long NO) → stop buying NO
+        return False, False
 
     @staticmethod
     def _maybe_quote(

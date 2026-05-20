@@ -636,10 +636,15 @@ class MakerOrchestrator:
             self._paper_fill_sweep(state, snapshot.orderbook.mid_price)
         state.last_mid = snapshot.orderbook.mid_price
 
-        # Pre-flight: would this fill push us past the cap on either side?
-        # If yes, force flatten-only mode by skipping new quotes.
         size = self._cfg.target_size_shares
         inv = state.inventory
+
+        # Observability only: note when we're over the soft inventory limit.
+        # We no longer hard-return here — that froze BOTH sides and held the
+        # adverse position to expiry (the 97%-inventory_limit stall). Instead
+        # we pass net/cap into sync_quotes so the strategy suppresses only the
+        # side that would grow the position and keeps quoting the reducing
+        # side, letting fills flatten us.
         if abs(inv.net_yes_shares) >= self._cfg.max_inventory_per_side:
             emit_decision(
                 cycle_id=f"maker-{int(time.time())}",
@@ -651,7 +656,6 @@ class MakerOrchestrator:
                 fair_value=fair,
                 extra={"net_inventory": inv.net_yes_shares},
             )
-            return
 
         # Use a fee rate fetched live when in live mode; default to crypto
         # taker theta in paper mode (no network call).
@@ -669,6 +673,8 @@ class MakerOrchestrator:
             time_remaining_s=t_rem,
             inventory_skew_cents=inv.skew_cents() * 100.0,
             size_shares=size,
+            net_inventory_shares=inv.net_yes_shares,
+            max_inventory_shares=self._cfg.max_inventory_per_side,
         )
 
         # Flatten window: turn inventory into either a directional bet or

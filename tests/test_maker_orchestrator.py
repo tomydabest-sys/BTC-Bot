@@ -401,3 +401,48 @@ async def test_mixed_tz_does_not_throw_or_poison_validation_gate(
         )
     finally:
         await orch.stop()
+
+
+@pytest.mark.asyncio
+async def test_inventory_bounded_at_soft_limit_in_crash(market_5m, maker_cfg):
+    """Regression for one-sided accumulation: in a crashing market the
+    maker must stop adding to the heavy side at the soft inventory limit
+    (0.5 x cap) instead of running to the hard cap. Previously it filled
+    YES all the way down and froze at the cap (97% inventory_limit)."""
+    import itertools
+
+    # Small cap so the test is quick: soft = 0.5 * 40 = 20 shares.
+    cfg = maker_cfg.model_copy(update={
+        "max_inventory_per_side": 40.0,
+        "target_size_shares": 5.0,
+    })
+    markets = {market_5m.id: market_5m}
+    scanner = _FakeScanner(markets)
+    pipeline_inner = _FakePipeline()
+    pipeline = _PipelineProxy(pipeline_inner, markets)
+    feed = _FakeFeed(start_price=95_000.0)
+
+    orch = MakerOrchestrator(
+        maker_cfg=cfg, scanner=scanner, pipeline=pipeline,
+        exchange_feed=feed, is_paper=True, client=None, telegram=None,
+    )
+    # Crash the mid downward so YES bids keep getting filled adversely.
+    mids = itertools.cycle([0.50, 0.42, 0.34, 0.26, 0.18, 0.12, 0.08, 0.06])
+    await orch.start()
+    try:
+        peak = 0.0
+        for _ in range(25):
+            pipeline_inner.set_mid(market_5m.id, next(mids))
+            await asyncio.sleep(0.15)
+            st = orch.markets.get(market_5m.id)
+            if st is not None:
+                peak = max(peak, abs(st.inventory.net_yes_shares))
+        # Must NOT run to the hard cap (40). Soft limit is 20; allow one
+        # extra fill of slack (suppression triggers AT the soft limit, so a
+        # fill in flight can push slightly past it).
+        assert peak <= 20.0 + cfg.target_size_shares + 1e-6, (
+            f"inventory ran past the soft limit: peak={peak}"
+        )
+        assert peak >= 5.0, f"expected some accumulation, got peak={peak}"
+    finally:
+        await orch.stop()

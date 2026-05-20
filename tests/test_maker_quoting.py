@@ -136,3 +136,53 @@ def test_fee_at_price_matches_brief_math():
     assert abs(2 * fee_at_price(0.5, 0.072) - 0.036) < 1e-9
     # Asymmetric prices: fee scales with p(1-p)
     assert fee_at_price(0.10, 0.072) < fee_at_price(0.50, 0.072)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Inventory-aware one-sided quoting — stops catching the falling knife
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_heavy_long_yes_suppresses_yes_bid_keeps_no():
+    """Past the soft limit while long YES, the YES bid (which would add to
+    the position) is dropped; the NO bid (which reduces it) keeps quoting."""
+    strat = MakerQuotingStrategy(MakerQuotingConfig(inventory_soft_limit_ratio=0.5))
+    yes_q, no_q = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.072, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5,
+        net_inventory_shares=150, max_inventory_shares=200,  # 0.75 > 0.5 soft
+    )
+    assert yes_q.size == 0.0, "YES side must be suppressed when heavy long YES"
+    assert no_q.size > 0.0, "NO side (reducing) must keep quoting"
+
+
+def test_heavy_short_yes_suppresses_no_bid_keeps_yes():
+    strat = MakerQuotingStrategy(MakerQuotingConfig(inventory_soft_limit_ratio=0.5))
+    yes_q, no_q = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.072, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5,
+        net_inventory_shares=-150, max_inventory_shares=200,
+    )
+    assert no_q.size == 0.0, "NO side must be suppressed when heavy short YES"
+    assert yes_q.size > 0.0, "YES side (reducing) must keep quoting"
+
+
+def test_within_soft_limit_quotes_both_sides():
+    strat = MakerQuotingStrategy(MakerQuotingConfig(inventory_soft_limit_ratio=0.5))
+    yes_q, no_q = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.072, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5,
+        net_inventory_shares=50, max_inventory_shares=200,  # 0.25 < 0.5
+    )
+    assert yes_q.size > 0.0 and no_q.size > 0.0
+
+
+def test_no_cap_means_no_suppression():
+    """max_inventory_shares=0 (default) disables suppression entirely."""
+    strat = MakerQuotingStrategy(MakerQuotingConfig())
+    yes_q, no_q = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.072, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5,
+        net_inventory_shares=10_000, max_inventory_shares=0,
+    )
+    assert yes_q.size > 0.0 and no_q.size > 0.0
