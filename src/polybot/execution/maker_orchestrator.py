@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -215,6 +216,8 @@ class _MarketState:
     round_trip_tracker: _RoundTripTracker = field(
         default_factory=_RoundTripTracker
     )
+    # Rolling (monotonic_ts, fair_value) samples for the trend filter.
+    fair_history: deque = field(default_factory=lambda: deque(maxlen=600))
 
 
 @dataclass
@@ -631,6 +634,11 @@ class MakerOrchestrator:
             else snapshot.orderbook.mid_price
         )
 
+        # Trend filter input: project the recent fair-value drift over the
+        # quote lifetime. Persistence assumption — if fair fell X over the
+        # last `lifetime` seconds, expect ~X more over the next one.
+        trend_drift = self._projected_fair_drift(state, fair)
+
         # Paper-mode fill simulation: cross check against mid moves.
         if self._is_paper:
             self._paper_fill_sweep(state, snapshot.orderbook.mid_price)
@@ -675,6 +683,7 @@ class MakerOrchestrator:
             size_shares=size,
             net_inventory_shares=inv.net_yes_shares,
             max_inventory_shares=self._cfg.max_inventory_per_side,
+            trend_drift=trend_drift,
         )
 
         # Flatten window: turn inventory into either a directional bet or
@@ -708,6 +717,31 @@ class MakerOrchestrator:
         self._loop_uptime_total += 1.0
         if isinstance(result, dict) and result.get("action") == "synced":
             self._loop_synced_total += 1.0
+
+    def _projected_fair_drift(self, state: _MarketState, fair: float) -> float:
+        """Project recent fair-value drift over the quote lifetime.
+
+        Records a (ts, fair) sample, measures the net move over the trailing
+        `max_quote_lifetime_s` window, and projects it forward one lifetime
+        (persistence). Returns 0 until enough history accumulates so the
+        filter doesn't fire on startup noise. Negative = fair falling.
+        """
+        now = time.monotonic()
+        hist = state.fair_history
+        hist.append((now, fair))
+        window = max(1.0, float(self._cfg.max_quote_lifetime_s))
+        cutoff = now - window
+        while len(hist) > 1 and hist[0][0] < cutoff:
+            hist.popleft()
+        if len(hist) < 2:
+            return 0.0
+        oldest_ts, oldest_fair = hist[0]
+        elapsed = now - oldest_ts
+        # Require a meaningful baseline before trusting a drift estimate.
+        if elapsed < min(window * 0.5, 10.0):
+            return 0.0
+        drift_rate = (fair - oldest_fair) / elapsed
+        return drift_rate * window
 
     # ─────────────────────────────────────────────────────────────────
     #  Paper-mode fill simulation

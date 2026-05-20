@@ -446,3 +446,68 @@ async def test_inventory_bounded_at_soft_limit_in_crash(market_5m, maker_cfg):
         assert peak >= 5.0, f"expected some accumulation, got peak={peak}"
     finally:
         await orch.stop()
+
+
+def test_projected_fair_drift_detects_downtrend(market_5m, maker_cfg):
+    """The orchestrator must turn a falling fair-value history into a
+    negative projected drift (which compute_quotes uses to pull the YES
+    bid). Deterministic: we pre-seed the history with an explicit old
+    timestamp so we don't depend on async timing."""
+    import time
+
+    from polybot.execution.maker_orchestrator import _MarketState
+    from polybot.execution.quote_manager import QuoteManager
+    from polybot.positions.inventory import InventoryManager
+    from polybot.strategies.maker_quoting import (
+        MakerQuotingConfig,
+        MakerQuotingStrategy,
+    )
+
+    cfg = maker_cfg.model_copy(update={"max_quote_lifetime_s": 30.0})
+    orch = MakerOrchestrator(
+        maker_cfg=cfg, scanner=_FakeScanner({}), pipeline=object(),
+        exchange_feed=_FakeFeed(), is_paper=True, client=None, telegram=None,
+    )
+    qm = QuoteManager(
+        market_id=market_5m.id, yes_token_id="y", no_token_id="n",
+        strategy=MakerQuotingStrategy(MakerQuotingConfig()),
+        client=None, is_paper=True,
+    )
+    state = _MarketState(
+        market=market_5m, quote_manager=qm,
+        inventory=InventoryManager(market_id=market_5m.id),
+    )
+    # Fair was 0.50 twenty seconds ago.
+    state.fair_history.append((time.monotonic() - 20.0, 0.50))
+    # Now it's 0.30 → drift_rate -0.01/s, projected over 30s ≈ -0.30.
+    drift = orch._projected_fair_drift(state, 0.30)
+    assert drift < 0, "falling fair must yield a negative projected drift"
+    assert drift == pytest.approx(-0.30, abs=0.05)
+
+
+def test_projected_fair_drift_returns_zero_without_baseline(market_5m, maker_cfg):
+    """No drift signal until enough history accumulates (no startup-noise
+    firing)."""
+    from polybot.execution.maker_orchestrator import _MarketState
+    from polybot.execution.quote_manager import QuoteManager
+    from polybot.positions.inventory import InventoryManager
+    from polybot.strategies.maker_quoting import (
+        MakerQuotingConfig,
+        MakerQuotingStrategy,
+    )
+
+    orch = MakerOrchestrator(
+        maker_cfg=maker_cfg, scanner=_FakeScanner({}), pipeline=object(),
+        exchange_feed=_FakeFeed(), is_paper=True, client=None, telegram=None,
+    )
+    qm = QuoteManager(
+        market_id=market_5m.id, yes_token_id="y", no_token_id="n",
+        strategy=MakerQuotingStrategy(MakerQuotingConfig()),
+        client=None, is_paper=True,
+    )
+    state = _MarketState(
+        market=market_5m, quote_manager=qm,
+        inventory=InventoryManager(market_id=market_5m.id),
+    )
+    # First sample → no baseline → zero.
+    assert orch._projected_fair_drift(state, 0.50) == 0.0

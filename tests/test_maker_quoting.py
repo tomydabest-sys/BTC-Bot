@@ -186,3 +186,82 @@ def test_no_cap_means_no_suppression():
         net_inventory_shares=10_000, max_inventory_shares=0,
     )
     assert yes_q.size > 0.0 and no_q.size > 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Vol-scaled trend filter — pulls the side the trend is running over
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_downtrend_widens_then_suppresses_yes_bid():
+    """Fair falling (-drift) picks off the YES bid. A small drift widens it
+    (lower bid); a drift past half-spread pulls it entirely."""
+    strat = MakerQuotingStrategy(MakerQuotingConfig(
+        min_half_spread_cents=2.0, adverse_selection_buffer_cents=0.0,
+        trend_suppress_ratio=1.0,
+    ))
+    base_yes, base_no = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.0, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5, trend_drift=0.0,
+    )
+    # Small downward drift (1c) < half-spread (2c) → YES bid widened lower.
+    small_yes, small_no = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.0, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5, trend_drift=-0.01,
+    )
+    assert small_yes.price < base_yes.price, "down-drift must lower the YES bid"
+    assert small_no.price == base_no.price, "NO side unaffected by down-drift"
+
+    # Strong downward drift (3c) >= half-spread (2c) → YES bid suppressed.
+    strong_yes, strong_no = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.0, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5, trend_drift=-0.03,
+    )
+    assert strong_yes.size == 0.0, "strong down-trend must pull the YES bid"
+    assert strong_no.size > 0.0, "NO side keeps quoting in a down-trend"
+
+
+def test_uptrend_suppresses_no_bid():
+    strat = MakerQuotingStrategy(MakerQuotingConfig(
+        min_half_spread_cents=2.0, adverse_selection_buffer_cents=0.0,
+        trend_suppress_ratio=1.0,
+    ))
+    yes_q, no_q = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.0, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5, trend_drift=0.03,
+    )
+    assert no_q.size == 0.0, "strong up-trend must pull the NO bid"
+    assert yes_q.size > 0.0, "YES side keeps quoting in an up-trend"
+
+
+def test_trend_trip_point_scales_with_half_spread():
+    """The suppression trip point is trend_suppress_ratio x half-spread, and
+    half-spread grows with vol — so the same drift is tolerated in high vol
+    but pulls the quote in calm vol (the vol-scaling property)."""
+    # adverse_selection_buffer makes half-spread vol-sensitive.
+    strat = MakerQuotingStrategy(MakerQuotingConfig(
+        min_half_spread_cents=1.0, adverse_selection_buffer_cents=4.0,
+        reference_annual_vol=0.45, trend_suppress_ratio=1.0,
+    ))
+    drift = -0.04
+    # Calm vol → small half-spread → drift trips suppression.
+    calm_yes, _ = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.0, vol_annual=0.10,
+        time_remaining_s=120, size_shares=5, trend_drift=drift,
+    )
+    # High vol → wider half-spread → same drift tolerated (still quotes).
+    wild_yes, _ = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.0, vol_annual=1.10,
+        time_remaining_s=120, size_shares=5, trend_drift=drift,
+    )
+    assert calm_yes.size == 0.0, "calm vol: tight spread → drift pulls YES bid"
+    assert wild_yes.size > 0.0, "high vol: wide spread absorbs the same drift"
+
+
+def test_no_trend_drift_leaves_quotes_symmetric():
+    strat = MakerQuotingStrategy(MakerQuotingConfig())
+    yes_q, no_q = strat.compute_quotes(
+        fair_value=0.50, fee_rate=0.072, vol_annual=0.45,
+        time_remaining_s=120, size_shares=5, trend_drift=0.0,
+    )
+    assert yes_q.size > 0.0 and no_q.size > 0.0
