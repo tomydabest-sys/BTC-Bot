@@ -416,6 +416,11 @@ async def serve_dashboard() -> HTMLResponse:
         return HTMLResponse(
             content=content,
             media_type="text/html; charset=utf-8",
+            # The JS is inlined in this document. Without no-store the browser
+            # can serve a stale copy after a code update (e.g. switching
+            # branches), and the old JS throws on the new API payloads —
+            # which silently bricks the refresh loop and hides tabs.
+            headers={"Cache-Control": "no-store, must-revalidate"},
         )
     return HTMLResponse(
         content="<h1>Dashboard frontend not found</h1>",

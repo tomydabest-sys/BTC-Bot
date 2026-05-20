@@ -257,3 +257,128 @@ def test_seconds_until_next_utc_midnight_is_positive():
     assert MakerOrchestrator._seconds_until_next_utc_midnight(just_past_midnight) == (
         86400.0 - 5.0
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Realistic paper P&L — naked inventory must book its real loss
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_falling_knife_inventory_books_loss_on_close():
+    """Buying YES all the way down a crashing mid, then closing at the low,
+    must realize a LOSS — not vanish. This is the bug that produced the
+    fake +13%/15min paper P&L: naked accumulation was never marked out."""
+    from polybot.execution.maker_orchestrator import _RoundTripTracker
+
+    tracker = _RoundTripTracker(fee_theta=0.0)
+    # YES bids filled on every downtick as the market crashes toward 0.
+    tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.40)
+    tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.20)
+    tracker.on_fill(side_yes=True, is_buy=True, shares=10, price=0.05)
+    # avg entry = (0.40 + 0.20 + 0.05) / 3 = 0.2167 over 30 shares
+    assert tracker.net_signed_inventory == pytest.approx(30.0)
+    assert tracker.avg_entry_yes == pytest.approx((0.40 + 0.20 + 0.05) / 3, abs=1e-6)
+
+    # Market resolves "Down" → YES settles near 0. Realize at 0.01.
+    rt = tracker.realize_remaining(exit_price_yes=0.01)
+    assert rt is not None
+    expected = (0.01 - (0.40 + 0.20 + 0.05) / 3) * 30  # strongly negative
+    assert rt.gross_pnl_usd == pytest.approx(expected, abs=1e-6)
+    assert rt.gross_pnl_usd < -6.0, "falling-knife close must be a real loss"
+    # Position is flat afterwards.
+    assert tracker.open_lot_count == 0
+    assert tracker.realize_remaining(exit_price_yes=0.01) is None
+
+
+def test_realize_remaining_none_when_flat():
+    from polybot.execution.maker_orchestrator import _RoundTripTracker
+
+    tracker = _RoundTripTracker()
+    assert tracker.realize_remaining(exit_price_yes=0.5) is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_books_loss_when_market_rolls_off(tmp_path):
+    """Integration: a market that accumulates long YES and then rolls off
+    the scanner must realize the position's loss onto the validation gate
+    (previously the state was dropped and the P&L disappeared)."""
+    from datetime import UTC, datetime, timedelta
+
+    from polybot.config import MakerConfig
+    from polybot.data.exchange_feed import PriceFeedState
+    from polybot.data.models import Market
+    from polybot.execution.maker_orchestrator import (
+        MakerOrchestrator,
+        _MarketState,
+    )
+    from polybot.execution.quote_manager import QuoteManager
+    from polybot.monitoring.paper_validation import PaperValidationGate
+    from polybot.positions.inventory import InventoryManager
+    from polybot.strategies.maker_quoting import (
+        MakerQuotingConfig,
+        MakerQuotingStrategy,
+    )
+
+    class _Scanner:
+        def __init__(self):
+            self.active_markets = {}
+
+    class _Feed:
+        def __init__(self):
+            self._s = PriceFeedState()
+            self._s.push(95000.0)
+
+        @property
+        def last_price(self):
+            return self._s.last_price
+
+        @property
+        def feed_age_s(self):
+            return 0.0
+
+    gate = PaperValidationGate(
+        state_path=str(tmp_path / "v.json"), starting_equity_usd=500.0
+    )
+    cfg = MakerConfig(enabled=True, primary_markets=["btc-5m"])
+    orch = MakerOrchestrator(
+        maker_cfg=cfg,
+        scanner=_Scanner(),
+        pipeline=object(),
+        exchange_feed=_Feed(),
+        is_paper=True,
+        client=None,
+        telegram=None,
+        validation_gate=gate,
+    )
+
+    market = Market(
+        id="m-roll",
+        question="Bitcoin Up or Down?",
+        slug="btc-updown-5m-1",
+        outcomes=["Up", "Down"],
+        token_ids=["y", "n"],
+        end_date=datetime.now(UTC) + timedelta(minutes=4),
+        category="crypto",
+        active=True,
+    )
+    qm = QuoteManager(
+        market_id=market.id, yes_token_id="y", no_token_id="n",
+        strategy=MakerQuotingStrategy(MakerQuotingConfig()),
+        client=None, is_paper=True,
+    )
+    state = _MarketState(
+        market=market, quote_manager=qm,
+        inventory=InventoryManager(market_id=market.id),
+        last_mid=0.02,  # crashed
+    )
+    # Accumulate long YES bought high.
+    state.round_trip_tracker.on_fill(side_yes=True, is_buy=True, shares=30, price=0.40)
+    orch._states[market.id] = state
+
+    # Scanner now has no eligible markets → state rolls off and must book loss.
+    await orch._maintain_states()
+
+    assert market.id not in orch._states
+    assert gate.state.trade_count == 1
+    # Bought 30 @ 0.40, realized at 0.02 → ~ -$11.4 gross.
+    assert gate.state.gross_pnl_usd < -10.0
