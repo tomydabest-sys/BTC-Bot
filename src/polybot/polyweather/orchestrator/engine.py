@@ -82,6 +82,46 @@ class EngineMetrics:
 
 
 @dataclass
+class OpenPaperPosition:
+    """An open paper position held until ``closes_at``.
+
+    The ``_final_outcome`` is sampled once at open time from ``p_realised``,
+    then ``current_price`` walks from ``entry_price`` toward that outcome
+    over the holding window. Mark-to-market unrealised P&L is reported each
+    cycle; realised P&L only lands at settlement.
+    """
+
+    market_id: str
+    event_id: str
+    strategy: str
+    station: str
+    city: str
+    side: str
+    outcome: str
+    token_id: str
+    entry_price: Decimal
+    current_price: Decimal
+    size_tokens: Decimal
+    size_usdc: Decimal
+    p_model: float
+    p_realised: float
+    bucket_low: float
+    bucket_high: float
+    horizon_hours: float
+    opened_at: float
+    closes_at: float
+    rebate_usdc: Decimal
+    final_outcome: int
+    fill_latency_seconds: float
+
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        return ((self.current_price - self.entry_price) * self.size_tokens).quantize(
+            Decimal("0.0001")
+        )
+
+
+@dataclass
 class EngineConfig:
     mode: str = "paper"
     use_mock: bool = True
@@ -94,12 +134,17 @@ class EngineConfig:
     target_cities: list[dict[str, Any]] = field(default_factory=list)
     bankroll_cap_usdc: Decimal | None = None
     first_24h_position_cap_usdc: Decimal = Decimal("5")
-    # Pacing: at most one new trade per event per cycle, and at most one trade
-    # per bucket within ``bucket_cooldown_seconds``. Stops the engine from
-    # firing the same signal every 5s and gives the dashboard a realistic
-    # cadence even in mock mode.
+    # Pacing: only ``max_signals_per_cycle`` new positions open per cycle,
+    # and the same bucket can't trade within ``bucket_cooldown_seconds`` of a
+    # previous fill. Positions then sit OPEN for ``position_horizon_seconds``
+    # in mock mode (simulating the time to market resolution) before they
+    # settle to their binary outcome — giving the dashboard a smooth
+    # mark-to-market curve instead of instant binary jumps.
     max_signals_per_event_per_cycle: int = 1
-    bucket_cooldown_seconds: float = 300.0  # 5 min
+    max_signals_per_cycle: int = 1
+    bucket_cooldown_seconds: float = 300.0
+    position_horizon_seconds: float = 60.0
+    mtm_noise_pct: float = 0.03
 
     @classmethod
     def from_files(
@@ -179,7 +224,8 @@ class PolyWeatherEngine:
         self.blender = EnsembleBlender()
         self._rng = random.Random(20260615)
         self._stop = asyncio.Event()
-        self._open_paper_positions: list[dict[str, Any]] = []
+        # OPEN positions held until settlement — exposed to the dashboard
+        self._open_positions: list[OpenPaperPosition] = []
         # market_id → last fill timestamp; honoured by ``_bucket_in_cooldown``
         self._last_fill_ts: dict[str, float] = {}
         # Inject a deterministic equity tick at startup so the dashboard
@@ -187,6 +233,17 @@ class PolyWeatherEngine:
         self.store.record_equity(
             self.risk.state.current_bankroll, Decimal("0"), Decimal("0")
         )
+
+    @property
+    def open_positions(self) -> list[OpenPaperPosition]:
+        return list(self._open_positions)
+
+    @property
+    def unrealized_pnl_usdc(self) -> Decimal:
+        return sum(
+            (p.unrealized_pnl for p in self._open_positions),
+            start=Decimal("0"),
+        ).quantize(Decimal("0.0001"))
 
     @property
     def is_mock(self) -> bool:
@@ -223,6 +280,14 @@ class PolyWeatherEngine:
         self.metrics.cycles += 1
         self.metrics.last_cycle_at = time.time()
         cycle_id = f"{self.metrics.cycles:05d}"
+
+        # 1. Mark-to-market existing open positions; settle any whose horizon
+        #    has elapsed. New realised P&L is recorded here.
+        self._settle_open_positions(cycle_id)
+
+        # 2. Pull markets and look for new opportunities — but cap how many
+        #    new positions we open per cycle so the equity curve builds up
+        #    smoothly from $0 P&L rather than jumping by $400 instantly.
         try:
             events = await self.gamma.list_active_weather_markets()
         except Exception as exc:  # noqa: BLE001
@@ -230,7 +295,10 @@ class PolyWeatherEngine:
             self.metrics.last_error = str(exc)
             return
 
+        self._cycle_signal_budget = self.config.max_signals_per_cycle
         for event in events:
+            if self._cycle_signal_budget <= 0:
+                break
             station = self.station_resolver.resolve(event.id, event.rules)
             if station is None:
                 self.store.record_decision(
@@ -243,8 +311,13 @@ class PolyWeatherEngine:
                 continue
             await self._evaluate_event(cycle_id, event, station)
 
+        # 3. Equity tick — bankroll INCLUDING unrealised so the curve isn't
+        #    flat while positions are open.
+        marked_equity = (
+            self.risk.state.current_bankroll + self.unrealized_pnl_usdc
+        ).quantize(Decimal("0.0001"))
         self.store.record_equity(
-            self.risk.state.current_bankroll,
+            marked_equity,
             self.risk.state.daily_pnl,
             self.risk.state.open_exposure,
         )
@@ -346,6 +419,8 @@ class PolyWeatherEngine:
         for edge_bps, sig, p_real in candidates:
             if fired >= self.config.max_signals_per_event_per_cycle:
                 break
+            if self._cycle_signal_budget <= 0:
+                break
             if sig.market_id in fired_market_ids:
                 continue
             # Pre-flight sizing: if it would round to 0 we skip silently rather
@@ -361,6 +436,7 @@ class PolyWeatherEngine:
             await self._handle_signal(cycle_id, event, station, sig, p_realised=p_real)
             fired_market_ids.add(sig.market_id)
             fired += 1
+            self._cycle_signal_budget -= 1
 
     # ─── signal handling ─────────────────────────────────────────────
 
@@ -441,52 +517,43 @@ class PolyWeatherEngine:
             )
             return
 
-        # Simulate fill + resolution in paper mode
+        # OPEN the position. Settlement happens later in
+        # ``_settle_open_positions`` when the holding horizon elapses.
         self.risk.record_open(size_usdc)
-        outcome = 1 if self._rng.random() < p_realised else 0
-        if outcome == 1:
-            exit_price = Decimal("1.00")
-        else:
-            exit_price = Decimal("0.00")
-        realised_pnl = (exit_price - target_price) * size_tokens
-        # Maker rebate: tiny positive on every fill (modeled at 5 bps notional)
+        final_outcome = 1 if self._rng.random() < p_realised else 0
         rebate = (size_usdc * Decimal("0.0005")).quantize(Decimal("0.0001"))
-        realised_pnl = (realised_pnl + rebate).quantize(Decimal("0.0001"))
-
-        trade = TradePair(
+        now = time.time()
+        position = OpenPaperPosition(
             market_id=signal.market_id,
             event_id=event.id,
             strategy=signal.strategy,
             station=station.icao,
             city=station.city,
             side=signal.direction.value,
+            outcome=signal.outcome,
+            token_id=meta.get("token_id", ""),
             entry_price=target_price,
-            exit_price=exit_price,
-            size=size_tokens,
-            fees_usdc=Decimal("0"),
-            rebates_usdc=rebate,
-            realised_pnl_usdc=realised_pnl,
-            opened_at=time.time(),
-            closed_at=time.time() + 1.0,
+            current_price=target_price,
+            size_tokens=size_tokens,
+            size_usdc=size_usdc,
+            p_model=p_model,
+            p_realised=p_realised,
+            bucket_low=float(meta.get("bucket_low", 0)),
+            bucket_high=float(meta.get("bucket_high", 0)),
+            horizon_hours=float(meta.get("horizon_hours", 0)),
+            opened_at=now,
+            closes_at=now + self.config.position_horizon_seconds,
+            rebate_usdc=rebate,
+            final_outcome=final_outcome,
             fill_latency_seconds=0.5 + self._rng.random() * 2.0,
-            model_probability=p_model,
-            realised_outcome=outcome,
-            used_dynamic_fee=True,
-            cap_violation=size_usdc > self.risk.weather_position_cap_usdc(),
-            metadata={
-                "edge_bps": float(meta.get("edge_bps", 0.0)),
-                "horizon_hours": float(meta.get("horizon_hours", 0.0)),
-                "model_contributions": meta.get("model_contributions", {}),
-            },
         )
-        self.store.record_trade(trade)
-        self.risk.record_close(size_usdc, realised_pnl)
-        self.metrics.fills_total += 1
+        self._open_positions.append(position)
+        self.metrics.fills_total += 1  # treat OPEN as the fill event
         self.metrics.fills_by_strategy[signal.strategy] = (
             self.metrics.fills_by_strategy.get(signal.strategy, 0) + 1
         )
         # Cool the bucket so the same market isn't retraded next cycle.
-        self._last_fill_ts[signal.market_id] = time.time()
+        self._last_fill_ts[signal.market_id] = now
 
         self.store.record_decision(
             cycle_id=cycle_id,
@@ -494,7 +561,7 @@ class PolyWeatherEngine:
             market_id=signal.market_id,
             station=station.icao,
             city=station.city,
-            decision="EXECUTED",
+            decision="OPENED",
             reason=signal.reason,
             mid=float(target_price),
             confidence=signal.confidence,
@@ -503,8 +570,95 @@ class PolyWeatherEngine:
             bucket_low=float(meta.get("bucket_low", 0)),
             bucket_high=float(meta.get("bucket_high", 0)),
             forecast_horizon_hours=float(meta.get("horizon_hours", 0)),
-            extra={"size_usdc": str(size_usdc), "pnl_usdc": str(realised_pnl)},
+            extra={"size_usdc": str(size_usdc), "size_tokens": str(size_tokens)},
         )
+
+    # ─── settlement of held positions ────────────────────────────────
+
+    def _settle_open_positions(self, cycle_id: str) -> None:
+        """Mark every open position to market; settle expired ones.
+
+        Mark-to-market = linear interp from entry_price → final_outcome over
+        the holding window plus a small noise term that decays toward zero
+        as we approach settlement. Realised P&L only lands when ``now >=
+        closes_at``; until then the position contributes via
+        ``unrealized_pnl_usdc``.
+        """
+        if not self._open_positions:
+            return
+        now = time.time()
+        still_open: list[OpenPaperPosition] = []
+        for pos in self._open_positions:
+            elapsed = max(0.0, now - pos.opened_at)
+            window = max(0.001, pos.closes_at - pos.opened_at)
+            progress = min(1.0, elapsed / window)
+            target = Decimal("1.00") if pos.final_outcome == 1 else Decimal("0.00")
+            # Path: entry → target with shrinking noise
+            noise_scale = self.config.mtm_noise_pct * (1.0 - progress)
+            noise = Decimal(str((self._rng.random() - 0.5) * noise_scale * 2))
+            drift = (target - pos.entry_price) * Decimal(str(progress))
+            mark = pos.entry_price + drift + noise
+            # Clamp to a sensible range
+            if mark < Decimal("0.001"):
+                mark = Decimal("0.001")
+            elif mark > Decimal("0.999"):
+                mark = Decimal("0.999")
+            pos.current_price = mark.quantize(Decimal("0.0001"))
+
+            if now < pos.closes_at:
+                still_open.append(pos)
+                continue
+
+            # Settlement
+            exit_price = target
+            realised_pnl = (exit_price - pos.entry_price) * pos.size_tokens
+            realised_pnl = (realised_pnl + pos.rebate_usdc).quantize(Decimal("0.0001"))
+            trade = TradePair(
+                market_id=pos.market_id,
+                event_id=pos.event_id,
+                strategy=pos.strategy,
+                station=pos.station,
+                city=pos.city,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                size=pos.size_tokens,
+                fees_usdc=Decimal("0"),
+                rebates_usdc=pos.rebate_usdc,
+                realised_pnl_usdc=realised_pnl,
+                opened_at=pos.opened_at,
+                closed_at=now,
+                fill_latency_seconds=pos.fill_latency_seconds,
+                model_probability=pos.p_model,
+                realised_outcome=pos.final_outcome,
+                used_dynamic_fee=True,
+                cap_violation=pos.size_usdc > self.risk.weather_position_cap_usdc(),
+                metadata={
+                    "bucket_low": pos.bucket_low,
+                    "bucket_high": pos.bucket_high,
+                    "horizon_hours": pos.horizon_hours,
+                },
+            )
+            self.store.record_trade(trade)
+            self.risk.record_close(pos.size_usdc, realised_pnl)
+            self.store.record_decision(
+                cycle_id=cycle_id,
+                strategy=pos.strategy,
+                market_id=pos.market_id,
+                station=pos.station,
+                city=pos.city,
+                decision="SETTLED",
+                reason=f"horizon_elapsed outcome={pos.final_outcome}",
+                mid=float(exit_price),
+                confidence=None,
+                edge_bps=None,
+                model_probability=pos.p_model,
+                bucket_low=pos.bucket_low,
+                bucket_high=pos.bucket_high,
+                forecast_horizon_hours=pos.horizon_hours,
+                extra={"pnl_usdc": str(realised_pnl), "size_usdc": str(pos.size_usdc)},
+            )
+        self._open_positions = still_open
 
 
 def _parse_iso(s: str) -> datetime:

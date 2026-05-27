@@ -38,7 +38,13 @@ def engine_factory(tmp_path: Path, resolver):
     from polybot.polyweather.orchestrator.engine import EngineConfig, PolyWeatherEngine
     from polybot.polyweather.persistence.store import PolyWeatherStore
 
-    def _factory(duration: float = 2.0, cycle: float = 0.5):
+    def _factory(
+        duration: float = 2.0,
+        cycle: float = 0.5,
+        position_horizon: float = 0.2,
+        bucket_cooldown: float = 0.05,
+        max_signals_per_cycle: int = 5,
+    ):
         cfg = EngineConfig.from_files(
             risk_yaml=REPO_ROOT / "config" / "polyweather" / "risk.yaml",
             markets_yaml=REPO_ROOT / "config" / "polyweather" / "markets.yaml",
@@ -48,6 +54,9 @@ def engine_factory(tmp_path: Path, resolver):
             cycle_seconds=cycle,
             duration_seconds=duration,
         )
+        cfg.position_horizon_seconds = position_horizon
+        cfg.bucket_cooldown_seconds = bucket_cooldown
+        cfg.max_signals_per_cycle = max_signals_per_cycle
         store = PolyWeatherStore(tmp_path / "paper.sqlite")
         engine = PolyWeatherEngine(cfg, store=store, station_resolver=resolver)
         return engine, store
