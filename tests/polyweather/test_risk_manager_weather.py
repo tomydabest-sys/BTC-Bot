@@ -77,3 +77,46 @@ def test_kelly_size_capped_at_1pct_bankroll() -> None:
     mgr = _mgr()
     sized = mgr.quarter_kelly_size(p_win=0.95, target_price=Decimal("0.10"))
     assert sized <= mgr.weather_position_cap_usdc()
+
+
+def test_consecutive_loss_pause_auto_recovers() -> None:
+    """30-min pause (or shorter, configurable) should auto-clear."""
+    cfg = WeatherRiskConfig(consecutive_loss_pause_seconds=0.1)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.consecutive_losses = 5
+    halted, _ = mgr.check_kill_switch()
+    assert halted
+    # Simulate the pause window having already elapsed
+    mgr.state.halt_started_ts = time.time() - 1.0
+    halted2, _ = mgr.check_kill_switch()
+    assert not halted2
+    assert mgr.state.consecutive_losses == 0
+
+
+def test_ath_drawdown_kill_is_permanent() -> None:
+    """ATH drawdown latches; cannot be cleared by time alone."""
+    mgr = _mgr()
+    mgr.state.ath_bankroll = Decimal("1000")
+    mgr.state.current_bankroll = Decimal("795")
+    halted, _ = mgr.check_kill_switch()
+    assert halted
+    assert mgr.state.ath_killed
+    # Even after a long fake window, ATH kill stays.
+    mgr.state.halt_started_ts = time.time() - 10000.0
+    halted2, _ = mgr.check_kill_switch()
+    assert halted2
+    # Manual reset clears it.
+    mgr.reset_ath_kill()
+    assert not mgr.state.ath_killed
+
+
+def test_daily_loss_cooldown_auto_recovers() -> None:
+    cfg = WeatherRiskConfig(daily_loss_cooldown_seconds=0.1)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.daily_pnl = Decimal("-60")
+    halted, _ = mgr.check_kill_switch()
+    assert halted
+    mgr.state.halt_started_ts = time.time() - 1.0
+    halted2, _ = mgr.check_kill_switch()
+    assert not halted2
+    assert mgr.state.daily_pnl == Decimal("0")
