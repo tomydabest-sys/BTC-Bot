@@ -1,0 +1,73 @@
+# Hand-curated catalog mapping cities to canonical ICAO/airport stations.
+# The station_resolver consults this when parsing market rules text.
+stations:
+  KLGA:
+    city: "New York"
+    aliases: ["LaGuardia", "LaGuardia Airport", "New York LaGuardia", "NYC LGA", "Central Park", "New York City - Central Park"]
+    lat: 40.7769
+    lon: -73.8740
+    source: "NWS"
+    country: "US"
+  KORD:
+    city: "Chicago"
+    aliases: ["O'Hare", "O Hare", "Chicago O'Hare", "Chicago OHare"]
+    lat: 41.9742
+    lon: -87.9073
+    source: "NWS"
+    country: "US"
+  KDAL:
+    city: "Dallas"
+    aliases: ["Dallas Love Field", "Love Field"]
+    lat: 32.8471
+    lon: -96.8517
+    source: "NWS"
+    country: "US"
+  KATL:
+    city: "Atlanta"
+    aliases: ["Atlanta Hartsfield", "Hartsfield-Jackson", "ATL airport"]
+    lat: 33.6407
+    lon: -84.4277
+    source: "NWS"
+    country: "US"
+  KMIA:
+    city: "Miami"
+    aliases: ["Miami International", "Miami Intl"]
+    lat: 25.7959
+    lon: -80.2870
+    source: "NWS"
+    country: "US"
+  KLAX:
+    city: "Los Angeles"
+    aliases: ["LAX", "Los Angeles International"]
+    lat: 33.9416
+    lon: -118.4085
+    source: "NWS"
+    country: "US"
+  EGLC:
+    city: "London"
+    aliases: ["London City Airport", "London City", "London Heathrow", "Heathrow", "EGLL"]
+    lat: 51.5053
+    lon: 0.0553
+    source: "MetOffice"
+    country: "UK"
+  VHHH:
+    city: "Hong Kong"
+    aliases: ["Hong Kong International", "Chek Lap Kok", "HKG"]
+    lat: 22.3080
+    lon: 113.9185
+    source: "OpenMeteo"
+    country: "HK"
+  RKSI:
+    city: "Seoul"
+    aliases: ["Incheon", "Incheon International", "ICN"]
+    lat: 37.4602
+    lon: 126.4407
+    source: "OpenMeteo"
+    country: "KR"
+  LFPB:
+    city: "Paris"
+    aliases: ["Paris Le Bourget", "Le Bourget", "Paris Charles de Gaulle", "CDG", "LFPG"]
+    lat: 48.9694
+    lon: 2.4414
+    source: "OpenMeteo"
+    country: "FR"

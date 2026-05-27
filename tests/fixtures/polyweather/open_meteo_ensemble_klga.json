@@ -1,0 +1,25 @@
+{
+  "station": "KLGA",
+  "issued_at": "2026-06-14T12:00:00Z",
+  "deterministic_models": {
+    "ecmwf_ifs04": [
+      {"valid_time": "2026-06-15T18:00:00Z", "horizon_hours": 30, "predicted_temp_f": 75.0},
+      {"valid_time": "2026-06-16T18:00:00Z", "horizon_hours": 54, "predicted_temp_f": 77.5}
+    ],
+    "gfs_seamless": [
+      {"valid_time": "2026-06-15T18:00:00Z", "horizon_hours": 30, "predicted_temp_f": 74.8},
+      {"valid_time": "2026-06-16T18:00:00Z", "horizon_hours": 54, "predicted_temp_f": 77.2}
+    ],
+    "ukmo_seamless": [
+      {"valid_time": "2026-06-15T18:00:00Z", "horizon_hours": 30, "predicted_temp_f": 75.4},
+      {"valid_time": "2026-06-16T18:00:00Z", "horizon_hours": 54, "predicted_temp_f": 78.0}
+    ]
+  },
+  "ensemble": {
+    "gfs025": {
+      "valid_time": "2026-06-15T18:00:00Z",
+      "horizon_hours": 30,
+      "members": [74.2, 74.5, 74.8, 74.9, 75.0, 75.1, 75.1, 75.2, 75.2, 75.3, 75.3, 75.4, 75.4, 75.5, 75.5, 75.6, 75.6, 75.7, 75.8, 75.8, 75.9, 76.0, 76.0, 76.1, 76.2, 76.3, 76.5, 76.7, 76.9, 77.2, 77.5]
+    }
+  }
+}

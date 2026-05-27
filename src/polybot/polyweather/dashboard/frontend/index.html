@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PolyWeather-Bot Dashboard</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>PolyWeather-Bot</h1>
+  <div id="mode-banner" class="mode-banner mode-mock">MOCK</div>
+  <div id="heartbeat" class="heartbeat heartbeat-amber">heartbeat …</div>
+</header>
+
+<nav class="tabs">
+  <button class="tab tab-active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="per-city">Per-City Edge</button>
+  <button class="tab" data-tab="forecasts">Active Forecasts</button>
+  <button class="tab" data-tab="risk">Risk</button>
+  <button class="tab" data-tab="trades">Trade Log</button>
+  <button class="tab" data-tab="gate">Validation Gate</button>
+</nav>
+
+<main>
+  <section id="tab-overview" class="tab-panel tab-panel-active">
+    <div class="hero">
+      <div class="card"><div class="card-title">Bankroll</div><div class="card-value" id="hero-bankroll">—</div></div>
+      <div class="card"><div class="card-title">24h P&amp;L</div><div class="card-value" id="hero-pnl24">—</div></div>
+      <div class="card"><div class="card-title">7d P&amp;L</div><div class="card-value" id="hero-pnl7">—</div></div>
+      <div class="card"><div class="card-title">30d P&amp;L</div><div class="card-value" id="hero-pnl30">—</div></div>
+      <div class="card"><div class="card-title">Open Positions</div><div class="card-value" id="hero-open">—</div></div>
+      <div class="card"><div class="card-title">Open Exposure %</div><div class="card-value" id="hero-exposure">—</div></div>
+      <div class="card"><div class="card-title">Brier (30d)</div><div class="card-value" id="hero-brier">—</div></div>
+      <div class="card"><div class="card-title">Sharpe (30d)</div><div class="card-value" id="hero-sharpe">—</div></div>
+    </div>
+    <div class="chart-row">
+      <div class="chart-card"><h3>Equity (last 30d)</h3><canvas id="equity-chart"></canvas></div>
+      <div class="chart-card"><h3>Drawdown</h3><canvas id="dd-chart"></canvas></div>
+    </div>
+    <div id="overview-empty" class="empty-state hidden">No data yet — paper-run hasn't produced trades.</div>
+  </section>
+
+  <section id="tab-per-city" class="tab-panel">
+    <h2>Per-City Edge Heatmap</h2>
+    <div id="per-city-grid" class="heatmap"></div>
+    <div id="per-city-empty" class="empty-state hidden">Data unavailable — no markets evaluated yet.</div>
+  </section>
+
+  <section id="tab-forecasts" class="tab-panel">
+    <h2>Active Forecasts</h2>
+    <table id="forecasts-table" class="data-table">
+      <thead><tr><th>City</th><th>Market</th><th>Strategy</th><th>Decision</th><th>Model P</th><th>Edge bps</th><th>Conf</th><th>Horizon h</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="forecasts-empty" class="empty-state hidden">No forecasts yet.</div>
+  </section>
+
+  <section id="tab-risk" class="tab-panel">
+    <h2>Risk</h2>
+    <div id="risk-summary"></div>
+    <h3>Kill Switches</h3>
+    <table id="risk-killswitches" class="data-table">
+      <thead><tr><th>Name</th><th>Current</th><th>Threshold</th><th>Armed</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>P&amp;L by Strategy</h3>
+    <table id="risk-pnl" class="data-table">
+      <thead><tr><th>Strategy</th><th>Realised P&amp;L (USDC)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="risk-empty" class="empty-state hidden">Risk data unavailable.</div>
+  </section>
+
+  <section id="tab-trades" class="tab-panel">
+    <h2>Trade Log</h2>
+    <table id="trades-table" class="data-table">
+      <thead><tr><th>Time</th><th>City</th><th>Strategy</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Model P</th><th>Fill (s)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="trades-empty" class="empty-state hidden">No trades yet.</div>
+  </section>
+
+  <section id="tab-gate" class="tab-panel">
+    <h2>Validation Gate</h2>
+    <div id="gate-banner" class="gate-banner">…</div>
+    <table id="gate-table" class="data-table">
+      <thead><tr><th>Criterion</th><th>Current</th><th>Threshold</th><th>Status</th><th>Notes</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

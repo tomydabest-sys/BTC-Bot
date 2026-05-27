@@ -1,0 +1,16 @@
+{
+  "station": "KLGA",
+  "date": "2026-06-15",
+  "window_days": 7,
+  "years_observed": 10,
+  "sample_size": 150,
+  "base_rates_by_bucket_f": {
+    "-999_70": 0.08,
+    "70_73": 0.14,
+    "73_77": 0.42,
+    "77_80": 0.24,
+    "80_999": 0.12
+  },
+  "mean_temp_f": 75.3,
+  "stddev_temp_f": 4.2
+}

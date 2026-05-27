@@ -1,0 +1,325 @@
+"use strict";
+
+const REFRESH_MS = 5000;
+const charts = {};
+
+function fmtMoney(x) {
+  if (x === null || x === undefined) return "—";
+  const n = typeof x === "string" ? parseFloat(x) : x;
+  if (Number.isNaN(n)) return "—";
+  const sign = n < 0 ? "-" : "";
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+
+function fmtPct(x) {
+  if (x === null || x === undefined) return "—";
+  const n = typeof x === "string" ? parseFloat(x) : x;
+  if (Number.isNaN(n)) return "—";
+  return `${n.toFixed(2)}%`;
+}
+
+function fmtNum(x, dp = 4) {
+  if (x === null || x === undefined) return "—";
+  const n = typeof x === "string" ? parseFloat(x) : x;
+  if (Number.isNaN(n)) return "—";
+  return n.toFixed(dp);
+}
+
+function setTab(name) {
+  document.querySelectorAll(".tab").forEach((t) =>
+    t.classList.toggle("tab-active", t.dataset.tab === name)
+  );
+  document.querySelectorAll(".tab-panel").forEach((p) =>
+    p.classList.toggle("tab-panel-active", p.id === `tab-${name}`)
+  );
+}
+
+document.querySelectorAll(".tab").forEach((t) => {
+  t.addEventListener("click", () => setTab(t.dataset.tab));
+});
+
+async function safeFetch(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch (err) {
+    console.error("fetch fail", url, err);
+    return null;
+  }
+}
+
+function showError(elemId, msg) {
+  const el = document.getElementById(elemId);
+  if (el) {
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+}
+
+function hideError(elemId) {
+  const el = document.getElementById(elemId);
+  if (el) el.classList.add("hidden");
+}
+
+// ─── overview ────────────────────────────────────────────────────────
+
+function renderOverview(data) {
+  if (!data) {
+    showError("overview-empty", "Data unavailable — see logs.");
+    return;
+  }
+  hideError("overview-empty");
+  document.getElementById("hero-bankroll").textContent = fmtMoney(data.bankroll_usdc);
+  document.getElementById("hero-pnl24").textContent =
+    fmtMoney(data.pnl_24h_usdc) + " (" + fmtPct(data.pnl_24h_pct) + ")";
+  document.getElementById("hero-pnl7").textContent = fmtMoney(data.pnl_7d_usdc);
+  document.getElementById("hero-pnl30").textContent = fmtMoney(data.pnl_30d_usdc);
+  document.getElementById("hero-open").textContent = data.open_positions ?? 0;
+  document.getElementById("hero-exposure").textContent = fmtPct(data.open_exposure_pct);
+  document.getElementById("hero-brier").textContent = fmtNum(data.brier_30d, 3);
+  document.getElementById("hero-sharpe").textContent = fmtNum(data.sharpe_30d, 3);
+
+  const modeBanner = document.getElementById("mode-banner");
+  modeBanner.textContent = data.mode;
+  modeBanner.className = "mode-banner " + (
+    data.mode === "LIVE" ? "mode-live"
+    : data.mode === "PAPER" ? "mode-paper"
+    : data.mode === "HALTED" ? "mode-halted"
+    : "mode-mock"
+  );
+
+  const hb = document.getElementById("heartbeat");
+  const hbStat = data.heartbeat && data.heartbeat.status;
+  hb.textContent = `heartbeat ${hbStat || "—"} (${data.heartbeat ? data.heartbeat.count : 0})`;
+  hb.className = "heartbeat heartbeat-" + (hbStat === "green" ? "green" : hbStat === "amber" ? "amber" : "red");
+
+  drawEquity(data.equity_curve);
+  drawDrawdown(data.drawdown_curve);
+}
+
+function drawEquity(curve) {
+  const ctx = document.getElementById("equity-chart");
+  if (!ctx || !curve) return;
+  const labels = curve.map((p) => new Date(p.ts * 1000).toLocaleString());
+  const values = curve.map((p) => parseFloat(p.bankroll));
+  if (charts.equity) {
+    charts.equity.data.labels = labels;
+    charts.equity.data.datasets[0].data = values;
+    charts.equity.update("none");
+    return;
+  }
+  charts.equity = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Bankroll USDC",
+        data: values,
+        borderColor: "#3b82f6",
+        backgroundColor: "rgba(59,130,246,0.1)",
+        tension: 0.2,
+        pointRadius: 0,
+      }],
+    },
+    options: { responsive: true, animation: false, plugins: { legend: { display: false } } },
+  });
+}
+
+function drawDrawdown(series) {
+  const ctx = document.getElementById("dd-chart");
+  if (!ctx || !series) return;
+  const labels = series.map((p) => new Date(p.ts * 1000).toLocaleString());
+  const values = series.map((p) => p.drawdown_pct * 100);
+  if (charts.dd) {
+    charts.dd.data.labels = labels;
+    charts.dd.data.datasets[0].data = values;
+    charts.dd.update("none");
+    return;
+  }
+  charts.dd = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Drawdown %",
+        data: values,
+        borderColor: "#f87171",
+        backgroundColor: "rgba(248,113,113,0.18)",
+        fill: true,
+        tension: 0.2,
+        pointRadius: 0,
+      }],
+    },
+    options: { responsive: true, animation: false, plugins: { legend: { display: false } },
+              scales: { y: { reverse: true } } },
+  });
+}
+
+// ─── per-city ────────────────────────────────────────────────────────
+
+function renderPerCity(data) {
+  const grid = document.getElementById("per-city-grid");
+  if (!grid) return;
+  if (!data || !data.cells || data.cells.length === 0) {
+    grid.innerHTML = "";
+    showError("per-city-empty", "No markets evaluated yet — bot has been running for <1 cycle.");
+    return;
+  }
+  hideError("per-city-empty");
+  grid.innerHTML = "";
+  for (const cell of data.cells) {
+    const div = document.createElement("div");
+    div.className = "heatmap-cell";
+    const edge = Number(cell.edge_bps || 0);
+    const intensity = Math.min(1, Math.abs(edge) / 1200);
+    const color = edge >= 0
+      ? `rgba(52,211,153,${0.15 + intensity * 0.7})`
+      : `rgba(248,113,113,${0.15 + intensity * 0.7})`;
+    div.style.background = color;
+    div.innerHTML = `
+      <div class="city">${cell.city}</div>
+      <div class="bucket">${fmtNum(cell.bucket_low, 0)}–${fmtNum(cell.bucket_high, 0)}°F</div>
+      <div>edge ${fmtNum(edge, 0)}bps</div>
+      <div class="muted">p≈${fmtNum(cell.fill_probability, 2)}</div>
+    `;
+    grid.appendChild(div);
+  }
+}
+
+// ─── forecasts ───────────────────────────────────────────────────────
+
+function renderForecasts(data) {
+  const tbody = document.querySelector("#forecasts-table tbody");
+  if (!tbody) return;
+  if (!data || !data.markets || data.markets.length === 0) {
+    tbody.innerHTML = "";
+    showError("forecasts-empty", "No forecasts yet.");
+    return;
+  }
+  hideError("forecasts-empty");
+  tbody.innerHTML = "";
+  for (const m of data.markets) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${m.city || ""}</td>
+      <td>${m.market_id || ""}</td>
+      <td>${m.strategy || ""}</td>
+      <td>${m.decision || ""}</td>
+      <td>${fmtNum(m.model_probability, 3)}</td>
+      <td>${fmtNum(m.edge_bps, 0)}</td>
+      <td>${fmtNum(m.confidence, 2)}</td>
+      <td>${fmtNum(m.horizon_hours, 1)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+// ─── risk ────────────────────────────────────────────────────────────
+
+function renderRisk(data) {
+  if (!data) { showError("risk-empty", "Risk data unavailable."); return; }
+  hideError("risk-empty");
+  const summary = document.getElementById("risk-summary");
+  summary.innerHTML = `
+    <p>Bankroll: <b>${fmtMoney(data.current_bankroll_usdc)}</b> (ATH ${fmtMoney(data.ath_bankroll_usdc)})</p>
+    <p>Max drawdown: <b>${fmtPct(data.max_drawdown_pct * 100)}</b></p>
+    <p>Open exposure: <b>${fmtMoney(data.open_exposure_usdc)}</b> / cap ${fmtMoney(data.open_exposure_cap_usdc)}</p>
+    <p>Consecutive losses: <b>${data.consecutive_losses}</b></p>
+    <p>Halted: <b class="${data.halted ? "negative" : "positive"}">${data.halted ? "YES — " + data.halt_reason : "no"}</b></p>
+  `;
+  const ksBody = document.querySelector("#risk-killswitches tbody");
+  ksBody.innerHTML = "";
+  for (const ks of (data.kill_switches || [])) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${ks.name}</td><td>${ks.current}</td><td>${ks.threshold}</td>
+      <td class="${ks.armed ? "negative" : "positive"}">${ks.armed ? "ARMED" : "ok"}</td>`;
+    ksBody.appendChild(tr);
+  }
+  const pnlBody = document.querySelector("#risk-pnl tbody");
+  pnlBody.innerHTML = "";
+  for (const [k, v] of Object.entries(data.pnl_by_strategy || {})) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${k}</td><td>${fmtMoney(v)}</td>`;
+    pnlBody.appendChild(tr);
+  }
+}
+
+// ─── trades ──────────────────────────────────────────────────────────
+
+function renderTrades(data) {
+  const tbody = document.querySelector("#trades-table tbody");
+  if (!data || !data.trades || data.trades.length === 0) {
+    if (tbody) tbody.innerHTML = "";
+    showError("trades-empty", "No trades yet.");
+    return;
+  }
+  hideError("trades-empty");
+  tbody.innerHTML = "";
+  for (const t of data.trades) {
+    const tr = document.createElement("tr");
+    const ts = new Date(t.timestamp * 1000).toLocaleString();
+    const pnl = parseFloat(t.pnl_usdc);
+    tr.innerHTML = `
+      <td>${ts}</td>
+      <td>${t.city || ""}</td>
+      <td>${t.strategy || ""}</td>
+      <td>${t.side || ""}</td>
+      <td>${fmtNum(t.entry_price, 3)}</td>
+      <td>${fmtNum(t.exit_price, 3)}</td>
+      <td class="${pnl >= 0 ? "positive" : "negative"}">${fmtMoney(pnl)}</td>
+      <td>${fmtNum(t.model_probability, 3)}</td>
+      <td>${fmtNum(t.fill_latency_seconds, 2)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+// ─── gate ────────────────────────────────────────────────────────────
+
+function renderGate(data) {
+  const banner = document.getElementById("gate-banner");
+  const tbody = document.querySelector("#gate-table tbody");
+  if (!data) {
+    banner.textContent = "Validation gate unavailable.";
+    banner.className = "gate-banner fail";
+    return;
+  }
+  banner.textContent = data.ready_for_live ? "READY FOR LIVE: YES" : "READY FOR LIVE: NO";
+  banner.className = "gate-banner " + (data.ready_for_live ? "pass" : "fail");
+  if (!data.ready_for_live && data.failing && data.failing.length > 0) {
+    banner.textContent += " — failing: " + data.failing.join(", ");
+  }
+  tbody.innerHTML = "";
+  for (const [name, c] of Object.entries(data.criteria || {})) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${name}</td>
+      <td>${c.value}</td>
+      <td>${c.threshold}</td>
+      <td class="${c.pass ? "positive" : "negative"}">${c.pass ? "PASS" : "FAIL"}</td>
+      <td class="muted">${c.reason}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+// ─── refresh loop ────────────────────────────────────────────────────
+
+async function refresh() {
+  const [ov, pc, fc, rk, tr, gt] = await Promise.all([
+    safeFetch("/api/weather/overview"),
+    safeFetch("/api/weather/per-city-edge"),
+    safeFetch("/api/weather/forecasts"),
+    safeFetch("/api/weather/risk"),
+    safeFetch("/api/weather/trades?limit=50"),
+    safeFetch("/api/weather/validation-gate"),
+  ]);
+  renderOverview(ov);
+  renderPerCity(pc);
+  renderForecasts(fc);
+  renderRisk(rk);
+  renderTrades(tr);
+  renderGate(gt);
+}
+
+refresh().catch((e) => console.error(e));
+setInterval(refresh, REFRESH_MS);

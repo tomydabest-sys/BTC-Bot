@@ -1,0 +1,9 @@
+{
+  "station": "KLGA",
+  "issued_at": "2026-06-14T12:00:00Z",
+  "periods": [
+    {"valid_time": "2026-06-15T18:00:00Z", "horizon_hours": 30, "predicted_temp_f": 75.2, "wind_mph": 8, "precip_pct": 10},
+    {"valid_time": "2026-06-16T18:00:00Z", "horizon_hours": 54, "predicted_temp_f": 77.8, "wind_mph": 10, "precip_pct": 20},
+    {"valid_time": "2026-06-17T18:00:00Z", "horizon_hours": 78, "predicted_temp_f": 73.1, "wind_mph": 12, "precip_pct": 40}
+  ]
+}

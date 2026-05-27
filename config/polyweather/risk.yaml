@@ -1,0 +1,12 @@
+# Hard limits. Do not loosen without operator sign-off in writing.
+bankroll_usdc: 1260
+max_position_size_usdc: 12          # 1% of bankroll per single bucket
+max_strategy_allocation_usdc: 882   # 70% to ensemble strategy
+max_total_open_exposure_usdc: 504   # 40% of bankroll across all open positions
+max_daily_loss_usdc: 50             # ~4% kill switch — triggers cancel_all + 24h pause
+max_weekly_loss_usdc: 150           # ~12% pause-and-review threshold
+kelly_fraction_multiplier: 0.25     # quarter Kelly, gopfan2-style
+position_minimum_usdc: 1.5          # below this, skip (fees dominate)
+first_24h_live_position_cap_usdc: 5 # extra safety on day-1 live, hard-coded regardless of config
+all_time_high_kill_drawdown_pct: 0.20  # 20% from ATH = permanent halt requiring manual restart
+consecutive_loss_pause_count: 5     # 5 losses in a row = 30min pause

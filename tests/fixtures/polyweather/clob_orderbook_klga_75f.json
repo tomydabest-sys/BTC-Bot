@@ -1,0 +1,17 @@
+{
+  "market_id": "mkt_klga_73_77",
+  "token_id": "tk_klga_7377_y",
+  "timestamp": "2026-06-14T18:30:00Z",
+  "bids": [
+    {"price": 0.55, "size": 250},
+    {"price": 0.54, "size": 400},
+    {"price": 0.53, "size": 600},
+    {"price": 0.50, "size": 1200}
+  ],
+  "asks": [
+    {"price": 0.58, "size": 180},
+    {"price": 0.59, "size": 350},
+    {"price": 0.60, "size": 500},
+    {"price": 0.62, "size": 1000}
+  ]
+}
