@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 import structlog
@@ -25,6 +27,24 @@ from polybot.polyweather.orchestrator.engine import EngineConfig, PolyWeatherEng
 from polybot.polyweather.persistence.store import PolyWeatherStore
 
 logger = structlog.get_logger()
+
+
+def _configure_logging(level: str = "INFO") -> None:
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)-7s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=True),
+            structlog.dev.ConsoleRenderer(),
+        ],
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RISK = REPO_ROOT / "config" / "polyweather" / "risk.yaml"
@@ -43,6 +63,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=int(os.environ.get("DASHBOARD_PORT", "8080")))
     p.add_argument("--no-dashboard", action="store_true")
     p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    p.add_argument(
+        "--log-level",
+        default=os.environ.get("BOT_LOG_LEVEL", "INFO"),
+        help="DEBUG / INFO / WARNING / ERROR",
+    )
+    p.add_argument(
+        "--status-every",
+        type=float,
+        default=10.0,
+        help="Seconds between console status lines (0 to disable)",
+    )
     return p.parse_args(argv)
 
 
@@ -52,11 +83,47 @@ def _reset_db(path: Path) -> None:
         logger.info("paper_db_reset", path=str(path))
 
 
+async def _status_loop(engine, store, interval_s: float, stop_event: asyncio.Event) -> None:
+    """Print a one-line console summary every ``interval_s`` seconds."""
+    started = time.time()
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+            return
+        except TimeoutError:
+            pass
+        m = engine.metrics
+        risk = engine.risk
+        halted, halt_reason = risk.check_kill_switch()
+        line = (
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"cycles={m.cycles} signals={m.signals_total} fills={m.fills_total} "
+            f"bankroll=${risk.state.current_bankroll:.2f} "
+            f"daily_pnl=${risk.state.daily_pnl:.2f} "
+            f"halted={'YES('+halt_reason+')' if halted else 'no'} "
+            f"trades_in_db={store.trade_count()}"
+        )
+        print(line, flush=True)
+        if time.time() - started > 1.5 * interval_s and m.cycles == 0:
+            print(
+                "  ⚠ no cycles run yet — check that fixtures exist under "
+                "tests/fixtures/polyweather/",
+                flush=True,
+            )
+
+
 async def run(args: argparse.Namespace) -> int:  # noqa: C901
+    _configure_logging(args.log_level)
     use_mock = args.mock or os.environ.get("BOT_MOCK_DATA", "").lower() == "true"
 
     if args.reset:
         _reset_db(args.db)
+
+    print(
+        f"polyweather: starting paper bot — mock={use_mock} duration={args.duration} "
+        f"cycle={args.cycle_seconds}s db={args.db}",
+        flush=True,
+    )
 
     engine_cfg = EngineConfig.from_files(
         risk_yaml=DEFAULT_RISK,
@@ -79,9 +146,18 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
 
     dashboard_task: asyncio.Task | None = None
     if not args.no_dashboard:
-        config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning", access_log=False)
+        config = uvicorn.Config(
+            app, host=args.host, port=args.port,
+            log_level="warning", access_log=False,
+        )
         server = uvicorn.Server(config)
         dashboard_task = asyncio.create_task(server.serve(), name="polyweather_dashboard")
+        print(
+            f"polyweather: dashboard → http://{args.host}:{args.port}",
+            flush=True,
+        )
+    else:
+        print("polyweather: --no-dashboard set, skipping HTTP server", flush=True)
 
     stop_event = asyncio.Event()
 
@@ -97,6 +173,12 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
 
     engine_task = asyncio.create_task(engine.start(), name="polyweather_engine")
     stop_task = asyncio.create_task(stop_event.wait(), name="polyweather_stop")
+    status_task: asyncio.Task | None = None
+    if args.status_every > 0:
+        status_task = asyncio.create_task(
+            _status_loop(engine, store, args.status_every, stop_event),
+            name="polyweather_status",
+        )
 
     try:
         # Always race the engine task against an explicit stop event. The
@@ -115,6 +197,8 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
                 raise exc
     finally:
         stop_task.cancel()
+        if status_task is not None:
+            status_task.cancel()
         await engine.shutdown()
         if not engine_task.done():
             engine_task.cancel()
