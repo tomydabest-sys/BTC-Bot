@@ -96,20 +96,25 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
             pass
 
     engine_task = asyncio.create_task(engine.start(), name="polyweather_engine")
+    stop_task = asyncio.create_task(stop_event.wait(), name="polyweather_stop")
 
     try:
-        if args.duration is not None:
-            await asyncio.wait_for(asyncio.shield(engine_task), timeout=args.duration + 5)
-        else:
-            done, _ = await asyncio.wait(
-                [engine_task, asyncio.create_task(stop_event.wait())],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for d in done:
-                exc = d.exception()
-                if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                    raise exc
+        # Always race the engine task against an explicit stop event. The
+        # engine respects --duration internally so we don't need a separate
+        # timeout; Ctrl-C on Windows raises KeyboardInterrupt and is caught
+        # in main() for a clean exit.
+        done, _ = await asyncio.wait(
+            [engine_task, stop_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for d in done:
+            if d is stop_task:
+                continue
+            exc = d.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                raise exc
     finally:
+        stop_task.cancel()
         await engine.shutdown()
         if not engine_task.done():
             engine_task.cancel()
@@ -129,7 +134,11 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    return asyncio.run(run(args))
+    try:
+        return asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("\npolyweather: stopped by user (Ctrl-C).")
+        return 0
 
 
 if __name__ == "__main__":
