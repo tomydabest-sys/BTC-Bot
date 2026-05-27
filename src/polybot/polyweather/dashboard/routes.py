@@ -112,6 +112,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
             eq = []
         bankroll = engine.risk.state.current_bankroll
         open_exp = engine.risk.state.open_exposure
+        unrealized = engine.unrealized_pnl_usdc
+        open_positions = engine.open_positions
         # P&L windows
         now_ts = time.time()
         pnl_24h = _pnl_since(eq, now_ts - 86400)
@@ -136,7 +138,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
             "pnl_24h_pct": float(pnl_24h / bankroll * 100) if bankroll else 0.0,
             "pnl_7d_usdc": pnl_7d,
             "pnl_30d_usdc": pnl_30d,
-            "open_positions": 0,
+            "open_positions": len(open_positions),
+            "unrealized_pnl_usdc": unrealized,
             "open_exposure_usdc": open_exp,
             "open_exposure_pct": float(open_exp / bankroll * 100) if bankroll else 0.0,
             "brier_30d": brier,
@@ -268,7 +271,23 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
                 },
             ],
             "pnl_by_strategy": {k: v for k, v in by_strategy.items()},
-            "open_positions": [],
+            "open_positions": [
+                {
+                    "market_id": p.market_id,
+                    "city": p.city,
+                    "strategy": p.strategy,
+                    "side": p.side,
+                    "outcome": p.outcome,
+                    "entry_price": p.entry_price,
+                    "current_price": p.current_price,
+                    "size_usdc": p.size_usdc,
+                    "size_tokens": p.size_tokens,
+                    "unrealized_pnl_usdc": p.unrealized_pnl,
+                    "opened_at": p.opened_at,
+                    "closes_at": p.closes_at,
+                }
+                for p in engine.open_positions
+            ],
         }
 
     @app.get("/api/weather/trades", response_class=DecimalJSONResponse)

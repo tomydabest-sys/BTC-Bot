@@ -85,6 +85,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Seconds before the same bucket can trade again (default 300 live, 30 mock)",
     )
+    p.add_argument(
+        "--position-horizon",
+        type=float,
+        default=None,
+        help="Seconds a paper position is held open before settlement (default 60 mock)",
+    )
     return p.parse_args(argv)
 
 
@@ -153,6 +159,15 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
         engine_cfg.bucket_cooldown_seconds = args.bucket_cooldown
     elif use_mock:
         engine_cfg.bucket_cooldown_seconds = 30.0
+    if args.position_horizon is not None:
+        engine_cfg.position_horizon_seconds = args.position_horizon
+
+    # In mock mode the spec 30-min consecutive-loss pause is longer than any
+    # reasonable demo run. Scale it down so a temporary halt actually clears
+    # during the session and the dashboard doesn't sit on a red banner.
+    if use_mock:
+        engine_cfg.risk.consecutive_loss_pause_seconds = 30.0
+        engine_cfg.risk.daily_loss_cooldown_seconds = 60.0
 
     store = PolyWeatherStore(args.db)
     resolver = StationResolver()
@@ -164,10 +179,14 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
     )
 
     dashboard_task: asyncio.Task | None = None
+    server: uvicorn.Server | None = None
     if not args.no_dashboard:
+        # ``lifespan="off"`` skips the starlette lifespan task whose forced
+        # cancellation produced the misleading "CancelledError" traceback on
+        # graceful shutdown.
         config = uvicorn.Config(
             app, host=args.host, port=args.port,
-            log_level="warning", access_log=False,
+            log_level="warning", access_log=False, lifespan="off",
         )
         server = uvicorn.Server(config)
         dashboard_task = asyncio.create_task(server.serve(), name="polyweather_dashboard")
@@ -226,10 +245,20 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         if dashboard_task is not None:
-            dashboard_task.cancel()
+            # Ask uvicorn to shut down gracefully; only force-cancel if it
+            # doesn't oblige within 3s. This avoids the CancelledError noise
+            # users were seeing during normal exit.
+            if server is not None:
+                server.should_exit = True
             try:
-                await dashboard_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                await asyncio.wait_for(dashboard_task, timeout=3.0)
+            except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError):
+                dashboard_task.cancel()
+                try:
+                    await dashboard_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
                 pass
 
     return 0
