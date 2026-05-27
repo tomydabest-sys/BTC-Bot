@@ -1,0 +1,9 @@
+{
+  "station": "EGLC",
+  "issued_at": "2026-06-14T12:00:00Z",
+  "hourly": [
+    {"valid_time": "2026-06-15T12:00:00Z", "horizon_hours": 24, "screen_temperature_c": 18.5, "predicted_temp_f": 65.3},
+    {"valid_time": "2026-06-15T15:00:00Z", "horizon_hours": 27, "screen_temperature_c": 19.1, "predicted_temp_f": 66.4},
+    {"valid_time": "2026-06-15T18:00:00Z", "horizon_hours": 30, "screen_temperature_c": 18.2, "predicted_temp_f": 64.8}
+  ]
+}

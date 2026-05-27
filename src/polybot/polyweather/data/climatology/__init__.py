@@ -1,0 +1,1 @@
+"""NCEI climatology base rates."""

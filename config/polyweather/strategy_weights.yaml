@@ -1,0 +1,18 @@
+weights:
+  weather_ensemble: 0.70
+  negative_risk_arb: 0.20
+  resolution_meanrev: 0.10
+
+edge_threshold_bps:
+  weather_ensemble: 800        # 8.00%
+  negative_risk_arb: 200       # 2.00%
+  resolution_meanrev: 500      # 5.00%
+
+confidence_minimum:
+  weather_ensemble: 0.55
+  negative_risk_arb: 0.95
+  resolution_meanrev: 0.85
+
+# Per-strategy P&L share cap — no single strategy may produce >60% of P&L over rolling 30d
+# (validation gate criterion #6)
+max_pl_share_per_strategy: 0.60

@@ -1,0 +1,113 @@
+{
+  "events": [
+    {
+      "id": "evt_klga_temp_2026_06_15",
+      "slug": "nyc-high-temp-jun-15-2026",
+      "title": "What will be the high temperature at New York LaGuardia on Jun 15, 2026?",
+      "category": "Weather",
+      "tags": ["temperature", "weather"],
+      "end_date": "2026-06-16T04:00:00Z",
+      "volume_24hr": 24500.0,
+      "active": true,
+      "closed": false,
+      "rules": "The high temperature for this market will be measured at LaGuardia Airport (KLGA) as reported by the National Weather Service for the calendar day of June 15, 2026.",
+      "markets": [
+        {"id": "mkt_klga_lt70", "token_id_yes": "tk_klga_lt70_y", "token_id_no": "tk_klga_lt70_n", "bucket_low": -999, "bucket_high": 70, "best_bid": 0.04, "best_ask": 0.06, "volume_24hr": 1200},
+        {"id": "mkt_klga_70_73", "token_id_yes": "tk_klga_7073_y", "token_id_no": "tk_klga_7073_n", "bucket_low": 70, "bucket_high": 73, "best_bid": 0.10, "best_ask": 0.13, "volume_24hr": 3000},
+        {"id": "mkt_klga_73_77", "token_id_yes": "tk_klga_7377_y", "token_id_no": "tk_klga_7377_n", "bucket_low": 73, "bucket_high": 77, "best_bid": 0.55, "best_ask": 0.58, "volume_24hr": 9000},
+        {"id": "mkt_klga_77_80", "token_id_yes": "tk_klga_7780_y", "token_id_no": "tk_klga_7780_n", "bucket_low": 77, "bucket_high": 80, "best_bid": 0.18, "best_ask": 0.21, "volume_24hr": 6500},
+        {"id": "mkt_klga_gt80", "token_id_yes": "tk_klga_gt80_y", "token_id_no": "tk_klga_gt80_n", "bucket_low": 80, "bucket_high": 999, "best_bid": 0.05, "best_ask": 0.08, "volume_24hr": 1800}
+      ]
+    },
+    {
+      "id": "evt_kord_temp_2026_06_15",
+      "slug": "chicago-high-temp-jun-15-2026",
+      "title": "Chicago high temperature Jun 15, 2026",
+      "category": "Weather",
+      "tags": ["temperature"],
+      "end_date": "2026-06-16T04:00:00Z",
+      "volume_24hr": 14200.0,
+      "active": true,
+      "closed": false,
+      "rules": "Temperature measured at Chicago O'Hare (KORD) per NWS.",
+      "markets": [
+        {"id": "mkt_kord_lt68", "token_id_yes": "tk_kord_lt68_y", "token_id_no": "tk_kord_lt68_n", "bucket_low": -999, "bucket_high": 68, "best_bid": 0.08, "best_ask": 0.11, "volume_24hr": 2000},
+        {"id": "mkt_kord_68_72", "token_id_yes": "tk_kord_6872_y", "token_id_no": "tk_kord_6872_n", "bucket_low": 68, "bucket_high": 72, "best_bid": 0.35, "best_ask": 0.38, "volume_24hr": 4500},
+        {"id": "mkt_kord_72_76", "token_id_yes": "tk_kord_7276_y", "token_id_no": "tk_kord_7276_n", "bucket_low": 72, "bucket_high": 76, "best_bid": 0.42, "best_ask": 0.45, "volume_24hr": 5000},
+        {"id": "mkt_kord_gt76", "token_id_yes": "tk_kord_gt76_y", "token_id_no": "tk_kord_gt76_n", "bucket_low": 76, "bucket_high": 999, "best_bid": 0.07, "best_ask": 0.10, "volume_24hr": 1500}
+      ]
+    },
+    {
+      "id": "evt_kmia_temp_2026_06_15",
+      "slug": "miami-high-temp-jun-15-2026",
+      "title": "Miami high temperature Jun 15, 2026",
+      "category": "Weather",
+      "tags": ["temperature"],
+      "end_date": "2026-06-16T04:00:00Z",
+      "volume_24hr": 18900.0,
+      "active": true,
+      "closed": false,
+      "rules": "Temperature measured at Miami International Airport (KMIA) per NWS.",
+      "markets": [
+        {"id": "mkt_kmia_lt85", "token_id_yes": "tk_kmia_lt85_y", "token_id_no": "tk_kmia_lt85_n", "bucket_low": -999, "bucket_high": 85, "best_bid": 0.06, "best_ask": 0.09, "volume_24hr": 1700},
+        {"id": "mkt_kmia_85_89", "token_id_yes": "tk_kmia_8589_y", "token_id_no": "tk_kmia_8589_n", "bucket_low": 85, "bucket_high": 89, "best_bid": 0.30, "best_ask": 0.33, "volume_24hr": 4800},
+        {"id": "mkt_kmia_89_92", "token_id_yes": "tk_kmia_8992_y", "token_id_no": "tk_kmia_8992_n", "bucket_low": 89, "bucket_high": 92, "best_bid": 0.45, "best_ask": 0.48, "volume_24hr": 6200},
+        {"id": "mkt_kmia_gt92", "token_id_yes": "tk_kmia_gt92_y", "token_id_no": "tk_kmia_gt92_n", "bucket_low": 92, "bucket_high": 999, "best_bid": 0.08, "best_ask": 0.11, "volume_24hr": 2200}
+      ]
+    },
+    {
+      "id": "evt_eglc_temp_2026_06_15",
+      "slug": "london-high-temp-jun-15-2026",
+      "title": "London high temperature Jun 15, 2026",
+      "category": "Weather",
+      "tags": ["temperature"],
+      "end_date": "2026-06-16T04:00:00Z",
+      "volume_24hr": 9800.0,
+      "active": true,
+      "closed": false,
+      "rules": "High temperature measured at London City Airport (EGLC) per Met Office.",
+      "markets": [
+        {"id": "mkt_eglc_lt60", "token_id_yes": "tk_eglc_lt60_y", "token_id_no": "tk_eglc_lt60_n", "bucket_low": -999, "bucket_high": 60, "best_bid": 0.10, "best_ask": 0.13, "volume_24hr": 1500},
+        {"id": "mkt_eglc_60_66", "token_id_yes": "tk_eglc_6066_y", "token_id_no": "tk_eglc_6066_n", "bucket_low": 60, "bucket_high": 66, "best_bid": 0.40, "best_ask": 0.43, "volume_24hr": 3800},
+        {"id": "mkt_eglc_66_72", "token_id_yes": "tk_eglc_6672_y", "token_id_no": "tk_eglc_6672_n", "bucket_low": 66, "bucket_high": 72, "best_bid": 0.36, "best_ask": 0.39, "volume_24hr": 3500},
+        {"id": "mkt_eglc_gt72", "token_id_yes": "tk_eglc_gt72_y", "token_id_no": "tk_eglc_gt72_n", "bucket_low": 72, "bucket_high": 999, "best_bid": 0.08, "best_ask": 0.11, "volume_24hr": 1200}
+      ]
+    },
+    {
+      "id": "evt_vhhh_temp_2026_06_15",
+      "slug": "hongkong-high-temp-jun-15-2026",
+      "title": "Hong Kong high temperature Jun 15, 2026",
+      "category": "Weather",
+      "tags": ["temperature"],
+      "end_date": "2026-06-16T04:00:00Z",
+      "volume_24hr": 7100.0,
+      "active": true,
+      "closed": false,
+      "rules": "Temperature measured at Hong Kong International Airport (VHHH).",
+      "markets": [
+        {"id": "mkt_vhhh_lt84", "token_id_yes": "tk_vhhh_lt84_y", "token_id_no": "tk_vhhh_lt84_n", "bucket_low": -999, "bucket_high": 84, "best_bid": 0.12, "best_ask": 0.15, "volume_24hr": 1200},
+        {"id": "mkt_vhhh_84_88", "token_id_yes": "tk_vhhh_8488_y", "token_id_no": "tk_vhhh_8488_n", "bucket_low": 84, "bucket_high": 88, "best_bid": 0.38, "best_ask": 0.41, "volume_24hr": 2800},
+        {"id": "mkt_vhhh_88_92", "token_id_yes": "tk_vhhh_8892_y", "token_id_no": "tk_vhhh_8892_n", "bucket_low": 88, "bucket_high": 92, "best_bid": 0.36, "best_ask": 0.39, "volume_24hr": 2500},
+        {"id": "mkt_vhhh_gt92", "token_id_yes": "tk_vhhh_gt92_y", "token_id_no": "tk_vhhh_gt92_n", "bucket_low": 92, "bucket_high": 999, "best_bid": 0.10, "best_ask": 0.13, "volume_24hr": 1100}
+      ]
+    },
+    {
+      "id": "evt_lfpb_temp_2026_06_15",
+      "slug": "paris-high-temp-jun-15-2026",
+      "title": "Paris high temperature Jun 15, 2026",
+      "category": "Weather",
+      "tags": ["temperature"],
+      "end_date": "2026-06-16T04:00:00Z",
+      "volume_24hr": 6300.0,
+      "active": true,
+      "closed": false,
+      "rules": "Temperature measured at Paris Le Bourget (LFPB).",
+      "markets": [
+        {"id": "mkt_lfpb_lt65", "token_id_yes": "tk_lfpb_lt65_y", "token_id_no": "tk_lfpb_lt65_n", "bucket_low": -999, "bucket_high": 65, "best_bid": 0.10, "best_ask": 0.13, "volume_24hr": 1100},
+        {"id": "mkt_lfpb_65_70", "token_id_yes": "tk_lfpb_6570_y", "token_id_no": "tk_lfpb_6570_n", "bucket_low": 65, "bucket_high": 70, "best_bid": 0.38, "best_ask": 0.41, "volume_24hr": 2200},
+        {"id": "mkt_lfpb_70_75", "token_id_yes": "tk_lfpb_7075_y", "token_id_no": "tk_lfpb_7075_n", "bucket_low": 70, "bucket_high": 75, "best_bid": 0.40, "best_ask": 0.43, "volume_24hr": 2100},
+        {"id": "mkt_lfpb_gt75", "token_id_yes": "tk_lfpb_gt75_y", "token_id_no": "tk_lfpb_gt75_n", "bucket_low": 75, "bucket_high": 999, "best_bid": 0.08, "best_ask": 0.11, "volume_24hr": 900}
+      ]
+    }
+  ]
+}
