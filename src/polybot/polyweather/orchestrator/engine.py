@@ -94,6 +94,12 @@ class EngineConfig:
     target_cities: list[dict[str, Any]] = field(default_factory=list)
     bankroll_cap_usdc: Decimal | None = None
     first_24h_position_cap_usdc: Decimal = Decimal("5")
+    # Pacing: at most one new trade per event per cycle, and at most one trade
+    # per bucket within ``bucket_cooldown_seconds``. Stops the engine from
+    # firing the same signal every 5s and gives the dashboard a realistic
+    # cadence even in mock mode.
+    max_signals_per_event_per_cycle: int = 1
+    bucket_cooldown_seconds: float = 300.0  # 5 min
 
     @classmethod
     def from_files(
@@ -174,6 +180,8 @@ class PolyWeatherEngine:
         self._rng = random.Random(20260615)
         self._stop = asyncio.Event()
         self._open_paper_positions: list[dict[str, Any]] = []
+        # market_id → last fill timestamp; honoured by ``_bucket_in_cooldown``
+        self._last_fill_ts: dict[str, float] = {}
         # Inject a deterministic equity tick at startup so the dashboard
         # always shows something.
         self.store.record_equity(
@@ -243,7 +251,13 @@ class PolyWeatherEngine:
         # Heartbeat freshness mirror so the dashboard can read it directly
         self.metrics.heartbeat_count = getattr(self.exchange, "heartbeat_count", 0)
 
-    async def _evaluate_event(self, cycle_id: str, event: WeatherEvent, station) -> None:
+    def _bucket_in_cooldown(self, market_id: str) -> bool:
+        last = self._last_fill_ts.get(market_id, 0.0)
+        if last == 0.0:
+            return False
+        return (time.time() - last) < self.config.bucket_cooldown_seconds
+
+    async def _evaluate_event(self, cycle_id: str, event: WeatherEvent, station) -> None:  # noqa: C901
         # Forecasts (mock or live)
         forecast_om = await self.open_meteo.forecast(station.lat, station.lon)
         nws_points = None
@@ -255,6 +269,11 @@ class PolyWeatherEngine:
 
         end_dt = _parse_iso(event.end_date)
         horizon_h = max(2.0, (end_dt - datetime.now(UTC)).total_seconds() / 3600.0)
+
+        # Collect every candidate signal across all strategies + buckets,
+        # then pick the highest-edge one(s) per event per cycle. This is what
+        # gives the bot a realistic cadence instead of firing 30 trades at once.
+        candidates: list[tuple[float, Any, float]] = []  # (edge_bps, signal, p_realised)
 
         # Negative-risk arb on the basket
         arb_view = EventBucketsView(
@@ -270,13 +289,17 @@ class PolyWeatherEngine:
                 for b in event.buckets
             ],
         )
-        arb_signals = self.s_arb.evaluate(arb_view)
-        self.metrics.signals_total += len(arb_signals)
-        for sig in arb_signals:
-            await self._handle_signal(cycle_id, event, station, sig, p_realised=sig.metadata.get("fair_value", 0.2))
+        for sig in self.s_arb.evaluate(arb_view):
+            if self._bucket_in_cooldown(sig.market_id):
+                continue
+            edge = float(sig.metadata.get("edge_bps", 0.0))
+            p_real = float(sig.metadata.get("fair_value", 0.2))
+            candidates.append((edge, sig, p_real))
 
         # Per-bucket ensemble + meanrev
         for bucket in event.buckets:
+            if self._bucket_in_cooldown(bucket.id):
+                continue
             base_rate = self.ncei.bucket_base_rate(
                 station.icao, end_dt.date().isoformat(), bucket.bucket_low, bucket.bucket_high
             )
@@ -305,13 +328,39 @@ class PolyWeatherEngine:
 
             sig = self.s_ensemble.evaluate(view)
             if sig is not None:
-                self.metrics.signals_total += 1
-                await self._handle_signal(cycle_id, event, station, sig, p_realised=forecast.p_bucket)
+                edge = float(sig.metadata.get("edge_bps", 0.0))
+                candidates.append((edge, sig, forecast.p_bucket))
 
             sig_mr = self.s_meanrev.evaluate(view)
             if sig_mr is not None:
-                self.metrics.signals_total += 1
-                await self._handle_signal(cycle_id, event, station, sig_mr, p_realised=forecast.p_bucket)
+                edge = float(sig_mr.metadata.get("edge_bps", 0.0))
+                candidates.append((edge, sig_mr, forecast.p_bucket))
+
+        # Order by best edge first; fire at most ``max_signals_per_event_per_cycle``
+        # winners. Skip duplicates on the same bucket (e.g. ensemble + meanrev
+        # both wanting the same market). If the top candidate sizes to zero
+        # we continue down the list rather than wasting the event slot.
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        fired_market_ids: set[str] = set()
+        fired = 0
+        for edge_bps, sig, p_real in candidates:
+            if fired >= self.config.max_signals_per_event_per_cycle:
+                break
+            if sig.market_id in fired_market_ids:
+                continue
+            # Pre-flight sizing: if it would round to 0 we skip silently rather
+            # than emitting a BLOCKED-sized_zero decision row per candidate.
+            target_price = Decimal(str(sig.target_price)).quantize(Decimal("0.0001"))
+            p_model = float(
+                (sig.metadata or {}).get("model_probability", p_real)
+            )
+            preview_size = self.risk.quarter_kelly_size(p_model, target_price)
+            if preview_size <= 0:
+                continue
+            self.metrics.signals_total += 1
+            await self._handle_signal(cycle_id, event, station, sig, p_realised=p_real)
+            fired_market_ids.add(sig.market_id)
+            fired += 1
 
     # ─── signal handling ─────────────────────────────────────────────
 
@@ -436,6 +485,8 @@ class PolyWeatherEngine:
         self.metrics.fills_by_strategy[signal.strategy] = (
             self.metrics.fills_by_strategy.get(signal.strategy, 0) + 1
         )
+        # Cool the bucket so the same market isn't retraded next cycle.
+        self._last_fill_ts[signal.market_id] = time.time()
 
         self.store.record_decision(
             cycle_id=cycle_id,

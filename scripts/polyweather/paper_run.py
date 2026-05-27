@@ -59,6 +59,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--duration", type=float, default=None, help="Wall-time seconds to run")
     p.add_argument("--cycle-seconds", type=float, default=5.0, help="Seconds between cycles")
     p.add_argument("--reset", action="store_true", help="Wipe paper SQLite first")
+    p.add_argument(
+        "--keep-state",
+        action="store_true",
+        help="Do NOT auto-wipe in --mock mode (default is fresh state per run)",
+    )
     p.add_argument("--host", default=os.environ.get("DASHBOARD_HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=int(os.environ.get("DASHBOARD_PORT", "8080")))
     p.add_argument("--no-dashboard", action="store_true")
@@ -73,6 +78,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Seconds between console status lines (0 to disable)",
+    )
+    p.add_argument(
+        "--bucket-cooldown",
+        type=float,
+        default=None,
+        help="Seconds before the same bucket can trade again (default 300 live, 30 mock)",
     )
     return p.parse_args(argv)
 
@@ -116,7 +127,11 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
     _configure_logging(args.log_level)
     use_mock = args.mock or os.environ.get("BOT_MOCK_DATA", "").lower() == "true"
 
-    if args.reset:
+    # Auto-reset for --mock runs so every demo starts at the configured
+    # bankroll. Override with --keep-state if the operator wants to
+    # continue a previous mock session.
+    should_reset = args.reset or (use_mock and not args.keep_state)
+    if should_reset:
         _reset_db(args.db)
 
     print(
@@ -134,6 +149,10 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
         cycle_seconds=args.cycle_seconds,
         duration_seconds=args.duration,
     )
+    if args.bucket_cooldown is not None:
+        engine_cfg.bucket_cooldown_seconds = args.bucket_cooldown
+    elif use_mock:
+        engine_cfg.bucket_cooldown_seconds = 30.0
 
     store = PolyWeatherStore(args.db)
     resolver = StationResolver()

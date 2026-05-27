@@ -1,4 +1,16 @@
-"""Weather-mode risk module: position caps, kill switch, day-1 live override."""
+"""Weather-mode risk module: position caps, kill switch, day-1 live override.
+
+Three distinct halt regimes (per the v1 spec):
+
+  - ATH drawdown ≥ 20% → ``ath_killed`` permanently latched; only manual
+    ``reset_ath_kill()`` clears it.
+  - Daily loss ≥ max_daily_loss_usdc → 24h cooldown.
+  - Consecutive losses ≥ N → pause for ``consecutive_loss_pause_seconds``
+    (default 30 min in live, configurable down for mock).
+
+Each pause records the timestamp it started; ``check_kill_switch`` auto-
+clears expired pauses so the dashboard isn't stuck in HALTED forever.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +31,9 @@ class WeatherRiskConfig:
     first_24h_live_position_cap_usdc: Decimal = Decimal("5")
     all_time_high_kill_drawdown_pct: Decimal = Decimal("0.20")
     consecutive_loss_pause_count: int = 5
+    # Auto-recovery windows (seconds). Per the v1 spec.
+    consecutive_loss_pause_seconds: float = 1800.0   # 30 min
+    daily_loss_cooldown_seconds: float = 86400.0     # 24 h
 
     @classmethod
     def from_yaml(cls, data: dict) -> WeatherRiskConfig:
@@ -33,6 +48,12 @@ class WeatherRiskConfig:
             first_24h_live_position_cap_usdc=Decimal(str(data["first_24h_live_position_cap_usdc"])),
             all_time_high_kill_drawdown_pct=Decimal(str(data["all_time_high_kill_drawdown_pct"])),
             consecutive_loss_pause_count=int(data["consecutive_loss_pause_count"]),
+            consecutive_loss_pause_seconds=float(
+                data.get("consecutive_loss_pause_seconds", 1800.0)
+            ),
+            daily_loss_cooldown_seconds=float(
+                data.get("daily_loss_cooldown_seconds", 86400.0)
+            ),
         )
 
 
@@ -46,6 +67,9 @@ class WeatherRiskState:
     consecutive_losses: int = 0
     halted: bool = False
     halt_reason: str = ""
+    halt_started_ts: float = 0.0
+    halt_kind: str = ""              # "ath" | "daily" | "consecutive"
+    ath_killed: bool = False         # latched permanently on ATH breach
     live_session_start_ts: float = 0.0
 
 
@@ -98,31 +122,79 @@ class WeatherRiskManager:
 
     # ─── kill switches ───────────────────────────────────────────────
 
-    def check_kill_switch(self) -> tuple[bool, str]:
-        if self.state.halted:
+    def check_kill_switch(self) -> tuple[bool, str]:  # noqa: C901
+        # ATH drawdown is the only permanent halt — never auto-recover.
+        if self.state.ath_killed:
             return True, self.state.halt_reason
-        if self.state.daily_pnl <= -self.config.max_daily_loss_usdc:
-            return self._halt(
-                f"daily_loss_kill_switch: {self.state.daily_pnl} "
-                f"<= -{self.config.max_daily_loss_usdc}"
-            )
+
+        # ATH check fires first because it's the strongest signal.
         if self.state.ath_bankroll > 0:
             dd = (self.state.ath_bankroll - self.state.current_bankroll) / self.state.ath_bankroll
             if dd >= self.config.all_time_high_kill_drawdown_pct:
-                return self._halt(
+                return self._latch_ath_kill(
                     f"ath_drawdown_kill_switch: {dd:.4f} "
                     f">= {self.config.all_time_high_kill_drawdown_pct}"
                 )
-        if self.state.consecutive_losses >= self.config.consecutive_loss_pause_count:
-            return self._halt(
-                f"consecutive_loss_pause: {self.state.consecutive_losses} losses in a row"
+
+        # Daily-loss cooldown — auto-resume after window.
+        if self.state.halted and self.state.halt_kind == "daily":
+            if self._cooldown_expired(self.config.daily_loss_cooldown_seconds):
+                self._clear_halt()
+                self.state.daily_pnl = Decimal("0")
+            else:
+                return True, self.state.halt_reason
+        if self.state.daily_pnl <= -self.config.max_daily_loss_usdc:
+            return self._open_halt(
+                "daily",
+                f"daily_loss_kill_switch: {self.state.daily_pnl} "
+                f"<= -{self.config.max_daily_loss_usdc}",
             )
+
+        # Consecutive-loss pause — auto-resume after window.
+        if self.state.halted and self.state.halt_kind == "consecutive":
+            if self._cooldown_expired(self.config.consecutive_loss_pause_seconds):
+                self._clear_halt()
+                self.state.consecutive_losses = 0
+            else:
+                return True, self.state.halt_reason
+        if self.state.consecutive_losses >= self.config.consecutive_loss_pause_count:
+            return self._open_halt(
+                "consecutive",
+                f"consecutive_loss_pause: {self.state.consecutive_losses} losses in a row",
+            )
+
         return False, ""
 
-    def _halt(self, reason: str) -> tuple[bool, str]:
+    # ─── halt helpers ────────────────────────────────────────────────
+
+    def _open_halt(self, kind: str, reason: str) -> tuple[bool, str]:
         self.state.halted = True
+        self.state.halt_kind = kind
         self.state.halt_reason = reason
+        if self.state.halt_started_ts == 0:
+            self.state.halt_started_ts = time.time()
         return True, reason
+
+    def _latch_ath_kill(self, reason: str) -> tuple[bool, str]:
+        self.state.ath_killed = True
+        return self._open_halt("ath", reason)
+
+    def _clear_halt(self) -> None:
+        self.state.halted = False
+        self.state.halt_reason = ""
+        self.state.halt_kind = ""
+        self.state.halt_started_ts = 0.0
+
+    def _cooldown_expired(self, window_s: float) -> bool:
+        if self.state.halt_started_ts <= 0:
+            return False
+        return (time.time() - self.state.halt_started_ts) >= window_s
+
+    def reset_ath_kill(self) -> None:
+        """Operator-only manual reset after an ATH drawdown halt."""
+        self.state.ath_killed = False
+        self._clear_halt()
+        self.state.ath_bankroll = self.state.current_bankroll
 
     def can_open(self, notional_usdc: Decimal) -> tuple[bool, str]:
         halted, reason = self.check_kill_switch()
