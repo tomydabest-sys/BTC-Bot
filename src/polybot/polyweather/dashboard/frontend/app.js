@@ -64,11 +64,19 @@ function hideError(elemId) {
 
 // ─── overview ────────────────────────────────────────────────────────
 
+// Track whether we ever rendered real data. If we did, transient nulls
+// from a single failed fetch shouldn't pop the empty-state on top of
+// stale-but-still-valid card values.
+let _overviewEverHadData = false;
+
 function renderOverview(data) {
   if (!data) {
-    showError("overview-empty", "Data unavailable — see logs.");
+    if (!_overviewEverHadData) {
+      showError("overview-empty", "Data unavailable — see logs.");
+    }
     return;
   }
+  _overviewEverHadData = true;
   hideError("overview-empty");
   document.getElementById("hero-bankroll").textContent = fmtMoney(data.bankroll_usdc);
   document.getElementById("hero-pnl24").textContent =
@@ -158,14 +166,19 @@ function drawDrawdown(series) {
 
 // ─── per-city ────────────────────────────────────────────────────────
 
+let _perCityEverHadData = false;
+
 function renderPerCity(data) {
   const grid = document.getElementById("per-city-grid");
   if (!grid) return;
   if (!data || !data.cells || data.cells.length === 0) {
-    grid.innerHTML = "";
-    showError("per-city-empty", "No markets evaluated yet — bot has been running for <1 cycle.");
+    if (!_perCityEverHadData) {
+      grid.innerHTML = "";
+      showError("per-city-empty", "No markets evaluated yet — bot has been running for <1 cycle.");
+    }
     return;
   }
+  _perCityEverHadData = true;
   hideError("per-city-empty");
   grid.innerHTML = "";
   for (const cell of data.cells) {
@@ -189,14 +202,19 @@ function renderPerCity(data) {
 
 // ─── forecasts ───────────────────────────────────────────────────────
 
+let _forecastsEverHadData = false;
+
 function renderForecasts(data) {
   const tbody = document.querySelector("#forecasts-table tbody");
   if (!tbody) return;
   if (!data || !data.markets || data.markets.length === 0) {
-    tbody.innerHTML = "";
-    showError("forecasts-empty", "No forecasts yet.");
+    if (!_forecastsEverHadData) {
+      tbody.innerHTML = "";
+      showError("forecasts-empty", "No forecasts yet.");
+    }
     return;
   }
+  _forecastsEverHadData = true;
   hideError("forecasts-empty");
   tbody.innerHTML = "";
   for (const m of data.markets) {
@@ -216,8 +234,14 @@ function renderForecasts(data) {
 
 // ─── risk ────────────────────────────────────────────────────────────
 
+let _riskEverHadData = false;
+
 function renderRisk(data) {
-  if (!data) { showError("risk-empty", "Risk data unavailable."); return; }
+  if (!data) {
+    if (!_riskEverHadData) showError("risk-empty", "Risk data unavailable.");
+    return;
+  }
+  _riskEverHadData = true;
   hideError("risk-empty");
   const summary = document.getElementById("risk-summary");
   summary.innerHTML = `
@@ -246,13 +270,18 @@ function renderRisk(data) {
 
 // ─── trades ──────────────────────────────────────────────────────────
 
+let _tradesEverHadData = false;
+
 function renderTrades(data) {
   const tbody = document.querySelector("#trades-table tbody");
   if (!data || !data.trades || data.trades.length === 0) {
-    if (tbody) tbody.innerHTML = "";
-    showError("trades-empty", "No trades yet.");
+    if (!_tradesEverHadData) {
+      if (tbody) tbody.innerHTML = "";
+      showError("trades-empty", "No trades yet.");
+    }
     return;
   }
+  _tradesEverHadData = true;
   hideError("trades-empty");
   tbody.innerHTML = "";
   for (const t of data.trades) {

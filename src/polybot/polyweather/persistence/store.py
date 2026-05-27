@@ -85,6 +85,12 @@ class PolyWeatherStore:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self._path)) as db:
+            # WAL allows the dashboard to read concurrently with engine writes;
+            # default rollback journal serialises every read and produces
+            # "database is locked" errors that surface in the UI as
+            # "Data unavailable" empty states.
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
             db.executescript(SCHEMA)
             db.commit()
 
@@ -93,7 +99,10 @@ class PolyWeatherStore:
         return self._path
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self._path)
+        # 5s busy timeout — if a contended write/read collides, wait rather
+        # than raise. Combined with WAL this should eliminate locked errors
+        # in practice.
+        db = sqlite3.connect(self._path, timeout=5.0)
         db.row_factory = sqlite3.Row
         return db
 

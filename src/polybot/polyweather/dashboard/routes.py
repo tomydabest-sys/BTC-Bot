@@ -106,7 +106,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
         store = HOLDER.store
         if engine is None or store is None:
             return _empty_overview()
-        eq = store.equity_history(limit=2000)
+        try:
+            eq = store.equity_history(limit=2000)
+        except Exception:  # noqa: BLE001
+            eq = []
         bankroll = engine.risk.state.current_bankroll
         open_exp = engine.risk.state.open_exposure
         # P&L windows
@@ -115,7 +118,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
         pnl_7d = _pnl_since(eq, now_ts - 7 * 86400)
         pnl_30d = _pnl_since(eq, now_ts - 30 * 86400)
         # Open positions: paper engine resolves immediately so 0 in v1
-        trades = store.trades(limit=2000)
+        try:
+            trades = store.trades(limit=2000)
+        except Exception:  # noqa: BLE001
+            trades = []
         brier = _brier_window(trades, days=30)
         sharpe = _sharpe_window(eq)
         hb_ts = getattr(engine.exchange, "last_heartbeat_ts", 0.0)
