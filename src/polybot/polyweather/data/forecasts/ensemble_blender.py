@@ -49,7 +49,29 @@ def sigma_for_horizon(horizon_hours: float) -> float:
     return SIGMA_AT_6H + frac * (SIGMA_AT_240H - SIGMA_AT_6H)
 
 
+# Polymarket point-market tolerance: bucket_low == bucket_high means the
+# market resolves YES if the observed value, after rounding to the nearest
+# integer, equals X. We model this as P(X - 0.5 ≤ T < X + 0.5).
+POINT_MARKET_HALF_WIDTH = 0.5
+
+
+def c_to_f(temp_c: float) -> float:
+    return temp_c * 9.0 / 5.0 + 32.0
+
+
+def f_to_c(temp_f: float) -> float:
+    return (temp_f - 32.0) * 5.0 / 9.0
+
+
 def p_bucket_gaussian(mu: float, sigma: float, low: float, high: float) -> float:
+    """Probability that a Gaussian forecast lands inside [low, high].
+
+    For point markets the spec uses ``low == high``; we widen the band to
+    ±``POINT_MARKET_HALF_WIDTH`` so the probability isn't trivially zero.
+    """
+    if low == high:
+        low = low - POINT_MARKET_HALF_WIDTH
+        high = high + POINT_MARKET_HALF_WIDTH
     if sigma <= 0:
         return 1.0 if low <= mu <= high else 0.0
     return float(norm.cdf(high, loc=mu, scale=sigma) - norm.cdf(low, loc=mu, scale=sigma))
@@ -101,7 +123,7 @@ class EnsembleBlender:
     def __init__(self, model_weights: dict[str, float] | None = None) -> None:
         self._weights = dict(model_weights or MODEL_WEIGHTS)
 
-    def blend(
+    def blend(  # noqa: C901 — multi-step blend with optional ensemble/climatology
         self,
         deterministic_models: dict[str, list[ForecastPoint]],
         ensemble: EnsembleMembers | None,
@@ -109,31 +131,55 @@ class EnsembleBlender:
         bucket_high: float,
         target_horizon_h: float,
         base_rate: float | None = None,
+        bucket_unit: str = "F",
     ) -> EnsembleForecast:
+        """Blend per-model probabilities for ``[bucket_low, bucket_high]``.
+
+        ``bucket_unit`` is the unit the BUCKET is expressed in (``F`` or ``C``).
+        Forecasts internally are always Fahrenheit; if the bucket is Celsius
+        the forecast values are converted before the probability is computed.
+        Polymarket point markets ("26°C") arrive as ``low==high`` and are
+        handled by ``p_bucket_gaussian`` widening to ±0.5°.
+        """
         contributions: dict[str, float] = {}
         weighted_sum = 0.0
         weight_total = 0.0
         sigma = sigma_for_horizon(target_horizon_h)
+        if bucket_unit.upper() == "C":
+            # σ scales 1:1 in absolute degrees regardless of unit, but the
+            # numerical sigma table is in °F. 1°F = 5/9 °C.
+            sigma_in_unit = sigma * 5.0 / 9.0
+        else:
+            sigma_in_unit = sigma
 
         for name, points in deterministic_models.items():
             chosen = _select_for_horizon(points, target_horizon_h)
             if chosen is None:
                 continue
             w = self._weights.get(name, self._weights.get(name.split("/")[-1], 0.20))
-            p = p_bucket_gaussian(chosen.predicted_temp_f, sigma, bucket_low, bucket_high)
+            mu_f = chosen.predicted_temp_f
+            mu = f_to_c(mu_f) if bucket_unit.upper() == "C" else mu_f
+            p = p_bucket_gaussian(mu, sigma_in_unit, bucket_low, bucket_high)
             contributions[name] = p
             weighted_sum += w * p
             weight_total += w
 
         members_used = 0
         if ensemble is not None and ensemble.members:
-            inside = sum(1 for x in ensemble.members if bucket_low <= x <= bucket_high)
-            p_ens = inside / len(ensemble.members)
+            # GEFS members are °F; if the market is °C convert each member.
+            members = ensemble.members
+            if bucket_unit.upper() == "C":
+                members = [f_to_c(m) for m in members]
+            lo, hi = bucket_low, bucket_high
+            if lo == hi:
+                lo, hi = lo - POINT_MARKET_HALF_WIDTH, hi + POINT_MARKET_HALF_WIDTH
+            inside = sum(1 for x in members if lo <= x <= hi)
+            p_ens = inside / len(members)
             w_ens = self._weights.get("gefs", 0.25)
             contributions["gefs_ensemble"] = p_ens
             weighted_sum += w_ens * p_ens
             weight_total += w_ens
-            members_used = len(ensemble.members)
+            members_used = len(members)
 
         if weight_total == 0:
             return EnsembleForecast(
@@ -160,12 +206,18 @@ class EnsembleBlender:
         # Confidence: 1 - ensemble disagreement (if we have ensemble), else
         # derived from σ vs bucket width
         if ensemble is not None and ensemble.members:
-            inside = sum(1 for x in ensemble.members if bucket_low <= x <= bucket_high)
-            p_in = inside / len(ensemble.members)
+            members = ensemble.members
+            if bucket_unit.upper() == "C":
+                members = [f_to_c(m) for m in members]
+            lo, hi = bucket_low, bucket_high
+            if lo == hi:
+                lo, hi = lo - POINT_MARKET_HALF_WIDTH, hi + POINT_MARKET_HALF_WIDTH
+            inside = sum(1 for x in members if lo <= x <= hi)
+            p_in = inside / len(members)
             confidence = 1.0 - 2.0 * min(p_in, 1.0 - p_in)
         else:
-            width = max(0.001, bucket_high - bucket_low)
-            confidence = max(0.0, min(1.0, 1.0 - sigma / max(width, sigma)))
+            width = max(0.001, bucket_high - bucket_low) if bucket_low != bucket_high else 1.0
+            confidence = max(0.0, min(1.0, 1.0 - sigma_in_unit / max(width, sigma_in_unit)))
 
         return EnsembleForecast(
             p_bucket=max(0.0, min(1.0, p_blended)),
@@ -188,6 +240,7 @@ class EnsembleBlender:
         bucket_high: float,
         target_horizon_h: float,
         base_rate: float | None = None,
+        bucket_unit: str = "F",
     ) -> EnsembleForecast:
         deterministic = dict(forecast.deterministic)
         if nws_points:
@@ -199,4 +252,5 @@ class EnsembleBlender:
             bucket_high=bucket_high,
             target_horizon_h=target_horizon_h,
             base_rate=base_rate,
+            bucket_unit=bucket_unit,
         )
