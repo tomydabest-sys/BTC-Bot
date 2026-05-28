@@ -112,7 +112,16 @@ class WeatherRiskManager:
         if f <= 0:
             return Decimal("0")
         f *= float(self.config.kelly_fraction_multiplier)
-        cap = self.weather_position_cap_usdc()
+        # Fat-tail guard (Bug B): standard Kelly will happily bet the full 1%
+        # cap on a long-shot price where the model claims a huge edge — e.g. an
+        # $0.001 token at "800 bps over model". Such a bet loses ~100% of its
+        # stake with ~99.9% probability; eight of them in a row drained ~$96.
+        # Scale the cap down linearly below $0.05 so tail bets can't reach the
+        # full position cap. At $0.05+ the discount is 1.0 (no change). Prices
+        # whose discounted cap falls below ``position_minimum_usdc`` size to 0,
+        # so the bot abstains from the tiniest long-shots entirely.
+        tail_discount = min(Decimal("1"), target_price / Decimal("0.05"))
+        cap = (self.weather_position_cap_usdc() * tail_discount).quantize(Decimal("0.0001"))
         sized = self.state.current_bankroll * Decimal(str(f))
         sized = sized.quantize(Decimal("0.0001"))
         sized = min(sized, cap)

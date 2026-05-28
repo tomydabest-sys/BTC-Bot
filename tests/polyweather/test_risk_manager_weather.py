@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from decimal import Decimal
 
+import pytest
+
 from polybot.polyweather.risk.weather_risk import WeatherRiskConfig, WeatherRiskManager
 
 
@@ -77,6 +79,38 @@ def test_kelly_size_capped_at_1pct_bankroll() -> None:
     mgr = _mgr()
     sized = mgr.quarter_kelly_size(p_win=0.95, target_price=Decimal("0.10"))
     assert sized <= mgr.weather_position_cap_usdc()
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        # discounted cap = $12 × (price / $0.05):
+        (Decimal("0.001"), Decimal("0")),    # cap $0.24 < $1.50 min → abstain
+        (Decimal("0.01"), Decimal("2.40")),  # cap $12 × 0.2
+        (Decimal("0.05"), Decimal("12")),    # discount = 1.0 → full cap
+        (Decimal("0.10"), Decimal("12")),    # discount clamped to 1.0 → full cap
+    ],
+)
+def test_tail_price_sizing_discounts_the_cap(price: Decimal, expected: Decimal) -> None:
+    """Bug B: long-shot prices must not size to the full position cap.
+
+    ``p_win`` is high enough that quarter-Kelly wants far more than the cap at
+    every price, so the (tail-discounted) cap is the binding constraint. Before
+    the fix all four prices sized to the full $12 cap — and an $0.001 fill that
+    lost cost ~$11.99.
+    """
+    mgr = _mgr()
+    sized = mgr.quarter_kelly_size(p_win=0.95, target_price=price)
+    assert sized == expected
+
+
+def test_tail_discount_never_inflates_above_base_cap() -> None:
+    """The discount only ever shrinks the cap, never grows it."""
+    mgr = _mgr()
+    base_cap = mgr.weather_position_cap_usdc()
+    for price in (Decimal("0.02"), Decimal("0.20"), Decimal("0.50"), Decimal("0.95")):
+        sized = mgr.quarter_kelly_size(p_win=0.99, target_price=price)
+        assert sized <= base_cap
 
 
 def test_consecutive_loss_pause_auto_recovers() -> None:
