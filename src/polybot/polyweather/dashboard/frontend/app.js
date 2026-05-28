@@ -25,6 +25,15 @@ function fmtNum(x, dp = 4) {
   return n.toFixed(dp);
 }
 
+function fmtStat(x, dp = 3) {
+  // Like fmtNum but renders explicit "N/A (need 30+)" when the backend
+  // reports null — used for Sharpe/Brier where small samples are meaningless.
+  if (x === null || x === undefined) return "N/A (need 30+)";
+  const n = typeof x === "string" ? parseFloat(x) : x;
+  if (Number.isNaN(n)) return "—";
+  return n.toFixed(dp);
+}
+
 function setTab(name) {
   document.querySelectorAll(".tab").forEach((t) =>
     t.classList.toggle("tab-active", t.dataset.tab === name)
@@ -85,8 +94,8 @@ function renderOverview(data) {
   document.getElementById("hero-pnl30").textContent = fmtMoney(data.pnl_30d_usdc);
   document.getElementById("hero-open").textContent = data.open_positions ?? 0;
   document.getElementById("hero-exposure").textContent = fmtPct(data.open_exposure_pct);
-  document.getElementById("hero-brier").textContent = fmtNum(data.brier_30d, 3);
-  document.getElementById("hero-sharpe").textContent = fmtNum(data.sharpe_30d, 3);
+  document.getElementById("hero-brier").textContent = fmtStat(data.brier_30d, 3);
+  document.getElementById("hero-sharpe").textContent = fmtStat(data.sharpe_30d, 3);
 
   const modeBanner = document.getElementById("mode-banner");
   modeBanner.textContent = data.mode;
@@ -96,6 +105,10 @@ function renderOverview(data) {
     : data.mode === "HALTED" ? "mode-halted"
     : "mode-mock"
   );
+  const mockWarning = document.getElementById("mock-warning");
+  if (mockWarning) {
+    mockWarning.classList.toggle("hidden", data.mode !== "MOCK");
+  }
 
   const hb = document.getElementById("heartbeat");
   const hbStat = data.heartbeat && data.heartbeat.status;

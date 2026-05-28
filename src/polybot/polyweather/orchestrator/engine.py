@@ -145,6 +145,11 @@ class EngineConfig:
     bucket_cooldown_seconds: float = 300.0
     position_horizon_seconds: float = 60.0
     mtm_noise_pct: float = 0.03
+    # Mock-mode "true probability" = skill·p_model + (1-skill)·market_price.
+    # 0.55 gives the bot a small real edge over the market, yielding
+    # Sharpe ≈ 1–2 over many trades. 1.0 would reproduce the old
+    # self-fulfilling outcome (Sharpe explodes), 0.5 = no edge.
+    mock_model_skill: float = 0.55
 
     @classmethod
     def from_files(
@@ -520,7 +525,19 @@ class PolyWeatherEngine:
         # OPEN the position. Settlement happens later in
         # ``_settle_open_positions`` when the holding horizon elapses.
         self.risk.record_open(size_usdc)
-        final_outcome = 1 if self._rng.random() < p_realised else 0
+        # Mock-mode outcome draw: the "true" probability is a blend of the
+        # model's belief and the market's implied probability. With skill=0.55
+        # the bot has a real-but-modest edge over the market (resulting Sharpe
+        # ≈ 1–2) instead of the self-consistent draw from p_model that
+        # produces an impossible Sharpe of 40+.
+        if self.config.use_mock:
+            market_implied = float(target_price)
+            skill = self.config.mock_model_skill
+            true_p = skill * p_realised + (1.0 - skill) * market_implied
+            true_p = max(0.0, min(1.0, true_p))
+        else:
+            true_p = p_realised
+        final_outcome = 1 if self._rng.random() < true_p else 0
         rebate = (size_usdc * Decimal("0.0005")).quantize(Decimal("0.0001"))
         now = time.time()
         position = OpenPaperPosition(

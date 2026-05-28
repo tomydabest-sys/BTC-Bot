@@ -407,31 +407,39 @@ def _pnl_since(eq: list[tuple[float, Decimal]], cutoff_ts: float) -> Decimal:
     return (last - prev).quantize(Decimal("0.0001"))
 
 
-def _brier_window(trades, days: int) -> float:
+MIN_SAMPLES_FOR_STATS = 30
+
+
+def _brier_window(trades, days: int) -> float | None:
     cutoff = time.time() - days * 86400
     sample = [t for t in trades if t.closed_at >= cutoff]
-    if not sample:
-        return 1.0
+    if len(sample) < MIN_SAMPLES_FOR_STATS:
+        return None
     return sum((t.model_probability - t.realised_outcome) ** 2 for t in sample) / len(sample)
 
 
-def _sharpe_window(eq: list[tuple[float, Decimal]]) -> float:
-    if len(eq) < 2:
-        return 0.0
+def _sharpe_window(eq: list[tuple[float, Decimal]]) -> float | None:
+    if len(eq) < MIN_SAMPLES_FOR_STATS:
+        return None
     rets: list[float] = []
     for (_, a), (_, b) in zip(eq, eq[1:], strict=False):
         if a == 0:
             continue
         rets.append(float((b - a) / a))
-    if len(rets) < 2:
-        return 0.0
+    if len(rets) < MIN_SAMPLES_FOR_STATS:
+        return None
     import math
     import statistics
     mean = statistics.fmean(rets)
     sd = statistics.pstdev(rets)
     if sd == 0:
-        return 0.0
-    return (mean / sd) * math.sqrt(365)
+        return None
+    sharpe = (mean / sd) * math.sqrt(365)
+    # Cap reported Sharpe to a believable display range. Anything over ~5
+    # in real markets is suspect; over 10 is a UI lie.
+    if sharpe > 10:
+        sharpe = 10.0
+    return sharpe
 
 
 def _drawdown_series(eq: list[tuple[float, Decimal]]) -> list[dict[str, Any]]:

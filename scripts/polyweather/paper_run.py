@@ -95,9 +95,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _reset_db(path: Path) -> None:
-    if path.exists():
-        path.unlink()
-        logger.info("paper_db_reset", path=str(path))
+    """Wipe the paper SQLite and the station audit log together.
+
+    Both files persist across sessions; wiping only one leads to stale
+    audit entries (the user saw 1326 'verified' rows accumulate across
+    several mock runs).
+    """
+    for f in (path, path.with_suffix(".sqlite-wal"), path.with_suffix(".sqlite-shm")):
+        if f.exists():
+            f.unlink()
+            logger.info("paper_db_reset", path=str(f))
+    audit_path = path.parent / "station_audit.jsonl"
+    if audit_path.exists():
+        audit_path.unlink()
+        logger.info("station_audit_reset", path=str(audit_path))
 
 
 async def _status_loop(engine, store, interval_s: float, stop_event: asyncio.Event) -> None:
@@ -170,7 +181,7 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
         engine_cfg.risk.daily_loss_cooldown_seconds = 60.0
 
     store = PolyWeatherStore(args.db)
-    resolver = StationResolver()
+    resolver = StationResolver(audit_enabled=not use_mock)
     engine = PolyWeatherEngine(engine_cfg, store=store, station_resolver=resolver)
 
     app = create_app(
