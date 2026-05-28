@@ -39,6 +39,21 @@ header h1 { font-size: 1.2rem; margin: 0; flex: 1; }
 }
 
 .mode-mock { background: #475569; color: #e0e6ef; }
+.mode-live-data { background: #0891b2; color: white; }
+
+.mock-warning {
+  background: rgba(251, 191, 36, 0.12);
+  border-bottom: 1px solid var(--warning);
+  color: var(--warning);
+  padding: 0.6rem 1.5rem;
+  font-size: 0.85rem;
+  text-align: center;
+  font-weight: 500;
+}
+
+#mock-warning:not(.hidden):has(+ *) {
+  /* Live-data band uses a different accent */
+}
 .mode-paper { background: #1d4ed8; color: white; }
 .mode-live { background: #ea580c; color: white; }
 .mode-halted { background: #b91c1c; color: white; }

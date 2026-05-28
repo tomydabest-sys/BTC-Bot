@@ -3,10 +3,31 @@
 Gamma is the marketplace metadata endpoint. We use it to enumerate active
 weather events, their child bucket markets, and the resolution rules text
 the station_resolver needs.
+
+Live mode parses the real Polymarket response shape:
+
+  Event
+    ├── id, slug, title, endDate, description, tags
+    └── markets[]                            (one per YES/NO question)
+        ├── id, question, conditionId, slug
+        ├── clobTokenIds   ("[<yes>, <no>]" JSON-string)
+        ├── outcomes       ("[\"Yes\", \"No\"]")
+        ├── outcomePrices  ("[\"0.34\", \"0.66\"]")
+        ├── lastTradePrice / bestBid / bestAsk
+        ├── volumeNum / volume24hrNum
+        ├── groupItemTitle  (e.g. "26°C" — the bucket label)
+        └── endDate, active, closed, archived
+
+Buckets are parsed best-effort from ``groupItemTitle`` or ``question``
+text; we accept Celsius and Fahrenheit, point markets ("26°C") and range
+markets ("70-73°F"), and degrade gracefully (bucket_low == bucket_high
+for point markets).
 """
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +39,9 @@ from polybot.polyweather._fixtures import load_fixture
 logger = structlog.get_logger()
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+
+# Tag slugs to look for. Polymarket uses both "weather" and "temperature".
+DEFAULT_WEATHER_TAG_SLUGS = ("weather", "temperature", "precipitation", "climate")
 
 
 @dataclass
@@ -32,6 +56,8 @@ class WeatherBucket:
     best_bid: float
     best_ask: float
     volume_24hr: float
+    question: str = ""
+    unit: str = "F"   # "F" or "C"
 
 
 @dataclass
@@ -51,7 +77,186 @@ class WeatherEvent:
     buckets: list[WeatherBucket]
 
 
+# ──────────────────────────────────────────────────────────────────────
+#  Bucket-text parsing
+# ──────────────────────────────────────────────────────────────────────
+
+_RANGE_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*[-–to]+\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])",
+    re.IGNORECASE,
+)
+_POINT_OR_HIGHER_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])\s*(?:or higher|or above|\+)",
+    re.IGNORECASE,
+)
+_POINT_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_bucket_label(label: str) -> tuple[float, float, str]:
+    """Extract (bucket_low, bucket_high, unit) from a Polymarket label.
+
+    Examples
+    --------
+    "26°C"           → (26, 26, "C")
+    "76-77°F"        → (76, 77, "F")
+    "76°F or higher" → (76, 999, "F")
+    "Under 70°F"     → (-999, 70, "F")     (heuristic)
+    """
+    if not label:
+        return (-999.0, 999.0, "F")
+    text = label.strip()
+
+    # X-Y °unit
+    m = _RANGE_RE.search(text)
+    if m:
+        lo, hi, unit = float(m.group(1)), float(m.group(2)), m.group(3).upper()
+        if lo > hi:
+            lo, hi = hi, lo
+        return (lo, hi, unit)
+
+    # X °unit or higher
+    m = _POINT_OR_HIGHER_RE.search(text)
+    if m:
+        return (float(m.group(1)), 999.0, m.group(2).upper())
+
+    # "Under X" / "below X"
+    if re.search(r"\b(under|below|less than)\b", text, re.IGNORECASE):
+        m = _POINT_RE.search(text)
+        if m:
+            return (-999.0, float(m.group(1)), m.group(2).upper())
+
+    # Single point X °unit → treat as [X, X] (Polymarket point markets
+    # resolve YES when the observed value equals X to the rounding step).
+    m = _POINT_RE.search(text)
+    if m:
+        v = float(m.group(1))
+        return (v, v, m.group(2).upper())
+
+    return (-999.0, 999.0, "F")
+
+
+def _safe_json_list(s: Any) -> list:
+    if isinstance(s, list):
+        return s
+    if not s:
+        return []
+    try:
+        out = json.loads(s)
+        if isinstance(out, list):
+            return out
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _parse_market_node(raw: dict[str, Any]) -> WeatherBucket | None:
+    """Convert one live Polymarket market into a ``WeatherBucket``."""
+    # CLOB token ids — "[yes, no]" JSON string in live responses
+    token_ids = _safe_json_list(raw.get("clobTokenIds"))
+    if len(token_ids) < 2:
+        return None
+    token_yes, token_no = str(token_ids[0]), str(token_ids[1])
+
+    # Prices — also stringified JSON
+    prices = _safe_json_list(raw.get("outcomePrices") or raw.get("outcome_prices"))
+    yes_price = None
+    if len(prices) >= 1:
+        try:
+            yes_price = float(prices[0])
+        except (TypeError, ValueError):
+            yes_price = None
+
+    # Best bid / ask — fall back to outcomePrices if individual fields missing
+    best_bid = raw.get("bestBid") or raw.get("best_bid")
+    best_ask = raw.get("bestAsk") or raw.get("best_ask")
+    try:
+        best_bid = float(best_bid) if best_bid is not None else (yes_price or 0.5)
+    except (TypeError, ValueError):
+        best_bid = yes_price or 0.5
+    try:
+        best_ask = float(best_ask) if best_ask is not None else (yes_price or 0.5)
+    except (TypeError, ValueError):
+        best_ask = yes_price or 0.5
+
+    # Sanity-clamp prices
+    best_bid = max(0.001, min(0.999, best_bid))
+    best_ask = max(0.001, min(0.999, best_ask))
+    if best_ask < best_bid:
+        best_ask = best_bid
+
+    label = raw.get("groupItemTitle") or raw.get("question") or ""
+    bucket_low, bucket_high, unit = _parse_bucket_label(label)
+
+    volume = raw.get("volume24hr") or raw.get("volume24hrNum") or raw.get("volumeNum") or 0.0
+    try:
+        volume = float(volume)
+    except (TypeError, ValueError):
+        volume = 0.0
+
+    market_id = str(raw.get("id") or raw.get("conditionId") or raw.get("slug") or "")
+    if not market_id:
+        return None
+
+    return WeatherBucket(
+        id=market_id,
+        token_id_yes=token_yes,
+        token_id_no=token_no,
+        bucket_low=bucket_low,
+        bucket_high=bucket_high,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        volume_24hr=volume,
+        question=label,
+        unit=unit,
+    )
+
+
 def _parse_event(raw: dict[str, Any]) -> WeatherEvent:
+    """Parse a Polymarket Gamma event. Tolerant of missing fields."""
+    # Mock-fixture compatibility: my fixtures use ``markets[].token_id_yes`` etc.
+    if raw.get("markets") and raw["markets"] and "token_id_yes" in raw["markets"][0]:
+        return _parse_fixture_event(raw)
+
+    markets_raw = raw.get("markets", []) or []
+    buckets: list[WeatherBucket] = []
+    for m in markets_raw:
+        if m.get("closed") or m.get("archived"):
+            continue
+        bucket = _parse_market_node(m)
+        if bucket is not None:
+            buckets.append(bucket)
+
+    tags = raw.get("tags") or []
+    tag_names: list[str] = []
+    if isinstance(tags, list):
+        for t in tags:
+            if isinstance(t, dict):
+                slug = t.get("slug") or t.get("label")
+                if slug:
+                    tag_names.append(str(slug).lower())
+            elif isinstance(t, str):
+                tag_names.append(t.lower())
+
+    return WeatherEvent(
+        id=str(raw.get("id") or raw.get("slug") or ""),
+        slug=str(raw.get("slug") or ""),
+        title=str(raw.get("title") or ""),
+        category=str(raw.get("category") or "Weather"),
+        tags=tag_names,
+        end_date=str(raw.get("endDate") or raw.get("end_date") or ""),
+        volume_24hr=float(raw.get("volume24hr") or raw.get("volume_24hr") or 0.0),
+        active=bool(raw.get("active", True)),
+        closed=bool(raw.get("closed", False)),
+        rules=str(raw.get("description") or raw.get("rules") or ""),
+        buckets=buckets,
+    )
+
+
+def _parse_fixture_event(raw: dict[str, Any]) -> WeatherEvent:
+    """The mock/test fixture format (predates the live schema work)."""
     buckets = [
         WeatherBucket(
             id=str(m["id"]),
@@ -62,6 +267,8 @@ def _parse_event(raw: dict[str, Any]) -> WeatherEvent:
             best_bid=float(m["best_bid"]),
             best_ask=float(m["best_ask"]),
             volume_24hr=float(m.get("volume_24hr", 0.0)),
+            question=str(m.get("question", "")),
+            unit="F",
         )
         for m in raw.get("markets", [])
     ]
@@ -81,41 +288,91 @@ def _parse_event(raw: dict[str, Any]) -> WeatherEvent:
 
 
 class GammaClient:
-    """Live Gamma client. Reads weather events that match include_tags."""
+    """Live Gamma client. Reads weather events from gamma-api.polymarket.com.
+
+    Filtering pipeline:
+      1. ``active=true&closed=false`` at the API
+      2. Local tag filter against ``include_tag_slugs``
+      3. Local title-text filter ("weather", "temperature", "precip")
+      4. Volume threshold
+      5. Skip events with no buckets we could parse
+    """
+
+    WEATHER_KEYWORDS = (
+        "weather", "temperature", "high temp", "low temp",
+        "highest temperature", "lowest temperature",
+        "precip", "rain", "snow", "hurricane",
+    )
 
     def __init__(
         self,
         base_url: str = GAMMA_BASE,
-        include_tags: list[str] | None = None,
-        min_volume_24hr: float = 5000.0,
-        timeout_s: float = 10.0,
+        include_tag_slugs: tuple[str, ...] = DEFAULT_WEATHER_TAG_SLUGS,
+        min_volume_24hr: float = 1000.0,
+        timeout_s: float = 15.0,
     ) -> None:
         self._base = base_url.rstrip("/")
-        self._tags = set(include_tags or ["temperature", "precipitation"])
+        self._tag_slugs = {s.lower() for s in include_tag_slugs}
         self._min_volume = float(min_volume_24hr)
         self._timeout = timeout_s
 
     async def list_active_weather_markets(self) -> list[WeatherEvent]:
+        # We page through a few hundred top events; weather is a small subset.
         url = (
-            f"{self._base}/events?active=true&closed=false"
-            f"&order=volume24hr&ascending=false&limit=100"
+            f"{self._base}/events"
+            "?active=true&closed=false&archived=false"
+            "&order=volume24hr&ascending=false&limit=200"
         )
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            payload = resp.json()
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                payload = resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.error("gamma_fetch_failed", url=url, error=str(exc))
+                return []
+
+        # Gamma returns either a top-level list or {"events": [...]}.
+        if isinstance(payload, dict):
+            payload = payload.get("events") or payload.get("data") or []
+        if not isinstance(payload, list):
+            logger.error("gamma_unexpected_shape", type=str(type(payload)))
+            return []
+
         events: list[WeatherEvent] = []
-        for raw in payload.get("events", payload):
-            tags = set(raw.get("tags", []))
-            if not (tags & self._tags):
-                continue
-            if float(raw.get("volume_24hr", 0.0)) < self._min_volume:
+        for raw in payload:
+            if not isinstance(raw, dict):
                 continue
             try:
-                events.append(_parse_event(raw))
-            except (KeyError, ValueError) as exc:
-                logger.warning("gamma_event_parse_failed", error=str(exc), id=raw.get("id"))
+                event = _parse_event(raw)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "gamma_event_parse_failed",
+                    error=str(exc),
+                    id=raw.get("id"),
+                    title=raw.get("title", "")[:60],
+                )
+                continue
+            if not self._is_weather_event(event):
+                continue
+            if event.volume_24hr < self._min_volume:
+                continue
+            if not event.buckets:
+                logger.info(
+                    "gamma_event_no_buckets_parsed",
+                    id=event.id,
+                    title=event.title[:60],
+                )
+                continue
+            events.append(event)
+
+        logger.info("gamma_weather_events_found", count=len(events))
         return events
+
+    def _is_weather_event(self, event: WeatherEvent) -> bool:
+        tag_hit = any(t in self._tag_slugs for t in event.tags)
+        title_hit = any(kw in event.title.lower() for kw in self.WEATHER_KEYWORDS)
+        return tag_hit or title_hit
 
 
 class MockGammaClient:

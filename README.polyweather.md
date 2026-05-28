@@ -28,18 +28,39 @@ Within 30 seconds the dashboard renders 6 populated tabs:
 
 ## Going live (gated)
 
-```bash
-python scripts/polyweather/discover_markets.py        # one-shot Gamma scan, audit station mappings
-python scripts/polyweather/verify_station_mapping.py  # interactive: mark each market verified
+Three execution tiers, mapped to risk:
 
-# 14 days + 100 closed trades later
-python scripts/polyweather/paper_run.py               # no --mock, real APIs
+| Mode | Data | Orders | Money at risk | Use case |
+|------|------|--------|---------------|----------|
+| `--mock` | fixtures | mocked | none | sanity-check the build |
+| `--live-data` | real Polymarket + real forecasts | mocked | none | 14-day paper validation against real markets |
+| `live_run.py --confirm-live` | real | **real** | yes | only after validation gate is green |
+
+```bash
+# Live-data paper trading (recommended first step against real markets)
+python scripts/polyweather/paper_run.py --live-data           # no creds needed; reads real APIs
+# Watch the dashboard for 14 days. Validation gate gradually fills in.
+
+# One-shot discovery + mapping audit (uses real Gamma API)
+python scripts/polyweather/discover_markets.py
+python scripts/polyweather/verify_station_mapping.py          # interactive: mark each market verified
 
 # Once /api/weather/validation-gate reports READY FOR LIVE: YES
 BOT_MODE=live python scripts/polyweather/live_run.py --confirm-live
-# Or override (NOT recommended) with strict $5 first-24h cap:
+# Override path (NOT recommended) with strict $5 first-24h cap:
 BOT_MODE=live python scripts/polyweather/live_run.py --confirm-live --force-live --bankroll-cap-usdc 200
 ```
+
+### What `--live-data` does and doesn't do
+
+- ✅ Fetches real events from `https://gamma-api.polymarket.com/events`
+- ✅ Uses real Open-Meteo forecasts (no API key needed)
+- ✅ Uses real NWS forecasts if `NWS_USER_AGENT_CONTACT` is set
+- ✅ Uses real Met Office forecasts if `MET_OFFICE_API_KEY` is set
+- ✅ Resolves stations from real market rules text (audit log enabled)
+- ✅ Maintains a real 14-day paper trading history that feeds the validation gate
+- ❌ Does NOT place real orders on Polymarket
+- ❌ Does NOT settle paper trades against real market resolution yet (positions still close at `position_horizon_seconds` with a skill-adjusted draw; real resolution polling is the next milestone before fully-live trading)
 
 ## File layout
 

@@ -43,6 +43,7 @@ class StationResolver:
         self,
         catalog_path: Path | str | None = None,
         audit_log_path: Path | str | None = None,
+        audit_enabled: bool = True,
     ) -> None:
         if catalog_path is None:
             catalog_path = (
@@ -67,6 +68,7 @@ class StationResolver:
             )
         self._audit_path = Path(audit_log_path)
         self._audit_path.parent.mkdir(parents=True, exist_ok=True)
+        self._audit_enabled = bool(audit_enabled)
 
     def resolve(self, market_id: str, rules_text: str) -> ResolvedStation | None:  # noqa: C901
         if not rules_text:
@@ -151,6 +153,11 @@ class StationResolver:
         )
 
     def _audit_raw(self, payload: dict[str, Any]) -> None:
+        # Mock mode disables auditing to keep the file from growing across
+        # every fixture-driven cycle (the user reported 1326 "verified" entries
+        # accumulating in a single demo session).
+        if not self._audit_enabled:
+            return
         try:
             with self._audit_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload) + "\n")

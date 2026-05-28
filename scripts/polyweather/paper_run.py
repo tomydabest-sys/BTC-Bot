@@ -56,6 +56,14 @@ DEFAULT_DB = REPO_ROOT / "data" / "runtime" / "polyweather" / "paper.sqlite"
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--mock", action="store_true", help="Use fixtures instead of live APIs")
+    p.add_argument(
+        "--live-data",
+        action="store_true",
+        help=(
+            "Use REAL Polymarket Gamma + real forecast APIs but PAPER-FILL "
+            "trades (no real money). Required for the 14-day validation gate."
+        ),
+    )
     p.add_argument("--duration", type=float, default=None, help="Wall-time seconds to run")
     p.add_argument("--cycle-seconds", type=float, default=5.0, help="Seconds between cycles")
     p.add_argument("--reset", action="store_true", help="Wipe paper SQLite first")
@@ -95,9 +103,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _reset_db(path: Path) -> None:
-    if path.exists():
-        path.unlink()
-        logger.info("paper_db_reset", path=str(path))
+    """Wipe the paper SQLite and the station audit log together.
+
+    Both files persist across sessions; wiping only one leads to stale
+    audit entries (the user saw 1326 'verified' rows accumulate across
+    several mock runs).
+    """
+    for f in (path, path.with_suffix(".sqlite-wal"), path.with_suffix(".sqlite-shm")):
+        if f.exists():
+            f.unlink()
+            logger.info("paper_db_reset", path=str(f))
+    audit_path = path.parent / "station_audit.jsonl"
+    if audit_path.exists():
+        audit_path.unlink()
+        logger.info("station_audit_reset", path=str(audit_path))
 
 
 async def _status_loop(engine, store, interval_s: float, stop_event: asyncio.Event) -> None:
@@ -131,20 +150,33 @@ async def _status_loop(engine, store, interval_s: float, stop_event: asyncio.Eve
 
 async def run(args: argparse.Namespace) -> int:  # noqa: C901
     _configure_logging(args.log_level)
-    use_mock = args.mock or os.environ.get("BOT_MOCK_DATA", "").lower() == "true"
+    env_mock = os.environ.get("BOT_MOCK_DATA", "").lower() == "true"
+    use_mock = (args.mock or env_mock) and not args.live_data
+    live_data = bool(args.live_data)
 
     # Auto-reset for --mock runs so every demo starts at the configured
     # bankroll. Override with --keep-state if the operator wants to
-    # continue a previous mock session.
+    # continue a previous mock session. --live-data NEVER auto-resets
+    # because the 14-day validation gate needs continuous history.
     should_reset = args.reset or (use_mock and not args.keep_state)
     if should_reset:
         _reset_db(args.db)
 
+    data_label = "MOCK" if use_mock else ("LIVE-DATA" if live_data else "LIVE")
     print(
-        f"polyweather: starting paper bot — mock={use_mock} duration={args.duration} "
+        f"polyweather: starting paper bot — data={data_label} duration={args.duration} "
         f"cycle={args.cycle_seconds}s db={args.db}",
         flush=True,
     )
+    if live_data:
+        print(
+            "polyweather: ⚠ LIVE-DATA mode: reads REAL Polymarket + forecast APIs,",
+            flush=True,
+        )
+        print(
+            "             paper-fills only — no real orders are placed.",
+            flush=True,
+        )
 
     engine_cfg = EngineConfig.from_files(
         risk_yaml=DEFAULT_RISK,
@@ -152,6 +184,7 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
         weights_yaml=DEFAULT_WEIGHTS,
         mode="paper",
         use_mock=use_mock,
+        live_data=live_data,
         cycle_seconds=args.cycle_seconds,
         duration_seconds=args.duration,
     )
@@ -170,7 +203,7 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
         engine_cfg.risk.daily_loss_cooldown_seconds = 60.0
 
     store = PolyWeatherStore(args.db)
-    resolver = StationResolver()
+    resolver = StationResolver(audit_enabled=not use_mock)
     engine = PolyWeatherEngine(engine_cfg, store=store, station_resolver=resolver)
 
     app = create_app(
@@ -252,7 +285,7 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
                 server.should_exit = True
             try:
                 await asyncio.wait_for(dashboard_task, timeout=3.0)
-            except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 dashboard_task.cancel()
                 try:
                     await dashboard_task

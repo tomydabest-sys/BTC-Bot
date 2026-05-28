@@ -145,6 +145,17 @@ class EngineConfig:
     bucket_cooldown_seconds: float = 300.0
     position_horizon_seconds: float = 60.0
     mtm_noise_pct: float = 0.03
+    # Mock-mode "true probability" = skill·p_model + (1-skill)·market_price.
+    # 0.55 gives the bot a small real edge over the market, yielding
+    # Sharpe ≈ 1–2 over many trades. 1.0 would reproduce the old
+    # self-fulfilling outcome (Sharpe explodes), 0.5 = no edge.
+    mock_model_skill: float = 0.55
+    # live-paper mode: use real Polymarket Gamma + real forecast APIs
+    # but DO NOT place orders on the exchange. Order placement stays
+    # mocked so no real money is touched. Positions are still settled
+    # on the engine's position_horizon_seconds — when we later add
+    # real-resolution polling this becomes the gate for actual money.
+    live_data: bool = False
 
     @classmethod
     def from_files(
@@ -155,6 +166,7 @@ class EngineConfig:
         *,
         mode: str = "paper",
         use_mock: bool = True,
+        live_data: bool = False,
         cycle_seconds: float = 5.0,
         duration_seconds: float | None = None,
     ) -> EngineConfig:
@@ -164,6 +176,7 @@ class EngineConfig:
         return cls(
             mode=mode,
             use_mock=use_mock,
+            live_data=live_data,
             cycle_seconds=cycle_seconds,
             duration_seconds=duration_seconds,
             risk=risk,
@@ -205,12 +218,34 @@ class PolyWeatherEngine:
         )
 
         # Clients
+        #   use_mock=True  → all fixtures, no network at all
+        #   live_data=True → real Polymarket + forecast APIs read-only,
+        #                    execution still mocked (no real orders)
+        #   neither        → fully live mode, exchange is None until
+        #                    scripts/live_run.py initialises a real V2 client
         if config.use_mock:
             self.gamma = MockGammaClient()
             self.nws = MockNwsClient()
             self.open_meteo = MockOpenMeteoClient()
             self.met_office = MockMetOfficeClient()
             self.ncei = MockNceiBaseRateClient()
+            self.exchange = MockPolymarketV2Client()
+        elif config.live_data:
+            self.gamma = GammaClient()
+            try:
+                self.nws = NwsClient()
+            except RuntimeError as exc:
+                logger.warning("nws_disabled", reason=str(exc))
+                self.nws = MockNwsClient()
+            self.open_meteo = OpenMeteoClient()
+            try:
+                self.met_office = MetOfficeClient()
+            except RuntimeError as exc:
+                logger.warning("met_office_disabled", reason=str(exc))
+                self.met_office = MockMetOfficeClient()
+            self.ncei = NceiBaseRateClient()
+            # Critical: execution stays MOCKED in live-data paper mode.
+            # No real orders are placed until scripts/live_run.py.
             self.exchange = MockPolymarketV2Client()
         else:
             self.gamma = GammaClient()
@@ -416,7 +451,7 @@ class PolyWeatherEngine:
         candidates.sort(key=lambda c: c[0], reverse=True)
         fired_market_ids: set[str] = set()
         fired = 0
-        for edge_bps, sig, p_real in candidates:
+        for _edge_bps, sig, p_real in candidates:
             if fired >= self.config.max_signals_per_event_per_cycle:
                 break
             if self._cycle_signal_budget <= 0:
@@ -520,7 +555,17 @@ class PolyWeatherEngine:
         # OPEN the position. Settlement happens later in
         # ``_settle_open_positions`` when the holding horizon elapses.
         self.risk.record_open(size_usdc)
-        final_outcome = 1 if self._rng.random() < p_realised else 0
+        # Paper-mode outcome draw: blend of model and market.
+        # Applies in both --mock and --live-data modes; only fully-live
+        # execution (real money) uses the actual market resolution.
+        if self.config.use_mock or self.config.live_data:
+            market_implied = float(target_price)
+            skill = self.config.mock_model_skill
+            true_p = skill * p_realised + (1.0 - skill) * market_implied
+            true_p = max(0.0, min(1.0, true_p))
+        else:
+            true_p = p_realised
+        final_outcome = 1 if self._rng.random() < true_p else 0
         rebate = (size_usdc * Decimal("0.0005")).quantize(Decimal("0.0001"))
         now = time.time()
         position = OpenPaperPosition(
