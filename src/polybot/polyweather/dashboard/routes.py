@@ -475,6 +475,8 @@ def _mode_label(engine, mode: str, mock: bool, halted: bool) -> str:
         return "HALTED"
     if mock:
         return "MOCK"
+    if getattr(engine.config, "live_data", False):
+        return "LIVE-DATA"
     return mode.upper()
 
 

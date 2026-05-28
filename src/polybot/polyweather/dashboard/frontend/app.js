@@ -103,11 +103,25 @@ function renderOverview(data) {
     data.mode === "LIVE" ? "mode-live"
     : data.mode === "PAPER" ? "mode-paper"
     : data.mode === "HALTED" ? "mode-halted"
+    : data.mode === "LIVE-DATA" ? "mode-live-data"
     : "mode-mock"
   );
   const mockWarning = document.getElementById("mock-warning");
   if (mockWarning) {
-    mockWarning.classList.toggle("hidden", data.mode !== "MOCK");
+    if (data.mode === "MOCK") {
+      mockWarning.textContent =
+        "⚠ MOCK MODE — all data is synthetic, no real Polymarket orders are placed. " +
+        "See README.polyweather.md \"Going live\" for how to connect to real markets.";
+      mockWarning.classList.remove("hidden");
+    } else if (data.mode === "LIVE-DATA") {
+      mockWarning.textContent =
+        "🛰 LIVE-DATA mode: reading REAL Polymarket markets + forecasts. " +
+        "Paper-filling only — no money at risk. Required 14 days + 100 trades " +
+        "before live mode can unlock.";
+      mockWarning.classList.remove("hidden");
+    } else {
+      mockWarning.classList.add("hidden");
+    }
   }
 
   const hb = document.getElementById("heartbeat");
