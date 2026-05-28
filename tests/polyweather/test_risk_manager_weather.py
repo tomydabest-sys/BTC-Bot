@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from decimal import Decimal
 
+import pytest
+
 from polybot.polyweather.risk.weather_risk import WeatherRiskConfig, WeatherRiskManager
 
 
@@ -67,6 +69,64 @@ def test_can_open_blocks_when_over_exposure_cap() -> None:
     assert "exposure" in reason
 
 
+def _mgr_weighted() -> WeatherRiskManager:
+    return WeatherRiskManager(
+        WeatherRiskConfig(),
+        mode="paper",
+        strategy_weights={"negative_risk_arb": 0.20, "weather_ensemble": 0.70},
+    )
+
+
+def test_strategy_exposure_cap_is_weight_times_bankroll() -> None:
+    mgr = _mgr_weighted()
+    # 0.20 × 1260 = 252
+    assert mgr.strategy_exposure_cap_usdc("negative_risk_arb") == Decimal("252")
+    assert mgr.strategy_exposure_cap_usdc("weather_ensemble") == Decimal("882")
+
+
+def test_strategy_exposure_cap_blocks_concentration() -> None:
+    mgr = _mgr_weighted()
+    mgr.record_open(Decimal("250"), strategy="negative_risk_arb")
+    ok, reason = mgr.can_open(Decimal("5"), strategy="negative_risk_arb")
+    assert not ok
+    assert "strategy_exposure_cap:negative_risk_arb" in reason
+    # A different strategy with headroom is unaffected by arb's concentration.
+    ok2, _ = mgr.can_open(Decimal("5"), strategy="weather_ensemble")
+    assert ok2
+
+
+def test_strategy_exposure_cap_allows_within_weight() -> None:
+    mgr = _mgr_weighted()
+    mgr.record_open(Decimal("100"), strategy="negative_risk_arb")
+    ok, reason = mgr.can_open(Decimal("10"), strategy="negative_risk_arb")
+    assert ok, reason
+
+
+def test_strategy_with_no_weight_is_uncapped_per_strategy() -> None:
+    mgr = WeatherRiskManager(WeatherRiskConfig(), mode="paper", strategy_weights={})
+    assert mgr.strategy_exposure_cap_usdc("anything") is None
+    ok, _ = mgr.can_open(Decimal("5"), strategy="anything")
+    assert ok
+
+
+def test_record_close_releases_strategy_exposure() -> None:
+    mgr = _mgr_weighted()
+    mgr.record_open(Decimal("250"), strategy="negative_risk_arb")
+    assert not mgr.can_open(Decimal("5"), strategy="negative_risk_arb")[0]
+    mgr.record_close(Decimal("250"), Decimal("3"), strategy="negative_risk_arb")
+    assert mgr.strategy_open_exposure_usdc("negative_risk_arb") == Decimal("0")
+    ok, _ = mgr.can_open(Decimal("5"), strategy="negative_risk_arb")
+    assert ok
+
+
+def test_can_open_without_strategy_skips_per_strategy_cap() -> None:
+    # Backward compatible: callers that omit ``strategy`` are unaffected.
+    mgr = _mgr_weighted()
+    mgr.state.open_exposure_by_strategy["negative_risk_arb"] = Decimal("500")
+    ok, _ = mgr.can_open(Decimal("5"))
+    assert ok
+
+
 def test_kelly_size_returns_zero_for_negative_edge() -> None:
     mgr = _mgr()
     out = mgr.quarter_kelly_size(p_win=0.10, target_price=Decimal("0.50"))
@@ -77,6 +137,38 @@ def test_kelly_size_capped_at_1pct_bankroll() -> None:
     mgr = _mgr()
     sized = mgr.quarter_kelly_size(p_win=0.95, target_price=Decimal("0.10"))
     assert sized <= mgr.weather_position_cap_usdc()
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        # discounted cap = $12 × (price / $0.05):
+        (Decimal("0.001"), Decimal("0")),    # cap $0.24 < $1.50 min → abstain
+        (Decimal("0.01"), Decimal("2.40")),  # cap $12 × 0.2
+        (Decimal("0.05"), Decimal("12")),    # discount = 1.0 → full cap
+        (Decimal("0.10"), Decimal("12")),    # discount clamped to 1.0 → full cap
+    ],
+)
+def test_tail_price_sizing_discounts_the_cap(price: Decimal, expected: Decimal) -> None:
+    """Bug B: long-shot prices must not size to the full position cap.
+
+    ``p_win`` is high enough that quarter-Kelly wants far more than the cap at
+    every price, so the (tail-discounted) cap is the binding constraint. Before
+    the fix all four prices sized to the full $12 cap — and an $0.001 fill that
+    lost cost ~$11.99.
+    """
+    mgr = _mgr()
+    sized = mgr.quarter_kelly_size(p_win=0.95, target_price=price)
+    assert sized == expected
+
+
+def test_tail_discount_never_inflates_above_base_cap() -> None:
+    """The discount only ever shrinks the cap, never grows it."""
+    mgr = _mgr()
+    base_cap = mgr.weather_position_cap_usdc()
+    for price in (Decimal("0.02"), Decimal("0.20"), Decimal("0.50"), Decimal("0.95")):
+        sized = mgr.quarter_kelly_size(p_win=0.99, target_price=price)
+        assert sized <= base_cap
 
 
 def test_consecutive_loss_pause_auto_recovers() -> None:
@@ -120,3 +212,49 @@ def test_daily_loss_cooldown_auto_recovers() -> None:
     halted2, _ = mgr.check_kill_switch()
     assert not halted2
     assert mgr.state.daily_pnl == Decimal("0")
+
+
+def test_halt_recovery_seconds_none_when_not_halted() -> None:
+    assert _mgr().halt_recovery_in_seconds() is None
+
+
+def test_halt_recovery_seconds_for_daily_halt_counts_down() -> None:
+    cfg = WeatherRiskConfig(daily_loss_cooldown_seconds=86400.0)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.daily_pnl = Decimal("-60")
+    halted, _ = mgr.check_kill_switch()
+    assert halted and mgr.state.halt_kind == "daily"
+    rec = mgr.halt_recovery_in_seconds()
+    assert rec is not None and 86000.0 < rec <= 86400.0
+    # As the halt ages, the countdown shrinks.
+    mgr.state.halt_started_ts -= 3600.0
+    assert mgr.halt_recovery_in_seconds() < rec
+
+
+def test_halt_recovery_seconds_for_consecutive_halt() -> None:
+    cfg = WeatherRiskConfig(consecutive_loss_pause_seconds=1800.0)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.consecutive_losses = 5
+    mgr.check_kill_switch()
+    assert mgr.state.halt_kind == "consecutive"
+    rec = mgr.halt_recovery_in_seconds()
+    assert rec is not None and 1700.0 < rec <= 1800.0
+
+
+def test_halt_recovery_seconds_none_for_permanent_ath_kill() -> None:
+    mgr = _mgr()
+    mgr.state.ath_bankroll = Decimal("1000")
+    mgr.state.current_bankroll = Decimal("795")
+    mgr.check_kill_switch()
+    assert mgr.state.ath_killed
+    # ATH kill is permanent → no countdown, signalling "manual reset".
+    assert mgr.halt_recovery_in_seconds() is None
+
+
+def test_halt_recovery_seconds_clamped_at_zero() -> None:
+    cfg = WeatherRiskConfig(daily_loss_cooldown_seconds=100.0)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.halted = True
+    mgr.state.halt_kind = "daily"
+    mgr.state.halt_started_ts = time.time() - 1000.0  # long past the window
+    assert mgr.halt_recovery_in_seconds() == 0.0

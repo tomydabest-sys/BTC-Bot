@@ -240,6 +240,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
         return {
             "halted": halted,
             "halt_reason": halt_reason,
+            "halt_kind": engine.risk.state.halt_kind,
+            # Seconds until an auto-recovering halt (daily / consecutive) lifts;
+            # None when not halted or when the halt is the permanent ATH kill.
+            "halt_recovery_in_seconds": engine.risk.halt_recovery_in_seconds(),
             "current_bankroll_usdc": engine.risk.state.current_bankroll,
             "ath_bankroll_usdc": engine.risk.state.ath_bankroll,
             "max_drawdown_pct": float(max_dd),
@@ -384,6 +388,8 @@ def _empty_risk() -> dict[str, Any]:
     return {
         "halted": False,
         "halt_reason": "",
+        "halt_kind": "",
+        "halt_recovery_in_seconds": None,
         "current_bankroll_usdc": Decimal("1260"),
         "ath_bankroll_usdc": Decimal("1260"),
         "max_drawdown_pct": 0.0,

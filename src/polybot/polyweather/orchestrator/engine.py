@@ -144,6 +144,12 @@ class EngineConfig:
     max_signals_per_event_per_cycle: int = 1
     max_signals_per_cycle: int = 1
     bucket_cooldown_seconds: float = 300.0
+    # Negative-risk arb is a *basket* trade: every bucket in an event is one
+    # leg. Without a guard the engine drains one leg per cycle for the same
+    # event (Bug A — 8 Seoul arb fills in a minute). Once arb opens a leg on
+    # an event we skip all further arb evaluation for that event until this
+    # cooldown elapses. One hour by default; trimmed down for tests.
+    arb_event_cooldown_seconds: float = 3600.0
     position_horizon_seconds: float = 60.0
     mtm_noise_pct: float = 0.03
     # Mock-mode "true probability" = skill·p_model + (1-skill)·market_price.
@@ -200,7 +206,9 @@ class PolyWeatherEngine:
         self.config = config
         self.store = store
         self.metrics = EngineMetrics()
-        self.risk = WeatherRiskManager(config.risk, mode=config.mode)
+        self.risk = WeatherRiskManager(
+            config.risk, mode=config.mode, strategy_weights=config.strategy_weights
+        )
         self.station_resolver = station_resolver or StationResolver()
 
         # Strategies
@@ -267,6 +275,9 @@ class PolyWeatherEngine:
         self._open_positions: list[OpenPaperPosition] = []
         # market_id → last fill timestamp; honoured by ``_bucket_in_cooldown``
         self._last_fill_ts: dict[str, float] = {}
+        # event_id → last timestamp an arb leg opened on that event; honoured
+        # by ``_event_arb_in_cooldown`` so arb can't churn a basket leg-by-leg.
+        self._last_event_arb_fired_ts: dict[str, float] = {}
         # Inject a deterministic equity tick at startup so the dashboard
         # always shows something.
         self.store.record_equity(
@@ -375,6 +386,17 @@ class PolyWeatherEngine:
             return False
         return (time.time() - last) < self.config.bucket_cooldown_seconds
 
+    def _event_arb_in_cooldown(self, event_id: str) -> bool:
+        """True if arb already opened a leg on this event recently.
+
+        Prevents the negative-risk arb from firing one basket leg per cycle
+        across many cycles for the same event (Bug A).
+        """
+        last = self._last_event_arb_fired_ts.get(event_id, 0.0)
+        if last == 0.0:
+            return False
+        return (time.time() - last) < self.config.arb_event_cooldown_seconds
+
     async def _check_real_resolutions(self, cycle_id: str) -> None:
         """Settle any open paper position whose Polymarket market has closed.
 
@@ -439,26 +461,29 @@ class PolyWeatherEngine:
         # gives the bot a realistic cadence instead of firing 30 trades at once.
         candidates: list[tuple[float, Any, float]] = []  # (edge_bps, signal, p_realised)
 
-        # Negative-risk arb on the basket
-        arb_view = EventBucketsView(
-            event_id=event.id,
-            station=station.icao,
-            city=station.city,
-            buckets=[
-                {
-                    "id": b.id, "best_ask": b.best_ask, "best_bid": b.best_bid,
-                    "bucket_low": b.bucket_low, "bucket_high": b.bucket_high,
-                    "token_id_yes": b.token_id_yes, "token_id_no": b.token_id_no,
-                }
-                for b in event.buckets
-            ],
-        )
-        for sig in self.s_arb.evaluate(arb_view):
-            if self._bucket_in_cooldown(sig.market_id):
-                continue
-            edge = float(sig.metadata.get("edge_bps", 0.0))
-            p_real = float(sig.metadata.get("fair_value", 0.2))
-            candidates.append((edge, sig, p_real))
+        # Negative-risk arb on the basket. Skip entirely if arb already
+        # opened a leg on this event within the cooldown window — otherwise
+        # the engine would drain one basket leg per cycle (Bug A).
+        if not self._event_arb_in_cooldown(event.id):
+            arb_view = EventBucketsView(
+                event_id=event.id,
+                station=station.icao,
+                city=station.city,
+                buckets=[
+                    {
+                        "id": b.id, "best_ask": b.best_ask, "best_bid": b.best_bid,
+                        "bucket_low": b.bucket_low, "bucket_high": b.bucket_high,
+                        "token_id_yes": b.token_id_yes, "token_id_no": b.token_id_no,
+                    }
+                    for b in event.buckets
+                ],
+            )
+            for sig in self.s_arb.evaluate(arb_view):
+                if self._bucket_in_cooldown(sig.market_id):
+                    continue
+                edge = float(sig.metadata.get("edge_bps", 0.0))
+                p_real = float(sig.metadata.get("fair_value", 0.2))
+                candidates.append((edge, sig, p_real))
 
         # Per-bucket ensemble + meanrev
         for bucket in event.buckets:
@@ -577,7 +602,7 @@ class PolyWeatherEngine:
             )
             return
 
-        ok, reason = self.risk.can_open(size_usdc)
+        ok, reason = self.risk.can_open(size_usdc, strategy=signal.strategy)
         if not ok:
             self.store.record_decision(
                 cycle_id=cycle_id,
@@ -621,7 +646,7 @@ class PolyWeatherEngine:
 
         # OPEN the position. Settlement happens later in
         # ``_settle_open_positions`` when the holding horizon elapses.
-        self.risk.record_open(size_usdc)
+        self.risk.record_open(size_usdc, strategy=signal.strategy)
         # Paper-mode outcome draw: blend of model and market.
         # Applies in both --mock and --live-data modes; only fully-live
         # execution (real money) uses the actual market resolution.
@@ -666,6 +691,10 @@ class PolyWeatherEngine:
         )
         # Cool the bucket so the same market isn't retraded next cycle.
         self._last_fill_ts[signal.market_id] = now
+        # Arb is a basket trade — once one leg opens, lock the whole event so
+        # the remaining legs aren't drained one-per-cycle (Bug A).
+        if signal.strategy == self.s_arb.name:
+            self._last_event_arb_fired_ts[event.id] = now
 
         self.store.record_decision(
             cycle_id=cycle_id,
@@ -752,7 +781,7 @@ class PolyWeatherEngine:
                 },
             )
             self.store.record_trade(trade)
-            self.risk.record_close(pos.size_usdc, realised_pnl)
+            self.risk.record_close(pos.size_usdc, realised_pnl, strategy=pos.strategy)
             self.store.record_decision(
                 cycle_id=cycle_id,
                 strategy=pos.strategy,

@@ -25,6 +25,19 @@ function fmtNum(x, dp = 4) {
   return n.toFixed(dp);
 }
 
+function fmtDuration(seconds) {
+  // "23h45m", "45m", "0m" — used for the halt-recovery countdown.
+  if (seconds === null || seconds === undefined) return "—";
+  const n = typeof seconds === "string" ? parseFloat(seconds) : seconds;
+  if (Number.isNaN(n) || n < 0) return "—";
+  const total = Math.round(n);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (h > 0) return `${h}h${String(m).padStart(2, "0")}m`;
+  if (m > 0) return `${m}m`;
+  return `${total}s`;
+}
+
 function fmtStat(x, dp = 3) {
   // Like fmtNum but renders explicit "N/A (need 30+)" when the backend
   // reports null — used for Sharpe/Brier where small samples are meaningless.
@@ -271,12 +284,24 @@ function renderRisk(data) {
   _riskEverHadData = true;
   hideError("risk-empty");
   const summary = document.getElementById("risk-summary");
+  // Halt line: show a "next attempt in HHmm" countdown for auto-recovering
+  // halts (daily / consecutive); call out the ATH kill as a manual reset.
+  let haltLine = `<p>Halted: <b class="positive">no</b></p>`;
+  if (data.halted) {
+    let recovery;
+    if (data.halt_recovery_in_seconds === null || data.halt_recovery_in_seconds === undefined) {
+      recovery = " — permanent (manual reset required)";
+    } else {
+      recovery = ` — next attempt in ${fmtDuration(data.halt_recovery_in_seconds)}`;
+    }
+    haltLine = `<p>Halted: <b class="negative">YES — ${data.halt_reason}</b>${recovery}</p>`;
+  }
   summary.innerHTML = `
     <p>Bankroll: <b>${fmtMoney(data.current_bankroll_usdc)}</b> (ATH ${fmtMoney(data.ath_bankroll_usdc)})</p>
     <p>Max drawdown: <b>${fmtPct(data.max_drawdown_pct * 100)}</b></p>
     <p>Open exposure: <b>${fmtMoney(data.open_exposure_usdc)}</b> / cap ${fmtMoney(data.open_exposure_cap_usdc)}</p>
     <p>Consecutive losses: <b>${data.consecutive_losses}</b></p>
-    <p>Halted: <b class="${data.halted ? "negative" : "positive"}">${data.halted ? "YES — " + data.halt_reason : "no"}</b></p>
+    ${haltLine}
   `;
   const ksBody = document.querySelector("#risk-killswitches tbody");
   ksBody.innerHTML = "";

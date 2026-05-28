@@ -15,7 +15,7 @@ clears expired pauses so the dashboard isn't stuck in HALTED forever.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 
@@ -62,6 +62,7 @@ class WeatherRiskState:
     current_bankroll: Decimal = Decimal("1260")
     ath_bankroll: Decimal = Decimal("1260")
     open_exposure: Decimal = Decimal("0")
+    open_exposure_by_strategy: dict[str, Decimal] = field(default_factory=dict)
     daily_pnl: Decimal = Decimal("0")
     weekly_pnl: Decimal = Decimal("0")
     consecutive_losses: int = 0
@@ -76,7 +77,12 @@ class WeatherRiskState:
 class WeatherRiskManager:
     """All-Decimal money math; floats only enter via probabilities."""
 
-    def __init__(self, config: WeatherRiskConfig, mode: str = "paper") -> None:
+    def __init__(
+        self,
+        config: WeatherRiskConfig,
+        mode: str = "paper",
+        strategy_weights: dict[str, float] | None = None,
+    ) -> None:
         self.config = config
         self.mode = mode
         self.state = WeatherRiskState(
@@ -86,6 +92,14 @@ class WeatherRiskManager:
         # First-24h-live override is hard-coded — bot caps individual positions
         # at $5 for the first 24h regardless of config (per the prompt).
         self._hard_first_24h_cap = Decimal("5")
+        # Per-strategy concentration: each strategy's open exposure is capped at
+        # ``weight × current_bankroll`` (e.g. negative_risk_arb at 0.20 can hold
+        # at most ~$252 of $1260). Weights come from strategy_weights.yaml; a
+        # strategy with no weight (or no weights configured) is uncapped here
+        # and only bounded by the global exposure cap.
+        self.strategy_weights: dict[str, Decimal] = {
+            str(k): Decimal(str(v)) for k, v in (strategy_weights or {}).items()
+        }
 
     # ─── caps ────────────────────────────────────────────────────────
 
@@ -112,7 +126,16 @@ class WeatherRiskManager:
         if f <= 0:
             return Decimal("0")
         f *= float(self.config.kelly_fraction_multiplier)
-        cap = self.weather_position_cap_usdc()
+        # Fat-tail guard (Bug B): standard Kelly will happily bet the full 1%
+        # cap on a long-shot price where the model claims a huge edge — e.g. an
+        # $0.001 token at "800 bps over model". Such a bet loses ~100% of its
+        # stake with ~99.9% probability; eight of them in a row drained ~$96.
+        # Scale the cap down linearly below $0.05 so tail bets can't reach the
+        # full position cap. At $0.05+ the discount is 1.0 (no change). Prices
+        # whose discounted cap falls below ``position_minimum_usdc`` size to 0,
+        # so the bot abstains from the tiniest long-shots entirely.
+        tail_discount = min(Decimal("1"), target_price / Decimal("0.05"))
+        cap = (self.weather_position_cap_usdc() * tail_discount).quantize(Decimal("0.0001"))
         sized = self.state.current_bankroll * Decimal(str(f))
         sized = sized.quantize(Decimal("0.0001"))
         sized = min(sized, cap)
@@ -190,13 +213,51 @@ class WeatherRiskManager:
             return False
         return (time.time() - self.state.halt_started_ts) >= window_s
 
+    def halt_cooldown_seconds(self) -> float | None:
+        """The cooldown window for the current halt kind, or None.
+
+        ATH kills are permanent (no auto-recovery) so they return None.
+        """
+        if self.state.halt_kind == "daily":
+            return self.config.daily_loss_cooldown_seconds
+        if self.state.halt_kind == "consecutive":
+            return self.config.consecutive_loss_pause_seconds
+        return None
+
+    def halt_recovery_in_seconds(self) -> float | None:
+        """Seconds until an auto-recovering halt lifts.
+
+        ``None`` when not halted or when the halt is permanent (ATH kill), so
+        the dashboard can render "permanent — manual reset" vs a countdown.
+        Clamped at 0 so an expired-but-not-yet-cleared halt reads "0s".
+        """
+        if not self.state.halted or self.state.halt_started_ts <= 0:
+            return None
+        window = self.halt_cooldown_seconds()
+        if window is None:
+            return None
+        return max(0.0, (self.state.halt_started_ts + window) - time.time())
+
     def reset_ath_kill(self) -> None:
         """Operator-only manual reset after an ATH drawdown halt."""
         self.state.ath_killed = False
         self._clear_halt()
         self.state.ath_bankroll = self.state.current_bankroll
 
-    def can_open(self, notional_usdc: Decimal) -> tuple[bool, str]:
+    def strategy_exposure_cap_usdc(self, strategy: str) -> Decimal | None:
+        """Max open exposure for ``strategy`` = weight × current bankroll.
+
+        ``None`` when the strategy has no configured weight (uncapped here).
+        """
+        weight = self.strategy_weights.get(strategy)
+        if weight is None:
+            return None
+        return (self.state.current_bankroll * weight).quantize(Decimal("0.0001"))
+
+    def strategy_open_exposure_usdc(self, strategy: str) -> Decimal:
+        return self.state.open_exposure_by_strategy.get(strategy, Decimal("0"))
+
+    def can_open(self, notional_usdc: Decimal, strategy: str | None = None) -> tuple[bool, str]:
         halted, reason = self.check_kill_switch()
         if halted:
             return False, reason
@@ -208,15 +269,34 @@ class WeatherRiskManager:
             return False, (
                 f"total_exposure_cap {projected} > {self.config.max_total_open_exposure_usdc}"
             )
+        # Per-strategy concentration cap (Bug D): one strategy can't soak up the
+        # whole bankroll. ``negative_risk_arb`` at weight 0.20 tops out at ~$252.
+        if strategy is not None:
+            strat_cap = self.strategy_exposure_cap_usdc(strategy)
+            if strat_cap is not None:
+                strat_projected = self.strategy_open_exposure_usdc(strategy) + notional_usdc
+                if strat_projected > strat_cap:
+                    return False, (
+                        f"strategy_exposure_cap:{strategy} {strat_projected} > {strat_cap}"
+                    )
         return True, "ok"
 
     # ─── bookkeeping ─────────────────────────────────────────────────
 
-    def record_open(self, notional_usdc: Decimal) -> None:
+    def record_open(self, notional_usdc: Decimal, strategy: str | None = None) -> None:
         self.state.open_exposure += notional_usdc
+        if strategy is not None:
+            self.state.open_exposure_by_strategy[strategy] = (
+                self.strategy_open_exposure_usdc(strategy) + notional_usdc
+            )
 
-    def record_close(self, notional_usdc: Decimal, pnl_usdc: Decimal) -> None:
+    def record_close(
+        self, notional_usdc: Decimal, pnl_usdc: Decimal, strategy: str | None = None
+    ) -> None:
         self.state.open_exposure = max(Decimal("0"), self.state.open_exposure - notional_usdc)
+        if strategy is not None:
+            remaining = self.strategy_open_exposure_usdc(strategy) - notional_usdc
+            self.state.open_exposure_by_strategy[strategy] = max(Decimal("0"), remaining)
         self.state.daily_pnl += pnl_usdc
         self.state.weekly_pnl += pnl_usdc
         self.state.current_bankroll += pnl_usdc
