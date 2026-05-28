@@ -199,6 +199,31 @@ class WeatherRiskManager:
             return False
         return (time.time() - self.state.halt_started_ts) >= window_s
 
+    def halt_cooldown_seconds(self) -> float | None:
+        """The cooldown window for the current halt kind, or None.
+
+        ATH kills are permanent (no auto-recovery) so they return None.
+        """
+        if self.state.halt_kind == "daily":
+            return self.config.daily_loss_cooldown_seconds
+        if self.state.halt_kind == "consecutive":
+            return self.config.consecutive_loss_pause_seconds
+        return None
+
+    def halt_recovery_in_seconds(self) -> float | None:
+        """Seconds until an auto-recovering halt lifts.
+
+        ``None`` when not halted or when the halt is permanent (ATH kill), so
+        the dashboard can render "permanent — manual reset" vs a countdown.
+        Clamped at 0 so an expired-but-not-yet-cleared halt reads "0s".
+        """
+        if not self.state.halted or self.state.halt_started_ts <= 0:
+            return None
+        window = self.halt_cooldown_seconds()
+        if window is None:
+            return None
+        return max(0.0, (self.state.halt_started_ts + window) - time.time())
+
     def reset_ath_kill(self) -> None:
         """Operator-only manual reset after an ATH drawdown halt."""
         self.state.ath_killed = False

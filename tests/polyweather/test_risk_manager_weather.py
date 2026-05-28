@@ -154,3 +154,49 @@ def test_daily_loss_cooldown_auto_recovers() -> None:
     halted2, _ = mgr.check_kill_switch()
     assert not halted2
     assert mgr.state.daily_pnl == Decimal("0")
+
+
+def test_halt_recovery_seconds_none_when_not_halted() -> None:
+    assert _mgr().halt_recovery_in_seconds() is None
+
+
+def test_halt_recovery_seconds_for_daily_halt_counts_down() -> None:
+    cfg = WeatherRiskConfig(daily_loss_cooldown_seconds=86400.0)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.daily_pnl = Decimal("-60")
+    halted, _ = mgr.check_kill_switch()
+    assert halted and mgr.state.halt_kind == "daily"
+    rec = mgr.halt_recovery_in_seconds()
+    assert rec is not None and 86000.0 < rec <= 86400.0
+    # As the halt ages, the countdown shrinks.
+    mgr.state.halt_started_ts -= 3600.0
+    assert mgr.halt_recovery_in_seconds() < rec
+
+
+def test_halt_recovery_seconds_for_consecutive_halt() -> None:
+    cfg = WeatherRiskConfig(consecutive_loss_pause_seconds=1800.0)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.consecutive_losses = 5
+    mgr.check_kill_switch()
+    assert mgr.state.halt_kind == "consecutive"
+    rec = mgr.halt_recovery_in_seconds()
+    assert rec is not None and 1700.0 < rec <= 1800.0
+
+
+def test_halt_recovery_seconds_none_for_permanent_ath_kill() -> None:
+    mgr = _mgr()
+    mgr.state.ath_bankroll = Decimal("1000")
+    mgr.state.current_bankroll = Decimal("795")
+    mgr.check_kill_switch()
+    assert mgr.state.ath_killed
+    # ATH kill is permanent → no countdown, signalling "manual reset".
+    assert mgr.halt_recovery_in_seconds() is None
+
+
+def test_halt_recovery_seconds_clamped_at_zero() -> None:
+    cfg = WeatherRiskConfig(daily_loss_cooldown_seconds=100.0)
+    mgr = WeatherRiskManager(cfg, mode="paper")
+    mgr.state.halted = True
+    mgr.state.halt_kind = "daily"
+    mgr.state.halt_started_ts = time.time() - 1000.0  # long past the window
+    assert mgr.halt_recovery_in_seconds() == 0.0
