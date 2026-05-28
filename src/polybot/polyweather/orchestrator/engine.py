@@ -43,6 +43,7 @@ from polybot.polyweather.data.forecasts.open_meteo_client import (
     OpenMeteoClient,
 )
 from polybot.polyweather.data.stations.station_resolver import StationResolver
+from polybot.polyweather.exchanges.clob_client import CLOBClient, MockCLOBClient
 from polybot.polyweather.exchanges.gamma_client import (
     GammaClient,
     MockGammaClient,
@@ -230,6 +231,7 @@ class PolyWeatherEngine:
             self.met_office = MockMetOfficeClient()
             self.ncei = MockNceiBaseRateClient()
             self.exchange = MockPolymarketV2Client()
+            self.clob = MockCLOBClient()
         elif config.live_data:
             self.gamma = GammaClient()
             try:
@@ -247,12 +249,14 @@ class PolyWeatherEngine:
             # Critical: execution stays MOCKED in live-data paper mode.
             # No real orders are placed until scripts/live_run.py.
             self.exchange = MockPolymarketV2Client()
+            self.clob = CLOBClient()
         else:
             self.gamma = GammaClient()
             self.nws = NwsClient()
             self.open_meteo = OpenMeteoClient()
             self.met_office = MetOfficeClient()
             self.ncei = NceiBaseRateClient()
+            self.clob = CLOBClient()
             # Live exchange instantiated on demand by scripts/live_run.py
             self.exchange = None  # type: ignore[assignment]
 
@@ -316,8 +320,14 @@ class PolyWeatherEngine:
         self.metrics.last_cycle_at = time.time()
         cycle_id = f"{self.metrics.cycles:05d}"
 
-        # 1. Mark-to-market existing open positions; settle any whose horizon
-        #    has elapsed. New realised P&L is recorded here.
+        # 1a. In live-data mode, poll Polymarket for any open position whose
+        #     underlying market has just resolved. This overrides the
+        #     horizon-timer settlement with the actual real outcome.
+        if self.config.live_data and not self.config.use_mock:
+            await self._check_real_resolutions(cycle_id)
+
+        # 1b. Mark-to-market existing open positions; settle any whose horizon
+        #     has elapsed. New realised P&L is recorded here.
         self._settle_open_positions(cycle_id)
 
         # 2. Pull markets and look for new opportunities — but cap how many
@@ -365,6 +375,52 @@ class PolyWeatherEngine:
             return False
         return (time.time() - last) < self.config.bucket_cooldown_seconds
 
+    async def _check_real_resolutions(self, cycle_id: str) -> None:
+        """Settle any open paper position whose Polymarket market has closed.
+
+        Strategy: fetch the current list of active weather events. Any of
+        our open positions whose ``market_id`` is *not* in that list has
+        either closed, archived, or fallen below volume threshold. We then
+        look up the resolved outcome via a single Gamma read.
+        """
+        if not self._open_positions:
+            return
+        try:
+            events = await self.gamma.list_active_weather_markets()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("resolution_check_skipped", error=str(exc))
+            return
+        live_market_ids = {
+            bucket.id
+            for event in events
+            for bucket in event.buckets
+        }
+        now = time.time()
+        for pos in self._open_positions:
+            if pos.market_id in live_market_ids:
+                continue
+            # Market no longer listed as active. In live mode we'd resolve
+            # against the on-chain CTF outcome; for v1 we assume "resolved
+            # YES" if the last CLOB midpoint we saw was > 0.5, else NO.
+            try:
+                mid = await self.clob.fetch_midpoint(pos.token_id)
+            except Exception:  # noqa: BLE001
+                mid = None
+            if mid is None or mid <= 0:
+                # Can't verify — leave the horizon timer to handle it.
+                continue
+            real_outcome = 1 if mid > 0.5 else 0
+            if pos.final_outcome != real_outcome:
+                logger.info(
+                    "real_resolution_override",
+                    market_id=pos.market_id,
+                    horizon_outcome=pos.final_outcome,
+                    real_outcome=real_outcome,
+                    mid=mid,
+                )
+            pos.final_outcome = real_outcome
+            pos.closes_at = now  # force immediate settlement in _settle_open_positions
+
     async def _evaluate_event(self, cycle_id: str, event: WeatherEvent, station) -> None:  # noqa: C901
         # Forecasts (mock or live)
         forecast_om = await self.open_meteo.forecast(station.lat, station.lon)
@@ -408,6 +464,16 @@ class PolyWeatherEngine:
         for bucket in event.buckets:
             if self._bucket_in_cooldown(bucket.id):
                 continue
+            # In live-data mode, refresh price from the CLOB orderbook
+            # rather than relying on Gamma's cached snapshot. CLOB returns
+            # what the bot would have actually transacted against.
+            best_bid, best_ask = bucket.best_bid, bucket.best_ask
+            if self.config.live_data and not self.config.use_mock:
+                book = await self.clob.fetch_book(bucket.token_id_yes)
+                if book is not None and book.bids and book.asks:
+                    best_bid = book.best_bid
+                    best_ask = book.best_ask
+            bucket_unit = getattr(bucket, "unit", "F")
             base_rate = self.ncei.bucket_base_rate(
                 station.icao, end_dt.date().isoformat(), bucket.bucket_low, bucket.bucket_high
             )
@@ -418,6 +484,7 @@ class PolyWeatherEngine:
                 bucket_high=bucket.bucket_high,
                 target_horizon_h=horizon_h,
                 base_rate=base_rate,
+                bucket_unit=bucket_unit,
             )
             view = WeatherMarketView(
                 market_id=bucket.id,
@@ -428,8 +495,8 @@ class PolyWeatherEngine:
                 token_id_no=bucket.token_id_no,
                 bucket_low=bucket.bucket_low,
                 bucket_high=bucket.bucket_high,
-                best_bid=bucket.best_bid,
-                best_ask=bucket.best_ask,
+                best_bid=best_bid,
+                best_ask=best_ask,
                 horizon_hours=horizon_h,
                 forecast=forecast,
             )
