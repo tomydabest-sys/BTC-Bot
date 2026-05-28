@@ -30,6 +30,15 @@
     {"market_id": "m28", "rules": "HKG temperature reading.", "expected_station": "VHHH"},
     {"market_id": "m29", "rules": "Seoul Incheon (RKSI) high temp.", "expected_station": "RKSI"},
     {"market_id": "m30", "rules": "Le Bourget high temp.", "expected_station": "LFPB"},
+    {"market_id": "m31", "rules": "High temperature at Amsterdam Schiphol (EHAM) as reported by KNMI.", "expected_station": "EHAM"},
+    {"market_id": "m32", "rules": "Resolution uses the daily high at Schiphol, Amsterdam.", "expected_station": "EHAM"},
+    {"market_id": "m33", "rules": "Denver International Airport (KDEN) high temperature per the National Weather Service.", "expected_station": "KDEN"},
+    {"market_id": "m34", "rules": "The high temperature in Denver as reported by the National Weather Service.", "expected_station": "KDEN"},
+    {"market_id": "m35", "rules": "Tokyo Haneda Airport (RJTT) daily high temperature.", "expected_station": "RJTT"},
+    {"market_id": "m36", "rules": "High temperature measured at Haneda, Tokyo.", "expected_station": "RJTT"},
+    {"market_id": "m37", "rules": "Mexico City Benito Juarez (MMMX) high temperature.", "expected_station": "MMMX"},
+    {"market_id": "m38", "rules": "Daily high temperature in Mexico City.", "expected_station": "MMMX"},
+    {"market_id": "m39", "rules": "London Heathrow (EGLL) high temperature as reported by the Met Office.", "expected_station": "EGLC"},
     {"market_id": "m_unresolvable", "rules": "Some city in space with no known weather station.", "expected_station": null}
   ]
 }

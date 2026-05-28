@@ -71,3 +71,31 @@ stations:
     lon: 2.4414
     source: "OpenMeteo"
     country: "FR"
+  EHAM:
+    city: "Amsterdam"
+    aliases: ["Amsterdam Schiphol", "Schiphol", "Amsterdam", "AMS"]
+    lat: 52.3105
+    lon: 4.7683
+    source: "OpenMeteo"
+    country: "NL"
+  KDEN:
+    city: "Denver"
+    aliases: ["Denver International", "Denver", "DEN"]
+    lat: 39.8561
+    lon: -104.6737
+    source: "NWS"
+    country: "US"
+  RJTT:
+    city: "Tokyo"
+    aliases: ["Tokyo Haneda", "Haneda", "Tokyo", "HND"]
+    lat: 35.5494
+    lon: 139.7798
+    source: "OpenMeteo"
+    country: "JP"
+  MMMX:
+    city: "Mexico City"
+    aliases: ["Mexico City Benito Juarez", "Benito Juarez", "Mexico City", "MEX"]
+    lat: 19.4363
+    lon: -99.0721
+    source: "OpenMeteo"
+    country: "MX"
