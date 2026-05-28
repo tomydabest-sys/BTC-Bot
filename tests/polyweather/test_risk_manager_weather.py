@@ -69,6 +69,64 @@ def test_can_open_blocks_when_over_exposure_cap() -> None:
     assert "exposure" in reason
 
 
+def _mgr_weighted() -> WeatherRiskManager:
+    return WeatherRiskManager(
+        WeatherRiskConfig(),
+        mode="paper",
+        strategy_weights={"negative_risk_arb": 0.20, "weather_ensemble": 0.70},
+    )
+
+
+def test_strategy_exposure_cap_is_weight_times_bankroll() -> None:
+    mgr = _mgr_weighted()
+    # 0.20 × 1260 = 252
+    assert mgr.strategy_exposure_cap_usdc("negative_risk_arb") == Decimal("252")
+    assert mgr.strategy_exposure_cap_usdc("weather_ensemble") == Decimal("882")
+
+
+def test_strategy_exposure_cap_blocks_concentration() -> None:
+    mgr = _mgr_weighted()
+    mgr.record_open(Decimal("250"), strategy="negative_risk_arb")
+    ok, reason = mgr.can_open(Decimal("5"), strategy="negative_risk_arb")
+    assert not ok
+    assert "strategy_exposure_cap:negative_risk_arb" in reason
+    # A different strategy with headroom is unaffected by arb's concentration.
+    ok2, _ = mgr.can_open(Decimal("5"), strategy="weather_ensemble")
+    assert ok2
+
+
+def test_strategy_exposure_cap_allows_within_weight() -> None:
+    mgr = _mgr_weighted()
+    mgr.record_open(Decimal("100"), strategy="negative_risk_arb")
+    ok, reason = mgr.can_open(Decimal("10"), strategy="negative_risk_arb")
+    assert ok, reason
+
+
+def test_strategy_with_no_weight_is_uncapped_per_strategy() -> None:
+    mgr = WeatherRiskManager(WeatherRiskConfig(), mode="paper", strategy_weights={})
+    assert mgr.strategy_exposure_cap_usdc("anything") is None
+    ok, _ = mgr.can_open(Decimal("5"), strategy="anything")
+    assert ok
+
+
+def test_record_close_releases_strategy_exposure() -> None:
+    mgr = _mgr_weighted()
+    mgr.record_open(Decimal("250"), strategy="negative_risk_arb")
+    assert not mgr.can_open(Decimal("5"), strategy="negative_risk_arb")[0]
+    mgr.record_close(Decimal("250"), Decimal("3"), strategy="negative_risk_arb")
+    assert mgr.strategy_open_exposure_usdc("negative_risk_arb") == Decimal("0")
+    ok, _ = mgr.can_open(Decimal("5"), strategy="negative_risk_arb")
+    assert ok
+
+
+def test_can_open_without_strategy_skips_per_strategy_cap() -> None:
+    # Backward compatible: callers that omit ``strategy`` are unaffected.
+    mgr = _mgr_weighted()
+    mgr.state.open_exposure_by_strategy["negative_risk_arb"] = Decimal("500")
+    ok, _ = mgr.can_open(Decimal("5"))
+    assert ok
+
+
 def test_kelly_size_returns_zero_for_negative_edge() -> None:
     mgr = _mgr()
     out = mgr.quarter_kelly_size(p_win=0.10, target_price=Decimal("0.50"))

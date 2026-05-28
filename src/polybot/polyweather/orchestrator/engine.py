@@ -206,7 +206,9 @@ class PolyWeatherEngine:
         self.config = config
         self.store = store
         self.metrics = EngineMetrics()
-        self.risk = WeatherRiskManager(config.risk, mode=config.mode)
+        self.risk = WeatherRiskManager(
+            config.risk, mode=config.mode, strategy_weights=config.strategy_weights
+        )
         self.station_resolver = station_resolver or StationResolver()
 
         # Strategies
@@ -600,7 +602,7 @@ class PolyWeatherEngine:
             )
             return
 
-        ok, reason = self.risk.can_open(size_usdc)
+        ok, reason = self.risk.can_open(size_usdc, strategy=signal.strategy)
         if not ok:
             self.store.record_decision(
                 cycle_id=cycle_id,
@@ -644,7 +646,7 @@ class PolyWeatherEngine:
 
         # OPEN the position. Settlement happens later in
         # ``_settle_open_positions`` when the holding horizon elapses.
-        self.risk.record_open(size_usdc)
+        self.risk.record_open(size_usdc, strategy=signal.strategy)
         # Paper-mode outcome draw: blend of model and market.
         # Applies in both --mock and --live-data modes; only fully-live
         # execution (real money) uses the actual market resolution.
@@ -779,7 +781,7 @@ class PolyWeatherEngine:
                 },
             )
             self.store.record_trade(trade)
-            self.risk.record_close(pos.size_usdc, realised_pnl)
+            self.risk.record_close(pos.size_usdc, realised_pnl, strategy=pos.strategy)
             self.store.record_decision(
                 cycle_id=cycle_id,
                 strategy=pos.strategy,
