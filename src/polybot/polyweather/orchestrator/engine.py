@@ -719,26 +719,23 @@ class PolyWeatherEngine:
     def _settle_open_positions(self, cycle_id: str) -> None:
         """Mark every open position to market; settle expired ones.
 
-        Mark-to-market = linear interp from entry_price → final_outcome over
-        the holding window plus a small noise term that decays toward zero
-        as we approach settlement. Realised P&L only lands when ``now >=
-        closes_at``; until then the position contributes via
-        ``unrealized_pnl_usdc``.
+        Honest mark-to-market: a binary position is worth roughly what we paid
+        for it until the market actually resolves — we do NOT know the outcome
+        in advance, so the mark must NOT drift toward the pre-sampled 0/1
+        outcome. (Doing so produced a fake unrealised spike: positions
+        "destined to win" marked toward $1.00, inflating equity by +100% on
+        cheap long-shots, then cratering at settlement.) Instead we mark at the
+        entry price plus a small mean-zero wiggle, bounded by ``mtm_noise_pct``
+        of entry. Realised P&L — the real binary payoff — only lands at
+        settlement, giving a smooth, stepwise equity curve.
         """
         if not self._open_positions:
             return
         now = time.time()
         still_open: list[OpenPaperPosition] = []
         for pos in self._open_positions:
-            elapsed = max(0.0, now - pos.opened_at)
-            window = max(0.001, pos.closes_at - pos.opened_at)
-            progress = min(1.0, elapsed / window)
-            target = Decimal("1.00") if pos.final_outcome == 1 else Decimal("0.00")
-            # Path: entry → target with shrinking noise
-            noise_scale = self.config.mtm_noise_pct * (1.0 - progress)
-            noise = Decimal(str((self._rng.random() - 0.5) * noise_scale * 2))
-            drift = (target - pos.entry_price) * Decimal(str(progress))
-            mark = pos.entry_price + drift + noise
+            wiggle = Decimal(str((self._rng.random() - 0.5) * 2 * self.config.mtm_noise_pct))
+            mark = pos.entry_price * (Decimal("1") + wiggle)
             # Clamp to a sensible range
             if mark < Decimal("0.001"):
                 mark = Decimal("0.001")
@@ -750,7 +747,8 @@ class PolyWeatherEngine:
                 still_open.append(pos)
                 continue
 
-            # Settlement
+            # Settlement — realise the binary outcome.
+            target = Decimal("1.00") if pos.final_outcome == 1 else Decimal("0.00")
             exit_price = target
             realised_pnl = (exit_price - pos.entry_price) * pos.size_tokens
             realised_pnl = (realised_pnl + pos.rebate_usdc).quantize(Decimal("0.0001"))
