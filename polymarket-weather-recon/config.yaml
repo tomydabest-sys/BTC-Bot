@@ -1,0 +1,261 @@
+# Polymarket Weather-Market Recon — central configuration
+# Config-driven by design: NO endpoints, addresses, windows, keywords, or
+# thresholds are hard-coded in source. Everything tunable lives here.
+#
+# Status flags reflect what was VERIFIED LIVE during Phase 0 recon
+# (see FINDINGS.md). "reachable: false" means blocked by the environment's
+# network allowlist ("Host not in allowlist"), not a permanent property of
+# the source. If the allowlist is widened, flip the flag and the relevant
+# ingester becomes usable.
+
+project:
+  name: polymarket-weather-recon
+  timezone: UTC
+
+# ---------------------------------------------------------------------------
+# Data sources. `reachable` was determined empirically in Phase 0.
+# ---------------------------------------------------------------------------
+sources:
+  gamma:
+    base_url: "https://gamma-api.polymarket.com"
+    reachable: true            # verified 200
+    role: "market & event metadata; weather-market discovery"
+    page_limit_max: 100        # /markets and /events cap at 100 rows/request
+    notes: >
+      clobTokenIds / outcomes / outcomePrices are STRINGIFIED JSON arrays.
+      tag_slug filter on /markets appears ignored; filter client-side on the
+      `tags` array + keyword pass instead. /public-search?q= caps ~50/type.
+
+  data_api:
+    base_url: "https://data-api.polymarket.com"
+    reachable: true            # verified 200
+    role: "PRIMARY trade source under current allowlist (taker-side fills, wallet-attributed)"
+    page_limit_max: 250        # /trades caps at 250 rows/request regardless of higher limit
+    paginate_step: 250
+    notes: >
+      /trades and /activity give ONE wallet (proxyWallet) + side per fill;
+      maker counterparty is NOT exposed (would need subgraph/on-chain).
+      /activity adds usdcSize + type. /positions gives avgPrice/realizedPnl/
+      cashPnl (PnL proxy). /holders gives current holder snapshot. Paginate
+      by offset in steps of 250 until a page returns 0 rows. Deep-offset
+      results beyond the real count are unreliable artifacts.
+
+  clob:
+    base_url: "https://clob.polymarket.com"
+    reachable: true            # verified 200
+    role: "live book snapshots (Phase 8) + coarse historical price series"
+    notes: >
+      /book /midpoint /price work for ACTIVE markets. /prices-history works
+      with explicit startTs&endTs (+fidelity minutes) even for CLOSED markets,
+      but point density tracks actual activity. interval=1m is invalid (400);
+      interval=max + fidelity works on active tokens. NO full order-book
+      history (placements/cancels are off-chain in the matching engine).
+
+  subgraph_goldsky:
+    base_url: "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw"
+    reachable: false           # BLOCKED: "Host not in allowlist"
+    role: "INTENDED primary trade source (maker+taker, fees, log index) — currently unavailable"
+    candidate_endpoints:
+      orderbook: "/subgraphs/orderbook-subgraph-polygon/prod/gn"
+      positions: "/subgraphs/positions-subgraph/prod/gn"
+      activity:  "/subgraphs/activity-subgraph/prod/gn"
+      pnl:       "/subgraphs/pnl-subgraph/prod/gn"
+    notes: "Enable by adding api.goldsky.com to the network allowlist, then verify schema live."
+
+  onchain_polygon:
+    rpc_urls:                  # ALL verified BLOCKED ("Host not in allowlist")
+      - "https://polygon-rpc.com"
+      - "https://rpc.ankr.com/polygon"
+      - "https://polygon.drpc.org"
+      - "https://polygon-bor-rpc.publicnode.com"
+    polygonscan: "https://api.polygonscan.com"   # BLOCKED
+    reachable: false
+    role: "INTENDED fallback/verification (OrderFilled / OrdersMatched decode) — currently unavailable"
+    # Well-known addresses kept for reference. MUST be re-verified against
+    # Polygonscan/Polymarket docs before any on-chain decode is trusted.
+    contracts_unverified:
+      ctf_exchange: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+      neg_risk_ctf_exchange: "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+      neg_risk_adapter: "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+      conditional_tokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+      usdc: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    abi_source_github_raw: "https://raw.githubusercontent.com/Polymarket"  # raw.githubusercontent.com IS reachable
+    notes: "ABIs can be fetched from GitHub raw, but decoding still needs an allowlisted RPC (none currently)."
+
+# ---------------------------------------------------------------------------
+# Weather reference (Phase 3.5). archive-api.open-meteo.com is BLOCKED, but
+# the forecast endpoint returns ~90 days of past data via past_days, and NWS
+# is reachable. Resolution sources observed are Wunderground URLs carrying an
+# embedded station code (e.g. KLGA) — exact resolution value would need
+# Wunderground (scrape/blocked); Open-Meteo/NWS at the same station are a
+# faithful proxy of the observable for reaction-latency analysis.
+# ---------------------------------------------------------------------------
+weather_reference:
+  open_meteo:
+    forecast_url: "https://api.open-meteo.com/v1/forecast"   # reachable; past_days up to ~92
+    archive_url: "https://archive-api.open-meteo.com/v1/archive"  # BLOCKED
+    reachable: true
+    past_days_max: 92
+  nws:
+    base_url: "https://api.weather.gov"      # reachable; temps in degC; recent-observation retention is limited
+    reachable: true
+    user_agent: "polymarket-weather-recon (research; contact via repo)"
+  # Station -> coordinates for Open-Meteo (which needs lat/lon, not a code).
+  # Codes are parsed from each market's Wunderground resolutionSource.
+  stations:
+    KLGA: {lat: 40.7769, lon: -73.8740, tz: "America/New_York", city: "New York City"}
+    EGLC: {lat: 51.5048, lon: 0.0495, tz: "Europe/London", city: "London"}
+    LFPG: {lat: 49.0097, lon: 2.5479, tz: "Europe/Paris", city: "Paris"}
+    KORD: {lat: 41.9742, lon: -87.9073, tz: "America/Chicago", city: "Chicago"}
+    KMIA: {lat: 25.7959, lon: -80.2870, tz: "America/New_York", city: "Miami"}
+
+# ---------------------------------------------------------------------------
+# Weather-market discovery (Phase 1)
+# ---------------------------------------------------------------------------
+weather_discovery:
+  keywords:
+    - temperature
+    - temp
+    - weather
+    - rain
+    - rainfall
+    - precipitation
+    - snow
+    - snowfall
+    - hurricane
+    - storm
+    - climate
+    - degrees
+    - "°f"
+    - "°c"
+    - nws
+    - wind
+    - "wind speed"
+    - heat
+    - cold
+    - hottest
+    - coldest
+    - "highest temperature"
+    - "lowest temperature"
+  # Tag labels observed on real weather events; matched case-insensitively
+  # against the event `tags` array.
+  tag_labels:
+    - Weather
+    - temperature
+    - "Daily Temperature"
+  # Strings that frequently produce false positives — flag for manual review.
+  ambiguous_terms:
+    - storm        # "Storm" (sports/teams), "perfect storm"
+    - heat         # "Miami Heat", "heat check"
+    - climate      # political "climate" markets
+  # Daily-temperature events have deterministic slugs; enumerate by date for a
+  # precise window (public-search caps at ~50 and mixes years). Verified live.
+  event_slug_template: "highest-temperature-in-{city}-on-{month}-{day}-{year}"
+  metric: temperature
+  city_slugs:
+    "New York City": nyc
+    London: london
+    Paris: paris
+    Chicago: chicago
+    Miami: miami
+
+# ---------------------------------------------------------------------------
+# Units / conventions — VERIFIED in Phase 0 against a live weather market.
+# ---------------------------------------------------------------------------
+conventions:
+  price_range: [0.0, 1.0]      # price in USDC per share, verified [0.001, 0.999]
+  min_tick: 0.001
+  size_unit: "shares (outcome tokens)"   # Data API returns human decimals, NOT 6dp raw
+  usdc_notional: "size * price"          # /activity provides usdcSize directly
+  data_api_decimals: "already human-readable (no 1e6 division)"
+  onchain_decimals_if_used: {usdc: 6, outcome_token: 6}
+
+# ---------------------------------------------------------------------------
+# Bounded first-ingestion window (Phase 2). Validate end-to-end here BEFORE
+# scaling to all weather markets / full history.
+# ---------------------------------------------------------------------------
+ingestion:
+  bounded_window:
+    lookback_days: 30
+    cities: ["New York City"]      # KLGA — single rich daily-temperature series
+    metrics: ["temperature"]
+  scale_up_window:                 # after bounded validation passes
+    lookback_days: 60
+    cities: ["New York City", "London", "Paris", "Chicago", "Miami"]
+    metrics: ["temperature"]
+  http:
+    timeout_seconds: 30
+    max_retries: 4
+    backoff_base_seconds: 2        # 2,4,8,16
+    polite_delay_seconds: 0.2
+
+# ---------------------------------------------------------------------------
+# Storage. SQLite is the system of record (BTC-Bot integration priority);
+# DuckDB is an optional read-only analytics layer over the same SQLite file
+# / parquet exports.
+# ---------------------------------------------------------------------------
+storage:
+  engine: sqlite
+  sqlite_path: "data/processed/recon.sqlite"
+  duckdb_optional: true
+
+# ---------------------------------------------------------------------------
+# Phase 8 — forward live-book capture (OPTIONAL, confirmed). Standalone
+# long-running collector; snapshots top-of-book + depth so Phases 3-6 can later
+# run over real quoting data (maker churn / rebate harvesting).
+# ---------------------------------------------------------------------------
+phase8_live_capture:
+  cities: ["New York City"]
+  forward_days: 2          # discover active events for today .. today+N
+  cadence_seconds: 15      # snapshot interval
+  capture_depth: true      # store full levels (on book-hash change) not just top-of-book
+  depth_levels: 15         # max levels per side to persist
+  capture_both_outcomes: false  # YES token only (NO ~= 1-YES) to bound volume
+  max_tokens: 200          # safety cap on number of books polled per cycle
+
+# ---------------------------------------------------------------------------
+# Detection thresholds (Phase 4) — placeholders to be calibrated on data.
+# ---------------------------------------------------------------------------
+thresholds:
+  bot_score:
+    min_score_trades: 30        # wallets below this are 'unscored' (too few trades)
+    cv_gap_machine: 0.6         # cv_gap below => machine-like cadence
+    breadth_systematic: 8       # distinct markets => systematic
+    burst_machine_per_sec: 3    # >=N fills in one second => machine burst
+    reaction_min_classifiable: 5
+    # transparent linear weights (sum ~1). Each component is a 0-1 sub-score.
+    weights:
+      cadence_regularity: 0.20  # low cv_gap
+      activity_247: 0.20        # many active UTC hours
+      size_regularity: 0.15     # repeated fixed size
+      breadth: 0.20             # many simultaneous markets
+      burstiness: 0.15          # multi-fill seconds
+      reaction: 0.10            # directional alignment with realised temp
+  clustering:
+    min_cluster_size: 10
+    features:                   # standardised feature subset used for clustering
+      - cv_gap
+      - hour_entropy
+      - active_hours
+      - breadth_markets
+      - mode_size_frac
+      - max_trades_per_sec
+      - extreme_price_frac
+      - reaction_alignment
+  operators:
+    cotrade_window_s: 2         # two wallets trading one market within Ns => co-trade
+    min_cotrade_markets: 5      # repeated across >=N markets => same operator
+
+# ---------------------------------------------------------------------------
+# P1 resolution-drift backtest (Option-1 prototype). The peak-passed gate is
+# CAUSAL: it uses only data available up to the decision time (no peeking at the
+# final daily max).
+# ---------------------------------------------------------------------------
+backtest_p1:
+  min_peak_hour_local: 13       # daily high rarely before ~1pm local
+  decline_margin_f: 1.0         # temp must fall this far below running-max to call the peak
+  decline_readings: 1           # for >= this many consecutive readings
+  taker_fee: 0.0                # base case (Polymarket historically ~0 taker)
+  taker_fee_stress: 0.02        # stressed fee sensitivity
+  entry: first_trade            # executable-price proxy: first YES print at/after signal
+  per_entry_cap_usdc: 50        # capacity cap per fired market

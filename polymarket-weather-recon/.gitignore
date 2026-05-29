@@ -15,6 +15,11 @@ reports/wallet_features.csv
 *.sqlite-wal
 *.sqlite-shm
 
+# BTC-Bot's ROOT .gitignore ignores `config.yaml` (user-specific BTC-Bot config).
+# This project's config.yaml is essential + non-secret (config-driven design) and
+# MUST be committed, so re-include it here.
+!config.yaml
+
 # python
 __pycache__/
 *.pyc
