@@ -32,13 +32,31 @@ trade-before-the-final-peak version does worse, ~25%), because of a **systematic
 are only **2°F wide**. The modeled 2m temperature reads hotter than the official
 station high used to resolve, so the rule buys the bucket one step too high.
 
-**Therefore the reference source below MUST be the actual station observation
-feed (NWS METAR for the station, e.g. KLGA via `api.weather.gov`, or the
-Wunderground resolver) — NOT Open-Meteo.** Spot-check: NWS KLGA daily max
-84.2°F → resolved bucket 84-85°F (exact) on 2026-05-27. Alternatives:
-bias-correct Open-Meteo and skip entries within ~1-2°F of a bucket edge; or use
-the **market price's own convergence** as the trigger. This is the single most
-important change before P1 is viable.
+**Therefore a weather-model reference (Open-Meteo) cannot drive bucket-level
+entries.** Two viable paths remain: (a) the actual station feed (NWS METAR /
+Wunderground), or — preferred and now backtested — (b) the **market price's own
+convergence** as the trigger (no weather feed at all).
+
+## 1b. ✅ Recommended implementation: MARKET-PRICE trigger (backtested positive)
+`reports/backtest_p1_market.md` tests entering a bucket's YES once its price
+crosses θ on the resolution day, holding to resolution (trade-stream execution
+proxy; causal; single-city/30-day, in-sample):
+
+| θ | hit rate | avg entry | ROI (fee 0) | ROI (fee 2%) |
+|--:|--:|--:|--:|--:|
+| 0.50 | 52% | 0.535 | −1.7% | −5.5% |
+| 0.70 | 77% | 0.741 | +7.5% | +4.8% |
+| **0.80** | **90%** | **0.828** | **+12.4%** | **+9.9%** |
+| 0.90 | 96% | 0.910 | +9.3% | +7.1% |
+| 0.95 | 100% | 0.955 | +4.7% | +2.6% |
+
+The market **underprices near-certain winners**: at θ=0.80 the bucket trades ~0.83
+but wins 90% of the time. Net positive across θ=0.7–0.95 even at a stressed 2%
+fee, peaking at **θ≈0.80 on the resolution day**. This needs **no weather feed**,
+sidestepping §1a entirely. Caveats: in-sample, single city, trade-stream proxy is
+optimistic on fills/impact, modest absolute capacity (~$1.5k deployed → ~$180/mo
+here). **This is the recommended P1 trigger; a faster weather signal (NWS) would
+be additive, letting you enter before the price has fully converged.**
 
 ## 2. Market selection (preconditions)
 - Weather **daily-temperature neg-risk events** (the ~11-bucket structure from

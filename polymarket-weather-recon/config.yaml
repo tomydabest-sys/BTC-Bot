@@ -260,3 +260,13 @@ backtest_p1:
   entry: first_trade            # executable-price proxy: first YES print at/after signal
   per_entry_cap_usdc: 50        # capacity cap per fired market
   reference_source: open_meteo  # which reference_temp source drives the trigger (open_meteo|nws)
+
+# Market-price-triggered P1 variant: ignore the weather feed entirely; let the
+# book's own convergence reveal the likely winner, then capture the residual gap
+# to $1. Causal (price crossing is observable live; outcome only for PnL).
+backtest_p1_market:
+  thetas: [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]   # YES-price thresholds to sweep
+  resolution_day_only: true                  # only trigger on the resolution day
+  taker_fee: 0.0
+  taker_fee_stress: 0.02
+  per_entry_cap_usdc: 50
