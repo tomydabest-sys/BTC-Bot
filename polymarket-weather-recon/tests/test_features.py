@@ -102,15 +102,15 @@ def test_bucket_center():
 
 def test_market_backtest_metrics_pnl():
     from src.analyze.backtest_p1_market import _metrics
-    entries = [  # one winner, one loser, both entered at 0.8 with 10 shares
-        {"entry_price": 0.8, "won": 1, "shares": 10, "notional": 8, "edge_share": 0.2},
-        {"entry_price": 0.8, "won": 0, "shares": 10, "notional": 8, "edge_share": -0.8},
+    entries = [  # one winner, one loser, both entered at 0.8 with 100 shares
+        {"entry_price": 0.8, "won": 1, "shares": 100, "notional": 80, "edge_share": 0.2},
+        {"entry_price": 0.8, "won": 0, "shares": 100, "notional": 80, "edge_share": -0.8},
     ]
     m = _metrics(entries, {"taker_fee": 0.0, "taker_fee_stress": 0.02})
     assert m["n"] == 2 and m["hit_rate"] == 0.5
-    assert m["deployed_usdc"] == 16
-    assert m["pnl_fee0"] == -6          # 0.2*10 + (-0.8*10)
-    assert abs(m["pnl_feeStress"] - (-6.4)) < 1e-6   # fee 0.02 * 20 shares = 0.4 extra cost
+    assert m["deployed_usdc"] == 160
+    assert m["pnl_fee0"] == -60                      # 0.2*100 + (-0.8*100)
+    assert m["pnl_feeStress"] == -64                 # fee 0.02 * 200 shares = 4 extra cost
 
 
 if __name__ == "__main__":
