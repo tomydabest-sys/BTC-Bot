@@ -22,6 +22,23 @@ The edge is real but thin and hit-rate-driven; the competition is fast
 (multi-fill-per-second). This is an *execution/timing* edge, not a forecasting
 edge.
 
+## 1a. ⚠️ Backtest result (Option-1 prototype) — REQUIRED design change
+A causal prototype (`reports/backtest_p1.md`) showed the naive
+reference-driven version is **net negative** (hit rate 25%, ROI −16%). Root
+cause, measured: **Open-Meteo's daily max lands in the actual winning bucket only
+11.8% of the time**, with a **systematic +1.36°F bias** (median |bias| 1.6°F) vs
+the resolved bucket — and the buckets are only **2°F wide**. The modeled 2m
+temperature reads hotter than the official station high used to resolve, so the
+rule buys the bucket one step too high.
+
+**Therefore the reference source below MUST be the actual station observation
+feed (NWS METAR for the station, e.g. KLGA via `api.weather.gov`, or the
+Wunderground resolver) — NOT Open-Meteo.** Spot-check: NWS KLGA daily max
+84.2°F → resolved bucket 84-85°F (exact) on 2026-05-27. Alternatives:
+bias-correct Open-Meteo and skip entries within ~1-2°F of a bucket edge; or use
+the **market price's own convergence** as the trigger. This is the single most
+important change before P1 is viable.
+
 ## 2. Market selection (preconditions)
 - Weather **daily-temperature neg-risk events** (the ~11-bucket structure from
   Phase 1), one station per event (parsed from the Wunderground `resolutionSource`,
@@ -32,8 +49,9 @@ edge.
   tail buckets unless running the H3 short variant).
 
 ## 3. Signal definition
-Inputs: station temperature feed (BTC-Bot `data/forecasts/open_meteo_client.py` /
-`nws_client.py`), Gamma market state, CLOB book (`exchanges/clob_client.py`).
+Inputs: station temperature feed — **use `nws_client.py` (actual METAR), not
+`open_meteo_client.py`**, per §1a — Gamma market state, CLOB book
+(`exchanges/clob_client.py`).
 
 Per event, maintain on the resolution day:
 - `running_max` = max observed station temperature so far today (°F).

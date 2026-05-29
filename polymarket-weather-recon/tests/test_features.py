@@ -93,6 +93,13 @@ def test_book_summary_empty_side():
     assert s["best_ask"] == 0.001
 
 
+def test_bucket_center():
+    from src.analyze.backtest_p1 import _bucket_center
+    assert _bucket_center((54.0, 55.0)) == 54.5
+    assert _bucket_center((float("-inf"), 53.0)) == 53.0   # 'or below'
+    assert _bucket_center((84.0, float("inf"))) == 84.0     # 'or above'
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
