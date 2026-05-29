@@ -7,11 +7,9 @@ data/processed/**
 
 # generated dossiers/plots may be large; keep the dirs, ignore contents except
 # curated markdown reports committed explicitly.
-reports/dossiers/*
-!reports/dossiers/.gitkeep
-# full per-wallet feature dump is large + regenerable from the sqlite db
+# dossier .md + plots ARE deliverables (committed). Only the bulky regenerable
+# per-wallet feature dump is excluded.
 reports/wallet_features.csv
-*.png
 *.parquet
 *.sqlite
 *.sqlite-wal

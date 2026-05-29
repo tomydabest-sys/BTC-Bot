@@ -9,20 +9,26 @@ separate BTC-Bot project.
 > calls BTC-Bot's runtime. It lives in its own directory; recommendations are
 > markdown/JSON for review only.
 
-## Status: Phases 0–4 complete (bounded window) — awaiting Phase 4 checkpoint sign-off
+## Status: Phases 0–7 complete (bounded window) — awaiting choice of proposals
 
 Done on the bounded NYC-temperature/30-day window:
 - **P0** recon+scaffold · **P1** discovery (319 markets) · **P2** ingestion
   (159,920 trades, 9,095 wallets, $2.39M taker-side).
 - **P3/3.5** per-wallet features (40 cols) + Open-Meteo KLGA reference & coarse
   reaction alignment.
-- **P4** heuristic bot score + HDBSCAN/KMeans clustering + co-timing operator
-  grouping: **748 scored**, **191 bot_score≥0.5**, **17≥0.7**, **10 operators**.
+- **P4** bot score + HDBSCAN/KMeans + co-timing operators: **748 scored**,
+  **191 bot_score≥0.5**, **17≥0.7**, **10 operators**.
+- **P5** 12 top-bot/operator dossiers (archetype + confidence + plots).
+- **P6** exploits: resolution-drift (≈$0.146/share convergence left on $1.32M
+  resolution-day notional), thin-hour holes, tail-bucket mispricing.
+- **P7** BTC-Bot proposals (P1–P5) + machine-readable `reports/insights.json`.
 
-Outputs: `reports/weather_markets.csv`, `reports/data_quality_phase2.md`,
-`reports/wallet_classification.csv`, `reports/phase4_summary.md`; FINDINGS.md §10.
-Run order: `run_phase1.py → run_phase2.py → run_phase3.py → run_phase4.py`.
-Next stop is the Phase 4 checkpoint (confirm before Phase 5 profiling / scaling).
+Outputs in `reports/`: `weather_markets.csv`, `data_quality_phase2.md`,
+`wallet_classification.csv`, `phase4_summary.md`, `dossiers/`, `exploits.md`,
+`btc_bot_recommendations.md`, `insights.json`. FINDINGS.md §10.
+Run order: `run_phase1 → run_phase2 → run_phase3 → run_phase4 → run_phase5 → run_phase67`.
+**Next:** pick which proposals (P1–P5) to spec; optionally widen the allowlist /
+scale the sample. Nothing is implemented in BTC-Bot.
 
 Start here:
 - **`FINDINGS.md`** — verified facts about every data source (the important read).
