@@ -9,6 +9,8 @@ data/processed/**
 # curated markdown reports committed explicitly.
 reports/dossiers/*
 !reports/dossiers/.gitkeep
+# full per-wallet feature dump is large + regenerable from the sqlite db
+reports/wallet_features.csv
 *.png
 *.parquet
 *.sqlite

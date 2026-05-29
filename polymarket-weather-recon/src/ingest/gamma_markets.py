@@ -46,6 +46,10 @@ def _markets_from_event(event: dict, city: str, metric: str) -> list[dict]:
     for m in event.get("markets", []) or []:
         token_ids = N.parse_json_array(m.get("clobTokenIds"))
         res = m.get("resolutionSource") or event_res
+        prices = [float(p) for p in N.parse_json_array(m.get("outcomePrices")) if p not in (None, "")]
+        resolved, win_idx = 0, None
+        if prices and m.get("closed") and (1.0 in prices and 0.0 in prices):
+            resolved, win_idx = 1, prices.index(max(prices))  # winning outcome = price 1
         rows.append({
             "condition_id": m.get("conditionId"),
             "event_id": event.get("id"),
@@ -63,6 +67,8 @@ def _markets_from_event(event: dict, city: str, metric: str) -> list[dict]:
             "end_date": m.get("endDate") or event.get("endDate"),
             "closed": 1 if m.get("closed") else 0,
             "neg_risk": 1 if (m.get("negRisk") or event.get("negRisk")) else 0,
+            "resolved": resolved,
+            "winning_outcome_index": win_idx,
         })
     return rows
 
@@ -115,12 +121,14 @@ def _persist(rows: list[dict], discovered_at: str) -> None:
                 """INSERT OR REPLACE INTO markets
                    (condition_id,event_id,event_slug,event_title,question,bucket_label,
                     city,metric,token_yes,token_no,resolution_source,station,
-                    start_date,end_date,closed,neg_risk,discovered_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    start_date,end_date,closed,neg_risk,resolved,winning_outcome_index,
+                    discovered_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (r["condition_id"], r["event_id"], r["event_slug"], r["event_title"],
                  r["question"], r["bucket_label"], r["city"], r["metric"],
                  r["token_yes"], r["token_no"], r["resolution_source"], r["station"],
-                 r["start_date"], r["end_date"], r["closed"], r["neg_risk"], discovered_at),
+                 r["start_date"], r["end_date"], r["closed"], r["neg_risk"],
+                 r["resolved"], r["winning_outcome_index"], discovered_at),
             )
     conn.close()
 

@@ -61,6 +61,28 @@ def iso_from_unix(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
 
 
+def parse_bucket_bounds(label: str | None) -> tuple[float, float] | None:
+    """Temperature-bucket label -> (lo, hi) in °F (inclusive-ish).
+    '53°F or below' -> (-inf, 53); '54-55°F' -> (54, 55);
+    '84°F or above' -> (84, inf). Returns None if unparseable."""
+    if not label:
+        return None
+    import re
+    s = label.replace("°F", "").replace("°", "").strip().lower()
+    if "below" in s:
+        m = re.search(r"-?\d+", s)
+        return (float("-inf"), float(m.group())) if m else None
+    if "above" in s:
+        m = re.search(r"-?\d+", s)
+        return (float(m.group()), float("inf")) if m else None
+    # range "A-B" — explicit separator so the middle hyphen isn't read as a sign
+    m = re.search(r"(-?\d+)\s*-\s*(-?\d+)", s)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    m = re.search(r"-?\d+", s)
+    return (float(m.group()), float(m.group())) if m else None
+
+
 def trade_uid(row: dict) -> str:
     """Deterministic id for dedupe/idempotency. The Data API gives one row per
     fill with no log index, so we hash the identifying fields."""

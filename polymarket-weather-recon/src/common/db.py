@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS markets (
     end_date         TEXT,
     closed           INTEGER,
     neg_risk         INTEGER,
+    resolved         INTEGER,        -- 1 if outcomePrices are 0/1
+    winning_outcome_index INTEGER,   -- 0 = YES won, 1 = NO won, NULL = unresolved
     discovered_at    TEXT
 );
 
@@ -82,4 +84,13 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotently add columns introduced after a table already existed."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(markets)").fetchall()}
+    for col, decl in (("resolved", "INTEGER"), ("winning_outcome_index", "INTEGER")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE markets ADD COLUMN {col} {decl}")

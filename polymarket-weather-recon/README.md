@@ -9,13 +9,20 @@ separate BTC-Bot project.
 > calls BTC-Bot's runtime. It lives in its own directory; recommendations are
 > markdown/JSON for review only.
 
-## Status: Phases 0–2 complete (bounded window) — awaiting Phase 2 checkpoint sign-off
+## Status: Phases 0–4 complete (bounded window) — awaiting Phase 4 checkpoint sign-off
 
-Phase 0 (recon+scaffold), Phase 1 (weather-market discovery), and Phase 2
-(trade ingestion for the bounded NYC-temperature/30-day window) are done:
-**319 markets → 159,920 trades, 9,095 wallets, $2.39M** taker-side volume. See
-`reports/weather_markets.csv`, `reports/data_quality_phase2.md`, FINDINGS.md §10.
-Next stop is the Phase 2 checkpoint (confirm before scaling to full history).
+Done on the bounded NYC-temperature/30-day window:
+- **P0** recon+scaffold · **P1** discovery (319 markets) · **P2** ingestion
+  (159,920 trades, 9,095 wallets, $2.39M taker-side).
+- **P3/3.5** per-wallet features (40 cols) + Open-Meteo KLGA reference & coarse
+  reaction alignment.
+- **P4** heuristic bot score + HDBSCAN/KMeans clustering + co-timing operator
+  grouping: **748 scored**, **191 bot_score≥0.5**, **17≥0.7**, **10 operators**.
+
+Outputs: `reports/weather_markets.csv`, `reports/data_quality_phase2.md`,
+`reports/wallet_classification.csv`, `reports/phase4_summary.md`; FINDINGS.md §10.
+Run order: `run_phase1.py → run_phase2.py → run_phase3.py → run_phase4.py`.
+Next stop is the Phase 4 checkpoint (confirm before Phase 5 profiling / scaling).
 
 Start here:
 - **`FINDINGS.md`** — verified facts about every data source (the important read).
