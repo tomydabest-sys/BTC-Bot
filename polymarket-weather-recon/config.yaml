@@ -187,7 +187,7 @@ ingestion:
     timeout_seconds: 30
     max_retries: 4
     backoff_base_seconds: 2        # 2,4,8,16
-    polite_delay_seconds: 0.2
+    polite_delay_seconds: 0.05     # lowered from 0.2 to speed the bounded backfill
 
 # ---------------------------------------------------------------------------
 # Storage. SQLite is the system of record (BTC-Bot integration priority);
