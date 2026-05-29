@@ -15,7 +15,11 @@
 #     not a single open position) before adding it here.
 #
 # Each entry: {address: "0x...", label: "human name"}.
-watch_wallets: []
+watch_wallets:
+  - {address: "0xae2e04fe9d8ccba5e45ba17ddf9dfbef498c40ad", label: "wallet-1"}
+  - {address: "0xdedd94979cb23fe6426d3a7605fa22bb523817e1", label: "wallet-2"}
+  - {address: "0xf1e18ec32b2f1e123bc098e3956e6fd00012c152", label: "wallet-3"}
+  - {address: "0xb40e89677d59665d5188541ad860450a6e2a7cc9", label: "wallet-4"}
 
 # Candidates auto-discovered 2026-05-29 from live weather-market trades, ranked
 # by weather-position value/PnL. UNVERIFIED — these had open weather exposure
