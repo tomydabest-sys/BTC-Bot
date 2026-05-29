@@ -43,6 +43,23 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 # Tag slugs to look for. Polymarket uses both "weather" and "temperature".
 DEFAULT_WEATHER_TAG_SLUGS = ("weather", "temperature", "precipitation", "climate")
 
+# A genuine Polymarket weather market (the https://polymarket.com/weather page)
+# is a daily city high/low *temperature* market — e.g. "Highest temperature in
+# London on May 29". We match that structure explicitly in the title or slug.
+# The previous filter used loose keyword substrings ("rain", "snow", "temp"),
+# which matched "rain" inside "Ukraine" and dragged in NHL, geopolitics and
+# health markets. Precip/hurricane markets are intentionally excluded: the bot
+# only models temperature buckets.
+_TEMP_TITLE_RE = re.compile(
+    r"\b(?:high(?:est)?|low(?:est)?|max(?:imum)?|min(?:imum)?)\s+temp(?:erature)?\b"
+    r"|\btemperature\s+in\b",
+    re.IGNORECASE,
+)
+_TEMP_SLUG_RE = re.compile(
+    r"(?:high|highest|low|lowest|max|min)-temp(?:erature)?",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class WeatherBucket:
@@ -291,18 +308,14 @@ class GammaClient:
     """Live Gamma client. Reads weather events from gamma-api.polymarket.com.
 
     Filtering pipeline:
-      1. ``active=true&closed=false`` at the API
-      2. Local tag filter against ``include_tag_slugs``
-      3. Local title-text filter ("weather", "temperature", "precip")
-      4. Volume threshold
-      5. Skip events with no buckets we could parse
+      1. Query the weather *tag* directly (the /weather page), falling back to a
+         broad active/open fetch if the tag query returns nothing.
+      2. Strict local filter: title or slug must match a city temperature market
+         (excludes NHL / geopolitics / health markets that the old substring
+         keyword filter let through, e.g. "rain" inside "Ukraine").
+      3. Volume threshold.
+      4. Skip events with no buckets we could parse.
     """
-
-    WEATHER_KEYWORDS = (
-        "weather", "temperature", "high temp", "low temp",
-        "highest temperature", "lowest temperature",
-        "precip", "rain", "snow", "hurricane",
-    )
 
     def __init__(
         self,
@@ -313,16 +326,65 @@ class GammaClient:
     ) -> None:
         self._base = base_url.rstrip("/")
         self._tag_slugs = {s.lower() for s in include_tag_slugs}
+        # Primary tag used to query the /weather page directly.
+        self._primary_tag = include_tag_slugs[0] if include_tag_slugs else "weather"
         self._min_volume = float(min_volume_24hr)
         self._timeout = timeout_s
 
     async def list_active_weather_markets(self) -> list[WeatherEvent]:
-        # We page through a few hundred top events; weather is a small subset.
+        # Target the weather tag so we pull the /weather page rather than the
+        # global top-of-book (where weather is a tiny, low-volume slice the
+        # volume sort buries). If the tag query yields nothing (param drift or
+        # empty result) fall back to a broad fetch — EITHER way the strict local
+        # temperature filter below is the final guarantee.
+        payload = await self._fetch_events(tag_slug=self._primary_tag)
+        if not payload:
+            payload = await self._fetch_events(tag_slug=None)
+
+        events: list[WeatherEvent] = []
+        skipped_non_weather = 0
+        for raw in payload:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                event = _parse_event(raw)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "gamma_event_parse_failed",
+                    error=str(exc),
+                    id=raw.get("id"),
+                    title=str(raw.get("title", ""))[:60],
+                )
+                continue
+            if not self._is_weather_event(event):
+                skipped_non_weather += 1
+                continue
+            if event.volume_24hr < self._min_volume:
+                continue
+            if not event.buckets:
+                logger.info(
+                    "gamma_event_no_buckets_parsed",
+                    id=event.id,
+                    title=event.title[:60],
+                )
+                continue
+            events.append(event)
+
+        logger.info(
+            "gamma_weather_events_found",
+            count=len(events),
+            skipped_non_weather=skipped_non_weather,
+        )
+        return events
+
+    async def _fetch_events(self, tag_slug: str | None) -> list[dict]:
         url = (
             f"{self._base}/events"
             "?active=true&closed=false&archived=false"
             "&order=volume24hr&ascending=false&limit=200"
         )
+        if tag_slug:
+            url += f"&tag_slug={tag_slug}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             try:
                 resp = await client.get(url)
@@ -338,41 +400,16 @@ class GammaClient:
         if not isinstance(payload, list):
             logger.error("gamma_unexpected_shape", type=str(type(payload)))
             return []
-
-        events: list[WeatherEvent] = []
-        for raw in payload:
-            if not isinstance(raw, dict):
-                continue
-            try:
-                event = _parse_event(raw)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "gamma_event_parse_failed",
-                    error=str(exc),
-                    id=raw.get("id"),
-                    title=raw.get("title", "")[:60],
-                )
-                continue
-            if not self._is_weather_event(event):
-                continue
-            if event.volume_24hr < self._min_volume:
-                continue
-            if not event.buckets:
-                logger.info(
-                    "gamma_event_no_buckets_parsed",
-                    id=event.id,
-                    title=event.title[:60],
-                )
-                continue
-            events.append(event)
-
-        logger.info("gamma_weather_events_found", count=len(events))
-        return events
+        return payload
 
     def _is_weather_event(self, event: WeatherEvent) -> bool:
-        tag_hit = any(t in self._tag_slugs for t in event.tags)
-        title_hit = any(kw in event.title.lower() for kw in self.WEATHER_KEYWORDS)
-        return tag_hit or title_hit
+        # Strict: must look like a daily city temperature market by title or
+        # slug. This excludes "Ukraine" (substring "rain"), NHL, geopolitics,
+        # health and every other non-weather market the old filter admitted.
+        return bool(
+            _TEMP_TITLE_RE.search(event.title or "")
+            or _TEMP_SLUG_RE.search(event.slug or "")
+        )
 
 
 class MockGammaClient:
