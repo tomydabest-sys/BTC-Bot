@@ -1,22 +1,45 @@
 # P1 variant — market-price-triggered resolution-drift backtest
 
-No weather feed. Trigger: a bucket's YES price crosses **θ** on the resolution day (resolution-day only); enter at that YES print (trade-stream proxy), hold to resolution. Causal — outcome used only for PnL. Single-city/30-day window — indicative.
+No weather feed. Trigger: a bucket's YES price crosses **θ** on the resolution day; enter at that YES print (trade-stream proxy), hold to resolution. Causal — outcome used only for PnL. **NYC = in-sample; London/Paris/Chicago/Miami = OUT-OF-SAMPLE.**
+
+## OUT-OF-SAMPLE (London + Paris + Chicago + Miami) — the real test
 
 | θ | entries | hit rate | avg entry | avg edge/share | deployed$ | PnL(fee0) | ROI(fee0) | ROI(fee 0.02) |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 0.5 | 52 | 0.52 | 0.535 | -0.0158 | 2,556 | -43 | -0.017 | -0.055 |
-| 0.6 | 44 | 0.61 | 0.633 | -0.0192 | 2,128 | -4 | -0.002 | -0.034 |
-| 0.7 | 35 | 0.77 | 0.741 | +0.0302 | 1,691 | 126 | 0.075 | 0.048 |
-| 0.8 | 30 | 0.90 | 0.828 | +0.0720 | 1,452 | 179 | 0.124 | 0.099 |
-| 0.9 | 28 | 0.96 | 0.910 | +0.0547 | 1,357 | 127 | 0.093 | 0.071 |
-| 0.95 | 26 | 1.00 | 0.955 | +0.0447 | 1,300 | 61 | 0.047 | 0.026 |
+| 0.5 | 412 | 0.55 | 0.568 | -0.0165 | 19,982 | 1 | 0.000 | -0.036 |
+| 0.6 | 365 | 0.62 | 0.662 | -0.0433 | 17,797 | -770 | -0.043 | -0.074 |
+| 0.7 | 315 | 0.72 | 0.755 | -0.0372 | 15,212 | -302 | -0.020 | -0.047 |
+| 0.8 | 282 | 0.80 | 0.845 | -0.0438 | 13,756 | -447 | -0.033 | -0.056 |
+| 0.9 | 255 | 0.89 | 0.924 | -0.0379 | 12,539 | -357 | -0.029 | -0.050 |
+| 0.95 | 241 | 0.94 | 0.959 | -0.0216 | 11,924 | -187 | -0.016 | -0.037 |
 
-## Read
-- **Higher θ → higher hit rate but higher entry price** (thinner residual gap to $1). The question is whether any θ stays **net positive after fees**.
-- Best θ by ROI(fee0) gives ROI **0.1236** (hit 0.9, entry 0.828) — **POSITIVE** at zero fee; under the stress fee 0.02 ROI is 0.0994.
-- If even the best θ is ~0/negative after fees, reacting to the book is **too late** — the convergence is already priced. Then P1 only works with a signal *faster than the market* (the resolution-drift snipers' actual edge), not by following price.
+## In-sample (NYC) — for comparison
+
+| θ | entries | hit rate | avg entry | avg edge/share | deployed$ | PnL(fee0) | ROI(fee0) | ROI(fee 0.02) |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 0.5 | 106 | 0.54 | 0.557 | -0.0189 | 5,170 | 49 | 0.009 | -0.028 |
+| 0.6 | 91 | 0.63 | 0.662 | -0.0361 | 4,390 | -62 | -0.014 | -0.045 |
+| 0.7 | 75 | 0.76 | 0.756 | +0.0041 | 3,641 | 163 | 0.045 | 0.018 |
+| 0.8 | 66 | 0.86 | 0.842 | +0.0213 | 3,195 | 210 | 0.066 | 0.042 |
+| 0.9 | 62 | 0.92 | 0.919 | +0.0001 | 3,018 | 88 | 0.029 | 0.007 |
+| 0.95 | 59 | 0.95 | 0.958 | -0.0087 | 2,913 | 11 | 0.004 | -0.017 |
+
+## Per-city @ θ=0.8
+
+| city | entries | hit rate | avg entry | ROI(fee0) | ROI(fee 0.02) |
+|---|--:|--:|--:|--:|--:|
+| Chicago | 65 | 0.86 | 0.893 | -0.024 | -0.047 |
+| London | 75 | 0.76 | 0.833 | -0.066 | -0.090 |
+| Miami | 68 | 0.84 | 0.830 | 0.032 | 0.007 |
+| New York City | 66 | 0.86 | 0.842 | 0.066 | 0.042 |
+| Paris | 74 | 0.76 | 0.830 | -0.065 | -0.089 |
+
+## Verdict
+- Out-of-sample @ θ=0.8: ROI **-0.0325** (fee0) / **-0.0563** (fee 0.02), hit 0.8014, n=282.
+- Best out-of-sample θ by ROI(fee0): 0.0001 (hit 0.551, entry 0.5675).
+- **The θ≈0.8 edge DOES NOT generalise out-of-sample after a stressed fee.** An edge present in every city (per-city table) is far more trustworthy than one driven by one market.
 
 ## Caveats
-- Trade-stream proxy (no historical book): assumes the print price is takeable with no queue/slippage and ignores our own market impact — **optimistic**.
-- Single city / 30 days, in-sample; validate out-of-sample before sizing.
-- Capacity = YES notional transacting at/after the crossing (per-entry cap $50).
+- Trade-stream proxy (no historical book): assumes the print is takeable with no queue/slippage and ignores our own market impact — **optimistic**.
+- ~58-day window per city; still a backtest, not live. Per-entry capacity capped at $50.
+- A faster *weather* signal (NWS live) would let you enter before full price convergence, improving entry prices beyond what reacting to the book can achieve.
