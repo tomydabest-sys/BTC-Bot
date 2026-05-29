@@ -1,7 +1,19 @@
+# Strategy allocation (also the per-strategy open-exposure cap = weight ×
+# bankroll). negative_risk_arb is DISABLED (weight 0): it sprays the sub-15c
+# long-shot tail — the source of 100% of the operator's losses, and the band
+# the weather-wallet research shows bleeds. Bump it above 0 to re-enable.
 weights:
-  weather_ensemble: 0.70
-  negative_risk_arb: 0.20
-  resolution_meanrev: 0.10
+  weather_ensemble: 0.80
+  negative_risk_arb: 0.0
+  resolution_meanrev: 0.20
+
+# Middle-band price gate for weather_ensemble (wallet-research headline
+# finding): only BUY a share priced in [min, max]; sub-min long-shots require
+# p_win >= longshot_override_mult × price (a steep, deliberately rare override).
+price_band:
+  min: 0.15
+  max: 0.85
+  longshot_override_mult: 3.0
 
 edge_threshold_bps:
   weather_ensemble: 800        # 8.00%

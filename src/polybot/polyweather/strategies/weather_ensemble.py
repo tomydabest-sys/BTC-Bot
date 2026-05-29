@@ -52,11 +52,21 @@ class WeatherEnsembleStrategy:
         confidence_min: float = 0.55,
         kelly_multiplier: float = 0.25,
         max_position_pct_bankroll: float = 0.01,
+        band_min: float = 0.15,
+        band_max: float = 0.85,
+        longshot_override_mult: float = 3.0,
     ) -> None:
         self.edge_threshold_bps = float(edge_threshold_bps)
         self.confidence_min = float(confidence_min)
         self.kelly_multiplier = float(kelly_multiplier)
         self.max_position_pct = float(max_position_pct_bankroll)
+        # Middle-band gate (weather-wallet research headline): the durable edge
+        # lives in the uncertain middle, not the cheap longshots. Only buy a
+        # share priced in [band_min, band_max]; sub-band longshots need
+        # p_win >= longshot_override_mult × price (steep, deliberately rare).
+        self.band_min = float(band_min)
+        self.band_max = float(band_max)
+        self.longshot_override_mult = float(longshot_override_mult)
 
     @property
     def name(self) -> str:
@@ -98,6 +108,16 @@ class WeatherEnsembleStrategy:
             return None
 
         if target_price <= 0 or target_price >= 1:
+            return None
+
+        # Middle-band gate. ``p_win`` is the model's probability for the share
+        # we'd actually buy (YES or NO), so the override is correct on both
+        # sides. Paying > band_max for a near-certain share is capital-
+        # inefficient (one bad resolution erases ~20 wins); buying < band_min
+        # is the longshot tail where the studied wallets bleed.
+        if target_price > self.band_max:
+            return None
+        if target_price < self.band_min and p_win < self.longshot_override_mult * target_price:
             return None
 
         b = (1.0 - target_price) / target_price

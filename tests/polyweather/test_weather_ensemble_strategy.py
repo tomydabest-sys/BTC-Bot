@@ -57,6 +57,35 @@ def test_low_confidence_no_signal() -> None:
     assert sig is None
 
 
+def test_longshot_below_band_is_suppressed() -> None:
+    # Edge exists (p 0.25 vs ask 0.10 = 1500 bps) but the share is a sub-15c
+    # long-shot and conviction isn't 3x the price → suppressed (research: the
+    # tail bleeds).
+    strat = WeatherEnsembleStrategy(edge_threshold_bps=500, confidence_min=0.5)
+    assert strat.evaluate(_view(p_model=0.25, best_ask=0.10, best_bid=0.08)) is None
+
+
+def test_longshot_override_allows_high_conviction() -> None:
+    # p_win 0.60 >= 3 × 0.10 → the steep override lets a rare high-conviction
+    # long-shot through.
+    strat = WeatherEnsembleStrategy(edge_threshold_bps=500, confidence_min=0.5)
+    sig = strat.evaluate(_view(p_model=0.60, best_ask=0.10, best_bid=0.08))
+    assert sig is not None and sig.outcome == "YES"
+
+
+def test_expensive_favorite_above_band_is_suppressed() -> None:
+    # Paying 0.90 for a near-certain share is capital-inefficient → suppressed.
+    strat = WeatherEnsembleStrategy(edge_threshold_bps=500, confidence_min=0.5)
+    assert strat.evaluate(_view(p_model=0.99, best_ask=0.90, best_bid=0.88)) is None
+
+
+def test_band_is_configurable_to_harvest_favorites() -> None:
+    # Operator can widen the upper bound to harvest the 65-95c favorite band.
+    strat = WeatherEnsembleStrategy(edge_threshold_bps=500, confidence_min=0.5, band_max=0.95)
+    sig = strat.evaluate(_view(p_model=0.99, best_ask=0.90, best_bid=0.88))
+    assert sig is not None and sig.outcome == "YES"
+
+
 def test_size_pct_respects_kelly_quarter_cap() -> None:
     strat = WeatherEnsembleStrategy(
         edge_threshold_bps=200, confidence_min=0.5, kelly_multiplier=0.25,
