@@ -158,6 +158,16 @@ events like *"Highest temperature in NYC on April 16?"*. Resolving that event:
   / NWS at the SAME station (e.g. KLGA) are a faithful PROXY** of the observable,
   suitable for reaction-latency inference but **not** the exact resolution value.
   Record reference series as proxy, with confidence noted.
+- **Measured (Phase backtest/validation):** Open-Meteo's daily max carries a
+  **systematic +1.36°F warm bias** vs the station resolver and matches the 2°F
+  winning bucket only **~35%** of the time (even with whole-degree rounding) — too
+  coarse to drive bucket-level trading. **NWS METAR** (`/stations/<id>/observations`)
+  is the actual station class used to resolve and matches far better, BUT the API
+  retains only **~2 days** (500-row cap; `limit=1000` → 400). So NWS is a
+  **live/forward** reference only; `reference_temp` is source-tagged
+  (`open_meteo`|`nws`) and `scripts/run_reference_validation.py` accumulates NWS
+  vs resolver accuracy forward (run daily). NWS 5-min METAR is also finer-grained
+  than Open-Meteo's hourly (better for reaction latency too).
 
 ---
 

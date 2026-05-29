@@ -14,7 +14,7 @@
 The peak gate should raise hit rate / edge vs the baseline — that delta is the value of waiting for the causal peak signal (the baseline buys winners AND buckets the temperature later climbs out of).
 
 ## ⚠️ Diagnosis — why this fails: the reference cannot pick the 2°F bucket
-- Open-Meteo daily-max lands in the **actual winning bucket only 12%** of 17 events.
+- Open-Meteo daily-max lands in the **actual winning bucket only 35%** of 17 events.
 - It carries a **systematic bias of 1.36°F** (median |bias| 1.6°F) vs the resolved bucket centre — and the buckets are only **2°F wide**. The modeled 2m temperature reads systematically *hotter* than the official station high used to resolve, so the rule keeps buying the bucket one step too high.
 - **Conclusion:** the ex-post resolution-drift edge is real (exploits.md: ~$0.146/share on $1.32M of winning-side flow) but **NOT capturable with Open-Meteo** as the reference. The backtest correctly kills the naive implementation.
 

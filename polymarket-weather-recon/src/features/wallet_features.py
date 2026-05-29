@@ -31,8 +31,11 @@ def _load(conn):
     markets = pd.read_sql_query(
         "SELECT condition_id, event_slug, bucket_label, station, end_date, "
         "resolved, winning_outcome_index FROM markets", conn)
-    try:
-        reference = pd.read_sql_query("SELECT station, ts, temp_f FROM reference_temp", conn)
+    try:  # historical features use Open-Meteo (NWS has no deep history)
+        reference = pd.read_sql_query(
+            "SELECT station, ts, temp_f FROM reference_temp WHERE source='open_meteo'", conn)
+        if reference.empty:  # pre-migration table without a source column
+            reference = pd.read_sql_query("SELECT station, ts, temp_f FROM reference_temp", conn)
     except Exception:
         reference = pd.DataFrame(columns=["station", "ts", "temp_f"])
     return trades, markets, reference

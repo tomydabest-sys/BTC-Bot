@@ -25,11 +25,12 @@ edge.
 ## 1a. ⚠️ Backtest result (Option-1 prototype) — REQUIRED design change
 A causal prototype (`reports/backtest_p1.md`) showed the naive
 reference-driven version is **net negative** (hit rate 25%, ROI −16%). Root
-cause, measured: **Open-Meteo's daily max lands in the actual winning bucket only
-11.8% of the time**, with a **systematic +1.36°F bias** (median |bias| 1.6°F) vs
-the resolved bucket — and the buckets are only **2°F wide**. The modeled 2m
-temperature reads hotter than the official station high used to resolve, so the
-rule buys the bucket one step too high.
+cause, measured: even with correct whole-degree rounding, **Open-Meteo's daily max
+lands in the actual winning bucket only ~35% of the time** (and the causal,
+trade-before-the-final-peak version does worse, ~25%), because of a **systematic
++1.36°F warm bias** (median |bias| 1.6°F) vs the resolved bucket — and the buckets
+are only **2°F wide**. The modeled 2m temperature reads hotter than the official
+station high used to resolve, so the rule buys the bucket one step too high.
 
 **Therefore the reference source below MUST be the actual station observation
 feed (NWS METAR for the station, e.g. KLGA via `api.weather.gov`, or the

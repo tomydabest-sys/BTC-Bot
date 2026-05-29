@@ -29,8 +29,12 @@ from ..common.db import connect
 log = logging.getLogger("recon.backtest_p1")
 
 
-def _reference_by_day(conn, tz_map):
-    ref = pd.read_sql_query("SELECT station, ts, temp_f FROM reference_temp", conn)
+def _reference_by_day(conn, tz_map, source: str = "open_meteo"):
+    try:
+        ref = pd.read_sql_query(
+            "SELECT station, ts, temp_f FROM reference_temp WHERE source=?", conn, params=(source,))
+    except Exception:
+        ref = pd.read_sql_query("SELECT station, ts, temp_f FROM reference_temp", conn)
     if ref.empty:
         return ref
     ref["dt"] = pd.to_datetime(ref["ts"], unit="s", utc=True)
@@ -87,7 +91,7 @@ def run_backtest() -> dict:
     mk = pd.read_sql_query(
         "SELECT condition_id, event_slug, bucket_label, station, end_date, resolved, "
         "winning_outcome_index FROM markets WHERE resolved=1", conn)
-    ref = _reference_by_day(conn, tz_map)
+    ref = _reference_by_day(conn, tz_map, p.get("reference_source", "open_meteo"))
     conn.close()
     if ref.empty:
         return {"error": "no reference_temp; run Phase 3 first"}
@@ -153,7 +157,7 @@ def _reference_accuracy(mk: pd.DataFrame, ref: pd.DataFrame) -> dict:
         wb = N.parse_bucket_bounds(win["bucket_label"].iloc[0])
         if not wb:
             continue
-        matches.append(int(wb[0] <= ref_max <= wb[1]))
+        matches.append(int(wb[0] <= round(ref_max) <= wb[1]))  # resolver uses whole-degree highs
         center = _bucket_center(wb)
         if center is not None and abs(center) != float("inf"):
             biases.append(ref_max - center)

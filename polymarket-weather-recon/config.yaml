@@ -259,3 +259,4 @@ backtest_p1:
   taker_fee_stress: 0.02        # stressed fee sensitivity
   entry: first_trade            # executable-price proxy: first YES print at/after signal
   per_entry_cap_usdc: 50        # capacity cap per fired market
+  reference_source: open_meteo  # which reference_temp source drives the trigger (open_meteo|nws)
