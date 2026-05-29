@@ -53,6 +53,7 @@ from polybot.polyweather.exchanges.polymarket_v2_client import (
     MockPolymarketV2Client,
     V2Order,
 )
+from polybot.polyweather.exchanges.wallet_watch import WalletWatcher, WalletWatchSnapshot
 from polybot.polyweather.persistence.store import PolyWeatherStore
 from polybot.polyweather.risk.validation_gate import TradePair, WeatherValidationGate
 from polybot.polyweather.risk.weather_risk import WeatherRiskConfig, WeatherRiskManager
@@ -164,6 +165,12 @@ class EngineConfig:
     # entry+wiggle mark and never early-exits (no real book).
     convergence_exit_enabled: bool = True
     convergence_exit_threshold: float = 0.10
+    # Wallet-watch: tracked-trader confirmation signal (dashboard only, never a
+    # trade gate). Operator-supplied addresses; empty by default. Polled on its
+    # own slow cadence (data-api is rate-limited), live-data mode only.
+    wallet_watch_wallets: list[dict[str, str]] = field(default_factory=list)
+    wallet_watch_poll_seconds: float = 120.0
+    wallet_watch_lookback_seconds: float = 86400.0
     # Mock-mode "true probability" = skill·p_model + (1-skill)·market_price.
     # 0.55 gives the bot a small real edge over the market, yielding
     # Sharpe ≈ 1–2 over many trades. 1.0 would reproduce the old
@@ -183,6 +190,7 @@ class EngineConfig:
         markets_yaml: Path,
         weights_yaml: Path,
         *,
+        wallets_yaml: Path | None = None,
         mode: str = "paper",
         use_mock: bool = True,
         live_data: bool = False,
@@ -192,6 +200,9 @@ class EngineConfig:
         risk = WeatherRiskConfig.from_yaml(yaml.safe_load(Path(risk_yaml).read_text()))
         markets = yaml.safe_load(Path(markets_yaml).read_text())
         weights = yaml.safe_load(Path(weights_yaml).read_text())
+        wallets: dict[str, Any] = {}
+        if wallets_yaml is not None and Path(wallets_yaml).exists():
+            wallets = yaml.safe_load(Path(wallets_yaml).read_text()) or {}
         return cls(
             mode=mode,
             use_mock=use_mock,
@@ -204,6 +215,9 @@ class EngineConfig:
             confidence_minimums=dict(weights["confidence_minimum"]),
             price_band=dict(weights.get("price_band", {})),
             target_cities=list(markets.get("target_cities", [])),
+            wallet_watch_wallets=list(wallets.get("watch_wallets", []) or []),
+            wallet_watch_poll_seconds=float(wallets.get("poll_seconds", 120.0)),
+            wallet_watch_lookback_seconds=float(wallets.get("lookback_seconds", 86400.0)),
         )
 
 
@@ -294,6 +308,13 @@ class PolyWeatherEngine:
         # event_id → last timestamp an arb leg opened on that event; honoured
         # by ``_event_arb_in_cooldown`` so arb can't churn a basket leg-by-leg.
         self._last_event_arb_fired_ts: dict[str, float] = {}
+        # Wallet-watch: tracked-trader confirmation signal (dashboard only).
+        self.wallet_watcher = WalletWatcher(
+            config.wallet_watch_wallets,
+            lookback_seconds=config.wallet_watch_lookback_seconds,
+        )
+        self._wallet_watch: WalletWatchSnapshot | None = None
+        self._wallet_watch_last_poll = 0.0
         # Inject a deterministic equity tick at startup so the dashboard
         # always shows something.
         self.store.record_equity(
@@ -303,6 +324,10 @@ class PolyWeatherEngine:
     @property
     def open_positions(self) -> list[OpenPaperPosition]:
         return list(self._open_positions)
+
+    @property
+    def wallet_watch_snapshot(self) -> WalletWatchSnapshot | None:
+        return self._wallet_watch
 
     @property
     def unrealized_pnl_usdc(self) -> Decimal:
@@ -356,6 +381,8 @@ class PolyWeatherEngine:
             #      any favorable convergence (brief §5.2.3) before the
             #      horizon-timer settlement runs.
             await self._reprice_open_positions(cycle_id)
+            # 1a.3 Poll the tracked wallets on their own slow cadence.
+            await self._poll_wallet_watch()
 
         # 1b. Mark-to-market existing open positions; settle any whose horizon
         #     has elapsed. New realised P&L is recorded here.
@@ -472,6 +499,25 @@ class PolyWeatherEngine:
                 )
             pos.final_outcome = real_outcome
             pos.closes_at = now  # force immediate settlement in _settle_open_positions
+
+    async def _poll_wallet_watch(self) -> None:
+        """Refresh the tracked-wallet confirmation signal on its own cadence.
+
+        No-op when no wallets are configured. Polled every
+        ``wallet_watch_poll_seconds`` (data-api is rate-limited), independent
+        of the trading cycle. Failures are swallowed — this is a dashboard
+        signal, never a trade gate.
+        """
+        if not self.wallet_watcher.enabled:
+            return
+        now = time.time()
+        if (now - self._wallet_watch_last_poll) < self.config.wallet_watch_poll_seconds:
+            return
+        self._wallet_watch_last_poll = now
+        try:
+            self._wallet_watch = await self.wallet_watcher.poll(now=now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("wallet_watch_failed", error=str(exc))
 
     async def _evaluate_event(self, cycle_id: str, event: WeatherEvent, station) -> None:  # noqa: C901
         # Forecasts (mock or live)
