@@ -148,6 +148,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
             "drawdown_curve": _drawdown_series(eq),
             "signal_count_today": engine.metrics.signals_total,
             "fill_count_today": engine.metrics.fills_total,
+            "convergence_exits": engine.metrics.convergence_exits,
             "heartbeat": {
                 "last_ts": hb_ts,
                 "age_seconds": hb_age,
@@ -378,6 +379,7 @@ def _empty_overview() -> dict[str, Any]:
         "drawdown_curve": [],
         "signal_count_today": 0,
         "fill_count_today": 0,
+        "convergence_exits": 0,
         "heartbeat": {"last_ts": 0.0, "age_seconds": 9999.0, "status": "red", "count": 0},
         "mode": "MOCK",
         "halt_reason": "",

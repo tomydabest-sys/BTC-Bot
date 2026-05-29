@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -169,7 +169,7 @@ def _parse_end_date(s: str) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -372,7 +372,7 @@ class GammaClient:
         if not payload:
             payload = await self._fetch_events(tag_slug=None)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         events: list[WeatherEvent] = []
         skipped_non_weather = 0
         skipped_resolved = 0

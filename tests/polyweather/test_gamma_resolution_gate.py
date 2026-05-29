@@ -11,11 +11,11 @@ already-decided bucket. These tests pin that resolved/past events are dropped.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from polybot.polyweather.exchanges.gamma_client import GammaClient, WeatherEvent
 
-NOW = datetime(2026, 5, 29, 2, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 5, 29, 2, 0, 0, tzinfo=UTC)
 
 
 def _event(end_date: str = "", *, closed: bool = False) -> WeatherEvent:
