@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -153,6 +154,23 @@ def _parse_bucket_label(label: str) -> tuple[float, float, str]:
         return (v, v, m.group(2).upper())
 
     return (-999.0, 999.0, "F")
+
+
+def _parse_end_date(s: str) -> datetime | None:
+    """Parse a Gamma ISO end-date into an aware UTC datetime, or None.
+
+    Returns None when the field is empty or unparseable so callers can
+    treat "unknown end date" differently from "definitely in the past".
+    """
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _safe_json_list(s: Any) -> list:
@@ -313,8 +331,17 @@ class GammaClient:
       2. Strict local filter: title or slug must match a city temperature market
          (excludes NHL / geopolitics / health markets that the old substring
          keyword filter let through, e.g. "rain" inside "Ukraine").
-      3. Volume threshold.
-      4. Skip events with no buckets we could parse.
+      3. Resolution-date gate: skip events whose resolution time has already
+         passed. Polymarket leaves yesterday's daily-temperature markets
+         ``active=true&closed=false`` for hours after they resolve (UMA
+         settlement lag), and they sort to the *top* by 24h volume. Without
+         this gate the engine would forecast a date in the past and the
+         sub-15c override could "buy" an already-decided bucket sitting at
+         $0.001. Dropping them here also lets the engine's real-resolution
+         check see an open position's market fall off the active list and
+         settle it.
+      4. Volume threshold.
+      5. Skip events with no buckets we could parse.
     """
 
     def __init__(
@@ -323,6 +350,7 @@ class GammaClient:
         include_tag_slugs: tuple[str, ...] = DEFAULT_WEATHER_TAG_SLUGS,
         min_volume_24hr: float = 1000.0,
         timeout_s: float = 15.0,
+        resolution_grace_seconds: float = 0.0,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._tag_slugs = {s.lower() for s in include_tag_slugs}
@@ -330,6 +358,9 @@ class GammaClient:
         self._primary_tag = include_tag_slugs[0] if include_tag_slugs else "weather"
         self._min_volume = float(min_volume_24hr)
         self._timeout = timeout_s
+        # An event is "past" once now > end_date + grace. Grace stays 0 by
+        # default (resolution happens AT end_date) but is tunable for skew.
+        self._resolution_grace_seconds = float(resolution_grace_seconds)
 
     async def list_active_weather_markets(self) -> list[WeatherEvent]:
         # Target the weather tag so we pull the /weather page rather than the
@@ -341,8 +372,10 @@ class GammaClient:
         if not payload:
             payload = await self._fetch_events(tag_slug=None)
 
+        now = datetime.now(timezone.utc)
         events: list[WeatherEvent] = []
         skipped_non_weather = 0
+        skipped_resolved = 0
         for raw in payload:
             if not isinstance(raw, dict):
                 continue
@@ -359,6 +392,9 @@ class GammaClient:
             if not self._is_weather_event(event):
                 skipped_non_weather += 1
                 continue
+            if self._is_past_resolution(event, now):
+                skipped_resolved += 1
+                continue
             if event.volume_24hr < self._min_volume:
                 continue
             if not event.buckets:
@@ -374,6 +410,7 @@ class GammaClient:
             "gamma_weather_events_found",
             count=len(events),
             skipped_non_weather=skipped_non_weather,
+            skipped_resolved=skipped_resolved,
         )
         return events
 
@@ -410,6 +447,21 @@ class GammaClient:
             _TEMP_TITLE_RE.search(event.title or "")
             or _TEMP_SLUG_RE.search(event.slug or "")
         )
+
+    def _is_past_resolution(self, event: WeatherEvent, now: datetime) -> bool:
+        """True if the event has already resolved (or its end time has passed).
+
+        ``closed`` events are obviously past. Otherwise compare the parsed
+        end date against ``now`` (+ grace). An unparseable / missing end date
+        is treated as NOT past — we'd rather rely on the volume and bucket
+        gates than drop a live market on a date-format change.
+        """
+        if event.closed:
+            return True
+        end_dt = _parse_end_date(event.end_date)
+        if end_dt is None:
+            return False
+        return now.timestamp() > (end_dt.timestamp() + self._resolution_grace_seconds)
 
 
 class MockGammaClient:
