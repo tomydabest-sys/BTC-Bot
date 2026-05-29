@@ -1,0 +1,34 @@
+# Wallet-watch — tracked-trader confirmation signal (DASHBOARD ONLY).
+#
+# These wallets are polled (data-api.polymarket.com) for recent *weather*
+# activity and surfaced at /api/weather/wallet-watch as a confirmation signal.
+# It NEVER gates or sizes trades, and must never be a reason to loosen risk.
+#
+# IMPORTANT — read before populating:
+#   * The original "weather_wallet_analysis.md" naming the profitable four was
+#     never committed to this repo, and the 11 addresses in wallet_profiler.py
+#     are BTC/ETH up-or-down 5-minute scalpers, NOT weather traders. So this
+#     list starts EMPTY on purpose.
+#   * Regenerate candidates from live data with:
+#         python scripts/polyweather/discover_weather_wallets.py
+#     then confirm a wallet is genuinely weather-profitable (round-trip P&L,
+#     not a single open position) before adding it here.
+#
+# Each entry: {address: "0x...", label: "human name"}.
+watch_wallets: []
+
+# Candidates auto-discovered 2026-05-29 from live weather-market trades, ranked
+# by weather-position value/PnL. UNVERIFIED — these had open weather exposure
+# but their closed-trade profitability was not established. Move into
+# watch_wallets above only after confirming with the discovery script.
+#
+# candidate_wallets:
+#   - {address: "0xeb1d1cd1b31070fb34b1d1de20d700f59c9959b0", label: "wx-whale (large open weather book)"}
+#   - {address: "0x01d94480e2a96cdd01fed071878b1adf82e0acd0", label: "wx-active (broad weather positions)"}
+#   - {address: "0xd676535f347c3be8a531bf08ff1bd417c530a859", label: "wx-candidate-3"}
+#   - {address: "0xd61508b9845502bd79842b2b7877811fa6a9ae32", label: "wx-candidate-4"}
+
+# Poll cadence and lookback window (seconds). data-api is rate-limited, so the
+# watcher polls on this slow cadence independent of the trading cycle.
+poll_seconds: 120
+lookback_seconds: 86400

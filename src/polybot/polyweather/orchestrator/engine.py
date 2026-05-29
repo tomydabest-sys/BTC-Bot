@@ -53,6 +53,7 @@ from polybot.polyweather.exchanges.polymarket_v2_client import (
     MockPolymarketV2Client,
     V2Order,
 )
+from polybot.polyweather.exchanges.wallet_watch import WalletWatcher, WalletWatchSnapshot
 from polybot.polyweather.persistence.store import PolyWeatherStore
 from polybot.polyweather.risk.validation_gate import TradePair, WeatherValidationGate
 from polybot.polyweather.risk.weather_risk import WeatherRiskConfig, WeatherRiskManager
@@ -76,6 +77,7 @@ class EngineMetrics:
     fills_total: int = 0
     fills_by_strategy: dict[str, int] = field(default_factory=dict)
     cancellations: int = 0
+    convergence_exits: int = 0
     heartbeat_count: int = 0
     last_cycle_at: float = 0.0
     started_at: float = field(default_factory=time.time)
@@ -154,6 +156,21 @@ class EngineConfig:
     arb_event_cooldown_seconds: float = 3600.0
     position_horizon_seconds: float = 60.0
     mtm_noise_pct: float = 0.03
+    # Convergence-exit (brief §5.2.3 — "sell into the move"). LIVE-DATA only:
+    # each cycle we reprice open positions to the real CLOB bid (the price we
+    # could actually sell our outcome token into — an honest real mark, never
+    # the pre-sampled outcome). When that bid has risen at least
+    # ``convergence_exit_threshold`` above entry, we realise the gain now
+    # instead of holding to binary resolution. Mock mode keeps the
+    # entry+wiggle mark and never early-exits (no real book).
+    convergence_exit_enabled: bool = True
+    convergence_exit_threshold: float = 0.10
+    # Wallet-watch: tracked-trader confirmation signal (dashboard only, never a
+    # trade gate). Operator-supplied addresses; empty by default. Polled on its
+    # own slow cadence (data-api is rate-limited), live-data mode only.
+    wallet_watch_wallets: list[dict[str, str]] = field(default_factory=list)
+    wallet_watch_poll_seconds: float = 120.0
+    wallet_watch_lookback_seconds: float = 86400.0
     # Mock-mode "true probability" = skill·p_model + (1-skill)·market_price.
     # 0.55 gives the bot a small real edge over the market, yielding
     # Sharpe ≈ 1–2 over many trades. 1.0 would reproduce the old
@@ -173,6 +190,7 @@ class EngineConfig:
         markets_yaml: Path,
         weights_yaml: Path,
         *,
+        wallets_yaml: Path | None = None,
         mode: str = "paper",
         use_mock: bool = True,
         live_data: bool = False,
@@ -182,6 +200,9 @@ class EngineConfig:
         risk = WeatherRiskConfig.from_yaml(yaml.safe_load(Path(risk_yaml).read_text()))
         markets = yaml.safe_load(Path(markets_yaml).read_text())
         weights = yaml.safe_load(Path(weights_yaml).read_text())
+        wallets: dict[str, Any] = {}
+        if wallets_yaml is not None and Path(wallets_yaml).exists():
+            wallets = yaml.safe_load(Path(wallets_yaml).read_text()) or {}
         return cls(
             mode=mode,
             use_mock=use_mock,
@@ -194,6 +215,9 @@ class EngineConfig:
             confidence_minimums=dict(weights["confidence_minimum"]),
             price_band=dict(weights.get("price_band", {})),
             target_cities=list(markets.get("target_cities", [])),
+            wallet_watch_wallets=list(wallets.get("watch_wallets", []) or []),
+            wallet_watch_poll_seconds=float(wallets.get("poll_seconds", 120.0)),
+            wallet_watch_lookback_seconds=float(wallets.get("lookback_seconds", 86400.0)),
         )
 
 
@@ -284,6 +308,13 @@ class PolyWeatherEngine:
         # event_id → last timestamp an arb leg opened on that event; honoured
         # by ``_event_arb_in_cooldown`` so arb can't churn a basket leg-by-leg.
         self._last_event_arb_fired_ts: dict[str, float] = {}
+        # Wallet-watch: tracked-trader confirmation signal (dashboard only).
+        self.wallet_watcher = WalletWatcher(
+            config.wallet_watch_wallets,
+            lookback_seconds=config.wallet_watch_lookback_seconds,
+        )
+        self._wallet_watch: WalletWatchSnapshot | None = None
+        self._wallet_watch_last_poll = 0.0
         # Inject a deterministic equity tick at startup so the dashboard
         # always shows something.
         self.store.record_equity(
@@ -293,6 +324,10 @@ class PolyWeatherEngine:
     @property
     def open_positions(self) -> list[OpenPaperPosition]:
         return list(self._open_positions)
+
+    @property
+    def wallet_watch_snapshot(self) -> WalletWatchSnapshot | None:
+        return self._wallet_watch
 
     @property
     def unrealized_pnl_usdc(self) -> Decimal:
@@ -342,6 +377,12 @@ class PolyWeatherEngine:
         #     horizon-timer settlement with the actual real outcome.
         if self.config.live_data and not self.config.use_mock:
             await self._check_real_resolutions(cycle_id)
+            # 1a.2 Reprice open positions to the real CLOB bid and sell into
+            #      any favorable convergence (brief §5.2.3) before the
+            #      horizon-timer settlement runs.
+            await self._reprice_open_positions(cycle_id)
+            # 1a.3 Poll the tracked wallets on their own slow cadence.
+            await self._poll_wallet_watch()
 
         # 1b. Mark-to-market existing open positions; settle any whose horizon
         #     has elapsed. New realised P&L is recorded here.
@@ -458,6 +499,25 @@ class PolyWeatherEngine:
                 )
             pos.final_outcome = real_outcome
             pos.closes_at = now  # force immediate settlement in _settle_open_positions
+
+    async def _poll_wallet_watch(self) -> None:
+        """Refresh the tracked-wallet confirmation signal on its own cadence.
+
+        No-op when no wallets are configured. Polled every
+        ``wallet_watch_poll_seconds`` (data-api is rate-limited), independent
+        of the trading cycle. Failures are swallowed — this is a dashboard
+        signal, never a trade gate.
+        """
+        if not self.wallet_watcher.enabled:
+            return
+        now = time.time()
+        if (now - self._wallet_watch_last_poll) < self.config.wallet_watch_poll_seconds:
+            return
+        self._wallet_watch_last_poll = now
+        try:
+            self._wallet_watch = await self.wallet_watcher.poll(now=now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("wallet_watch_failed", error=str(exc))
 
     async def _evaluate_event(self, cycle_id: str, event: WeatherEvent, station) -> None:  # noqa: C901
         # Forecasts (mock or live)
@@ -749,73 +809,162 @@ class PolyWeatherEngine:
         """
         if not self._open_positions:
             return
+        # In live-data mode the mark is the real CLOB bid set by
+        # ``_reprice_open_positions``; don't overwrite it with the mock wiggle.
+        live_marked = self.config.live_data and not self.config.use_mock
         now = time.time()
         still_open: list[OpenPaperPosition] = []
         for pos in self._open_positions:
-            wiggle = Decimal(str((self._rng.random() - 0.5) * 2 * self.config.mtm_noise_pct))
-            mark = pos.entry_price * (Decimal("1") + wiggle)
-            # Clamp to a sensible range
-            if mark < Decimal("0.001"):
-                mark = Decimal("0.001")
-            elif mark > Decimal("0.999"):
-                mark = Decimal("0.999")
-            pos.current_price = mark.quantize(Decimal("0.0001"))
+            if not live_marked:
+                wiggle = Decimal(
+                    str((self._rng.random() - 0.5) * 2 * self.config.mtm_noise_pct)
+                )
+                mark = pos.entry_price * (Decimal("1") + wiggle)
+                # Clamp to a sensible range
+                if mark < Decimal("0.001"):
+                    mark = Decimal("0.001")
+                elif mark > Decimal("0.999"):
+                    mark = Decimal("0.999")
+                pos.current_price = mark.quantize(Decimal("0.0001"))
 
             if now < pos.closes_at:
                 still_open.append(pos)
                 continue
 
             # Settlement — realise the binary outcome.
-            target = Decimal("1.00") if pos.final_outcome == 1 else Decimal("0.00")
-            exit_price = target
-            realised_pnl = (exit_price - pos.entry_price) * pos.size_tokens
-            realised_pnl = (realised_pnl + pos.rebate_usdc).quantize(Decimal("0.0001"))
-            trade = TradePair(
-                market_id=pos.market_id,
-                event_id=pos.event_id,
-                strategy=pos.strategy,
-                station=pos.station,
-                city=pos.city,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
-                size=pos.size_tokens,
-                fees_usdc=Decimal("0"),
-                rebates_usdc=pos.rebate_usdc,
-                realised_pnl_usdc=realised_pnl,
-                opened_at=pos.opened_at,
-                closed_at=now,
-                fill_latency_seconds=pos.fill_latency_seconds,
-                model_probability=pos.p_model,
-                realised_outcome=pos.final_outcome,
-                used_dynamic_fee=True,
-                cap_violation=pos.size_usdc > self.risk.weather_position_cap_usdc(),
-                metadata={
-                    "bucket_low": pos.bucket_low,
-                    "bucket_high": pos.bucket_high,
-                    "horizon_hours": pos.horizon_hours,
-                },
-            )
-            self.store.record_trade(trade)
-            self.risk.record_close(pos.size_usdc, realised_pnl, strategy=pos.strategy)
-            self.store.record_decision(
-                cycle_id=cycle_id,
-                strategy=pos.strategy,
-                market_id=pos.market_id,
-                station=pos.station,
-                city=pos.city,
-                decision="SETTLED",
-                reason=f"horizon_elapsed outcome={pos.final_outcome}",
-                mid=float(exit_price),
-                confidence=None,
-                edge_bps=None,
-                model_probability=pos.p_model,
-                bucket_low=pos.bucket_low,
-                bucket_high=pos.bucket_high,
-                forecast_horizon_hours=pos.horizon_hours,
-                extra={"pnl_usdc": str(realised_pnl), "size_usdc": str(pos.size_usdc)},
+            exit_price = Decimal("1.00") if pos.final_outcome == 1 else Decimal("0.00")
+            self._close_position(
+                pos,
+                exit_price,
+                now,
+                cycle_id,
+                exit_reason="horizon",
+                decision_reason=f"horizon_elapsed outcome={pos.final_outcome}",
             )
         self._open_positions = still_open
+
+    def _close_position(
+        self,
+        pos: OpenPaperPosition,
+        exit_price: Decimal,
+        now: float,
+        cycle_id: str,
+        *,
+        exit_reason: str,
+        decision_reason: str,
+    ) -> Decimal:
+        """Realise one position at ``exit_price``; record the trade + decision.
+
+        Shared by horizon settlement (exit at the binary outcome 0/1) and
+        convergence-exit (exit at the real CLOB bid). ``realised_outcome``
+        always carries the pre-sampled binary outcome so the validation
+        gate's Brier score stays a measure of *forecast* skill regardless of
+        whether we sold early — P&L reflects the actual exit price.
+        """
+        exit_price = exit_price.quantize(Decimal("0.0001"))
+        realised_pnl = (
+            (exit_price - pos.entry_price) * pos.size_tokens + pos.rebate_usdc
+        ).quantize(Decimal("0.0001"))
+        trade = TradePair(
+            market_id=pos.market_id,
+            event_id=pos.event_id,
+            strategy=pos.strategy,
+            station=pos.station,
+            city=pos.city,
+            side=pos.side,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            size=pos.size_tokens,
+            fees_usdc=Decimal("0"),
+            rebates_usdc=pos.rebate_usdc,
+            realised_pnl_usdc=realised_pnl,
+            opened_at=pos.opened_at,
+            closed_at=now,
+            fill_latency_seconds=pos.fill_latency_seconds,
+            model_probability=pos.p_model,
+            realised_outcome=pos.final_outcome,
+            used_dynamic_fee=True,
+            cap_violation=pos.size_usdc > self.risk.weather_position_cap_usdc(),
+            metadata={
+                "bucket_low": pos.bucket_low,
+                "bucket_high": pos.bucket_high,
+                "horizon_hours": pos.horizon_hours,
+                "exit_reason": exit_reason,
+            },
+        )
+        self.store.record_trade(trade)
+        self.risk.record_close(pos.size_usdc, realised_pnl, strategy=pos.strategy)
+        self.store.record_decision(
+            cycle_id=cycle_id,
+            strategy=pos.strategy,
+            market_id=pos.market_id,
+            station=pos.station,
+            city=pos.city,
+            decision="SETTLED",
+            reason=decision_reason,
+            mid=float(exit_price),
+            confidence=None,
+            edge_bps=None,
+            model_probability=pos.p_model,
+            bucket_low=pos.bucket_low,
+            bucket_high=pos.bucket_high,
+            forecast_horizon_hours=pos.horizon_hours,
+            extra={
+                "pnl_usdc": str(realised_pnl),
+                "size_usdc": str(pos.size_usdc),
+                "exit_reason": exit_reason,
+            },
+        )
+        return realised_pnl
+
+    async def _reprice_open_positions(self, cycle_id: str) -> None:
+        """Reprice open positions to the real CLOB bid; sell into the move.
+
+        Live-data only. The exit price for our long is the best bid we could
+        sell the outcome token into — a real, honest mark (never the
+        pre-sampled outcome). When that bid has risen at least
+        ``convergence_exit_threshold`` above entry we realise the gain now
+        ("sell into the move", brief §5.2.3) rather than holding to
+        resolution. Positions below the threshold keep the refreshed mark and
+        continue to their horizon / real-resolution settlement.
+        """
+        if not self._open_positions:
+            return
+        now = time.time()
+        threshold = Decimal(str(self.config.convergence_exit_threshold))
+        survivors: list[OpenPaperPosition] = []
+        for pos in self._open_positions:
+            book = None
+            if pos.token_id:
+                try:
+                    book = await self.clob.fetch_book(pos.token_id)
+                except Exception:  # noqa: BLE001
+                    book = None
+            if book is None or not book.bids:
+                # No live book this cycle — keep the last mark, hold the position.
+                survivors.append(pos)
+                continue
+
+            exit_bid = Decimal(str(book.best_bid)).quantize(Decimal("0.0001"))
+            # Honest real mark: what we'd actually receive if we sold now.
+            pos.current_price = exit_bid
+
+            if self.config.convergence_exit_enabled and (exit_bid - pos.entry_price) >= threshold:
+                self.metrics.convergence_exits += 1
+                self._close_position(
+                    pos,
+                    exit_bid,
+                    now,
+                    cycle_id,
+                    exit_reason="convergence_exit",
+                    decision_reason=(
+                        f"convergence_exit bid={exit_bid:.4f} entry={pos.entry_price:.4f} "
+                        f"gain={(exit_bid - pos.entry_price):.4f}"
+                    ),
+                )
+                continue
+            survivors.append(pos)
+        self._open_positions = survivors
 
 
 def _parse_iso(s: str) -> datetime:

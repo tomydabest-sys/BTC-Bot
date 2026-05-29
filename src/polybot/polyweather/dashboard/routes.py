@@ -148,6 +148,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
             "drawdown_curve": _drawdown_series(eq),
             "signal_count_today": engine.metrics.signals_total,
             "fill_count_today": engine.metrics.fills_total,
+            "convergence_exits": engine.metrics.convergence_exits,
             "heartbeat": {
                 "last_ts": hb_ts,
                 "age_seconds": hb_age,
@@ -334,6 +335,26 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — registers 9 endpoi
             "failing": failing,
         }
 
+    @app.get("/api/weather/wallet-watch", response_class=DecimalJSONResponse)
+    async def wallet_watch() -> Any:
+        engine = HOLDER.engine
+        if engine is None:
+            return {"enabled": False, "polled_at": 0.0, "wallets": [], "market_signals": []}
+        watcher = getattr(engine, "wallet_watcher", None)
+        snap = engine.wallet_watch_snapshot
+        if snap is None:
+            return {
+                "enabled": bool(watcher and watcher.enabled),
+                "polled_at": 0.0,
+                "wallet_count": 0,
+                "wallets": [],
+                "market_signals": [],
+                "note": "no poll yet (live-data mode only) or no wallets configured",
+            }
+        payload = snap.to_dict()
+        payload["enabled"] = bool(watcher and watcher.enabled)
+        return payload
+
     @app.get("/api/weather/market/{market_id}", response_class=DecimalJSONResponse)
     async def market_detail(market_id: str) -> Any:
         store = HOLDER.store
@@ -378,6 +399,7 @@ def _empty_overview() -> dict[str, Any]:
         "drawdown_curve": [],
         "signal_count_today": 0,
         "fill_count_today": 0,
+        "convergence_exits": 0,
         "heartbeat": {"last_ts": 0.0, "age_seconds": 9999.0, "status": "red", "count": 0},
         "mode": "MOCK",
         "halt_reason": "",

@@ -383,16 +383,71 @@ function renderGate(data) {
   }
 }
 
+function fmtTs(ts) {
+  if (!ts) return "—";
+  const n = typeof ts === "string" ? parseFloat(ts) : ts;
+  if (!n || Number.isNaN(n)) return "—";
+  return new Date(n * 1000).toLocaleString();
+}
+
+function renderWalletWatch(data) {
+  if (!data) return;
+  const banner = document.getElementById("wallets-banner");
+  const sigBody = document.querySelector("#wallets-signals-table tbody");
+  const walBody = document.querySelector("#wallets-table tbody");
+  const empty = document.getElementById("wallets-empty");
+  if (!banner || !sigBody || !walBody) return;
+
+  const wallets = data.wallets || [];
+  const signals = data.market_signals || [];
+  if (!data.enabled) {
+    banner.textContent = "Disabled — no wallets in config/polyweather/wallets.yaml.";
+    empty.classList.remove("hidden");
+  } else if (!data.polled_at) {
+    banner.textContent = "Configured — not polled yet (live-data mode only).";
+    empty.classList.add("hidden");
+  } else {
+    banner.textContent = `${wallets.length} wallet(s) tracked · polled ${fmtTs(data.polled_at)}`;
+    empty.classList.add("hidden");
+  }
+
+  sigBody.innerHTML = "";
+  for (const s of signals) {
+    const tr = document.createElement("tr");
+    const cls = s.direction === "bullish" ? "positive" : (s.direction === "bearish" ? "negative" : "muted");
+    tr.innerHTML = `
+      <td>${s.title || s.condition_id}</td>
+      <td>${s.wallets}</td>
+      <td class="${cls}">${s.direction}</td>
+      <td>${fmtMoney(s.net_usdc)}</td>
+      <td class="muted">${fmtTs(s.last_trade_ts)}</td>`;
+    sigBody.appendChild(tr);
+  }
+
+  walBody.innerHTML = "";
+  for (const w of wallets) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${w.label || ""}</td>
+      <td class="muted">${w.address}</td>
+      <td>${w.error ? "—" : w.weather_trades}</td>
+      <td>${w.error ? "—" : fmtMoney(w.net_usdc)}</td>
+      <td class="muted">${w.error ? ("err: " + w.error) : fmtTs(w.last_trade_ts)}</td>`;
+    walBody.appendChild(tr);
+  }
+}
+
 // ─── refresh loop ────────────────────────────────────────────────────
 
 async function refresh() {
-  const [ov, pc, fc, rk, tr, gt] = await Promise.all([
+  const [ov, pc, fc, rk, tr, gt, ww] = await Promise.all([
     safeFetch("/api/weather/overview"),
     safeFetch("/api/weather/per-city-edge"),
     safeFetch("/api/weather/forecasts"),
     safeFetch("/api/weather/risk"),
     safeFetch("/api/weather/trades?limit=50"),
     safeFetch("/api/weather/validation-gate"),
+    safeFetch("/api/weather/wallet-watch"),
   ]);
   renderOverview(ov);
   renderPerCity(pc);
@@ -400,6 +455,7 @@ async function refresh() {
   renderRisk(rk);
   renderTrades(tr);
   renderGate(gt);
+  renderWalletWatch(ww);
 }
 
 refresh().catch((e) => console.error(e));

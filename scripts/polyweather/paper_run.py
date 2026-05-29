@@ -50,6 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RISK = REPO_ROOT / "config" / "polyweather" / "risk.yaml"
 DEFAULT_MARKETS = REPO_ROOT / "config" / "polyweather" / "markets.yaml"
 DEFAULT_WEIGHTS = REPO_ROOT / "config" / "polyweather" / "strategy_weights.yaml"
+DEFAULT_WALLETS = REPO_ROOT / "config" / "polyweather" / "wallets.yaml"
 DEFAULT_DB = REPO_ROOT / "data" / "runtime" / "polyweather" / "paper.sqlite"
 
 
@@ -182,6 +183,7 @@ async def run(args: argparse.Namespace) -> int:  # noqa: C901
         risk_yaml=DEFAULT_RISK,
         markets_yaml=DEFAULT_MARKETS,
         weights_yaml=DEFAULT_WEIGHTS,
+        wallets_yaml=DEFAULT_WALLETS,
         mode="paper",
         use_mock=use_mock,
         live_data=live_data,

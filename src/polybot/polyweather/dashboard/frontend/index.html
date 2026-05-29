@@ -24,6 +24,7 @@
   <button class="tab" data-tab="forecasts">Active Forecasts</button>
   <button class="tab" data-tab="risk">Risk</button>
   <button class="tab" data-tab="trades">Trade Log</button>
+  <button class="tab" data-tab="wallets">Wallet Watch</button>
   <button class="tab" data-tab="gate">Validation Gate</button>
 </nav>
 
@@ -84,6 +85,22 @@
       <tbody></tbody>
     </table>
     <div id="trades-empty" class="empty-state hidden">No trades yet.</div>
+  </section>
+
+  <section id="tab-wallets" class="tab-panel">
+    <h2>Wallet Watch <span class="muted">— tracked-trader confirmation signal (dashboard only, never a trade gate)</span></h2>
+    <div id="wallets-banner" class="gate-banner">…</div>
+    <h3>Market signals (tracked wallets betting on temperature buckets)</h3>
+    <table id="wallets-signals-table" class="data-table">
+      <thead><tr><th>Market</th><th>Wallets</th><th>Direction</th><th>Net USDC</th><th>Last trade</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>Tracked wallets</h3>
+    <table id="wallets-table" class="data-table">
+      <thead><tr><th>Label</th><th>Address</th><th>Weather trades</th><th>Net USDC</th><th>Last trade</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="wallets-empty" class="empty-state hidden">No wallets configured — see config/polyweather/wallets.yaml.</div>
   </section>
 
   <section id="tab-gate" class="tab-panel">

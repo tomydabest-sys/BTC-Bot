@@ -35,6 +35,7 @@ def test_root_serves_html(engine_with_data, resolver):
     "/api/weather/risk",
     "/api/weather/trades",
     "/api/weather/validation-gate",
+    "/api/weather/wallet-watch",
 ])
 def test_endpoints_200_under_500ms(endpoint, engine_with_data, resolver):
     engine, store = engine_with_data
@@ -46,6 +47,35 @@ def test_endpoints_200_under_500ms(endpoint, engine_with_data, resolver):
     assert r.status_code == 200, f"{endpoint} status={r.status_code}"
     assert elapsed < 0.5, f"{endpoint} took {elapsed:.3f}s"
     assert r.json()  # not empty
+
+
+def test_wallet_watch_endpoint_surfaces_snapshot(engine_with_data, resolver):
+    from decimal import Decimal
+
+    from polybot.polyweather.exchanges.data_api_client import MockDataApiClient, WalletActivity
+    from polybot.polyweather.exchanges.wallet_watch import WalletWatcher
+
+    engine, store = engine_with_data
+    act = WalletActivity(
+        timestamp=1_780_000_000, type="TRADE", side="BUY", asset="a",
+        condition_id="mkt-1", outcome="Yes", price=Decimal("0.5"), size=Decimal("10"),
+        usdc_size=Decimal("100"),
+        title="Will the highest temperature in Miami be 84-85°F on May 29?",
+        slug="highest-temperature-in-miami-on-may-29-2026", event_slug="ev", tx_hash="0x",
+    )
+    engine.wallet_watcher = WalletWatcher(
+        [{"address": "0xabc", "label": "tracked"}],
+        client_factory=lambda addr: MockDataApiClient(activity=[act]),
+    )
+    engine._wallet_watch = asyncio.run(engine.wallet_watcher.poll(now=1_780_000_050))
+
+    app = create_app(engine=engine, store=store, station_resolver=resolver, mode="paper", mock=True)
+    client = TestClient(app)
+    payload = client.get("/api/weather/wallet-watch").json()
+    assert payload["enabled"] is True
+    assert payload["wallet_count"] == 1
+    assert payload["market_signals"][0]["direction"] == "bullish"
+    assert float(payload["market_signals"][0]["net_usdc"]) == 100.0
 
 
 def test_overview_has_required_keys(engine_with_data, resolver):
