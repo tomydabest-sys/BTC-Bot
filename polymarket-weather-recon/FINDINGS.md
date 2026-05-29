@@ -219,3 +219,34 @@ layer** over the same file / parquet exports.
   SQLite's comfort zone; no need for a columnar store as the primary.
 - DuckDB can `read`/attach the SQLite DB and parquet directly for fast feature
   scans/clustering in Phases 3–4 without duplicating the source of truth.
+
+---
+
+## 10. Phase 1 + 2 execution — bounded window (NYC temperature, 30 days)
+
+Ran 2026-05-29 against the live Data API. Window: NYC temperature, last 30 days.
+
+**Phase 1 discovery:** 29 daily-temperature events found via deterministic
+date-slug enumeration → **319 YES/NO bucket-markets**, all with station `KLGA`
+parsed from the Wunderground resolution URL, 0 flagged for review. Output:
+`reports/weather_markets.csv` + `markets` table.
+
+**Phase 2 ingestion:** **159,920 trades** across all 319 markets (0 zero-trade),
+**9,095 unique taker wallets**, **$2.39M** taker-side USDC, prices in
+[0.001, 0.999], date range 2026-04-27 → 2026-05-29. Output: `trades` table +
+`reports/data_quality_phase2.md`.
+
+**Pagination depth — CORRECTION to the Phase-0 worry.** Real markets paginate
+cleanly far past 250: per-market trades ranged **4 → 2,152** (median 372),
+pages_fetched up to **9**, and **0 markets landed on an exact 250-multiple**, so
+**no truncation was observed** in this window. The Phase-0 "deep offset returns
+1 row" behaviour was specific to one near-empty illiquid bucket, not a general
+cap. Pagination terminates reliably on a partial/empty page.
+
+**Dedupe/idempotency verified:** distinct `trade_uid` == total rows (159,920);
+re-running skips completed markets via `ingest_log`.
+
+**Completeness cross-check:** for the May-6 NYC event, ingested taker-side USDC
+($333k) was **0.76×** Gamma's reported event volume ($439k) — a sane band
+(Gamma counts roughly both legs), indicating no gross trade loss. This is the
+best completeness signal available without the (blocked) subgraph/on-chain.

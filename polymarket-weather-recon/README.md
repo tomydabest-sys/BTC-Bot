@@ -9,7 +9,13 @@ separate BTC-Bot project.
 > calls BTC-Bot's runtime. It lives in its own directory; recommendations are
 > markdown/JSON for review only.
 
-## Status: Phase 0 complete (recon + scaffold) — awaiting checkpoint sign-off
+## Status: Phases 0–2 complete (bounded window) — awaiting Phase 2 checkpoint sign-off
+
+Phase 0 (recon+scaffold), Phase 1 (weather-market discovery), and Phase 2
+(trade ingestion for the bounded NYC-temperature/30-day window) are done:
+**319 markets → 159,920 trades, 9,095 wallets, $2.39M** taker-side volume. See
+`reports/weather_markets.csv`, `reports/data_quality_phase2.md`, FINDINGS.md §10.
+Next stop is the Phase 2 checkpoint (confirm before scaling to full history).
 
 Start here:
 - **`FINDINGS.md`** — verified facts about every data source (the important read).
