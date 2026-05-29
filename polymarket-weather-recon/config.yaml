@@ -270,3 +270,4 @@ backtest_p1_market:
   taker_fee: 0.0
   taker_fee_stress: 0.02
   per_entry_cap_usdc: 50
+  focus_theta: 0.8                            # θ used for the per-city comparison table

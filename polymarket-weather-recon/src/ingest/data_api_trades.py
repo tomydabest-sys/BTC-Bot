@@ -31,9 +31,19 @@ def _fetch_market_trades(condition_id: str, base_url: str, cache_bust: bool) -> 
     pages = 0
     offset = 0
     while True:
-        page = get_json(f"{base_url}/trades", source="data_api_trades",
-                        params={"market": condition_id, "limit": PAGE, "offset": offset},
-                        cache_bust=cache_bust)
+        try:
+            page = get_json(f"{base_url}/trades", source="data_api_trades",
+                            params={"market": condition_id, "limit": PAGE, "offset": offset},
+                            cache_bust=cache_bust)
+        except Exception as exc:
+            # The Data API rejects offsets beyond a ceiling with a 400. At offset 0
+            # that's a real error; deeper in, it just means we've hit the pagination
+            # ceiling -> stop (this market's oldest trades are truncated, newest kept).
+            if offset == 0:
+                raise
+            log.warning("pagination ceiling for %s at offset %d (%s) — truncated",
+                        condition_id[:12], offset, str(exc)[:60])
+            break
         pages += 1
         if not isinstance(page, list) or len(page) == 0:
             break
@@ -127,7 +137,12 @@ def ingest_discovered_markets(cache_bust: bool = False, skip_done: bool = True) 
         if cid in done:
             totals["skipped"] += 1
             continue
-        res = ingest_market_trades(cid, city=m["city"], conn=conn, cache_bust=cache_bust)
+        try:
+            res = ingest_market_trades(cid, city=m["city"], conn=conn, cache_bust=cache_bust)
+        except Exception as exc:   # one bad market must not kill the whole job
+            totals["errors"] = totals.get("errors", 0) + 1
+            log.warning("ingest failed for %s (%s) — skipping", cid[:12], str(exc)[:80])
+            continue
         totals["markets"] += 1
         totals["raw"] += res["raw"]
         totals["inserted"] += res["inserted"]

@@ -24,6 +24,28 @@ from ..common.config import load_config, project_root
 from ..common.db import connect
 
 
+def _sweep(trades: pd.DataFrame, thetas, cap, p) -> dict:
+    """θ-sweep over a subset of (already resolution-day-filtered) YES trades."""
+    out = {}
+    for theta in thetas:
+        entries = []
+        for cid, g in trades.groupby("condition_id"):
+            crossed = g[g["price"] >= theta]
+            if crossed.empty:
+                continue
+            first = crossed.iloc[0]
+            notional = min(float(crossed["usdc"].sum()), cap)
+            entries.append({
+                "entry_price": float(first["price"]),
+                "won": int(first["won"]),
+                "shares": notional / float(first["price"]) if first["price"] > 0 else 0.0,
+                "notional": notional,
+                "edge_share": (1.0 if first["won"] else 0.0) - float(first["price"]),
+            })
+        out[theta] = _metrics(entries, p)
+    return out
+
+
 def run_market_backtest() -> dict:
     cfg = load_config()
     p = cfg["backtest_p1_market"]
@@ -32,7 +54,7 @@ def run_market_backtest() -> dict:
         "SELECT condition_id, price, usdc, outcome_index, timestamp FROM trades "
         "WHERE outcome_index=0", conn)          # YES leg only
     mk = pd.read_sql_query(
-        "SELECT condition_id, end_date, winning_outcome_index FROM markets WHERE resolved=1", conn)
+        "SELECT condition_id, city, end_date, winning_outcome_index FROM markets WHERE resolved=1", conn)
     conn.close()
 
     trades = trades.merge(mk, on="condition_id", how="inner")
@@ -44,26 +66,20 @@ def run_market_backtest() -> dict:
     trades = trades.sort_values("timestamp")
 
     cap = p["per_entry_cap_usdc"]
-    by_theta = {}
-    for theta in p["thetas"]:
-        entries = []
-        for cid, g in trades.groupby("condition_id"):
-            crossed = g[g["price"] >= theta]
-            if crossed.empty:
-                continue
-            first = crossed.iloc[0]
-            # capacity = YES notional available at/after the crossing
-            avail = float(crossed["usdc"].sum())
-            notional = min(avail, cap)
-            entries.append({
-                "entry_price": float(first["price"]),
-                "won": int(first["won"]),
-                "shares": notional / float(first["price"]) if first["price"] > 0 else 0.0,
-                "notional": notional,
-                "edge_share": (1.0 if first["won"] else 0.0) - float(first["price"]),
-            })
-        by_theta[theta] = _metrics(entries, p)
-    res = {"by_theta": by_theta, "resolution_day_only": p["resolution_day_only"],
+    thetas = p["thetas"]
+    cities = sorted(trades["city"].dropna().unique().tolist())
+    nyc = "New York City"
+    groups = {
+        "ALL": trades,
+        "in_sample_NYC": trades[trades["city"] == nyc],
+        "out_of_sample": trades[trades["city"] != nyc],
+    }
+    by_group = {name: _sweep(g, thetas, cap, p) for name, g in groups.items() if not g.empty}
+    per_city = {c: _sweep(trades[trades["city"] == c], [p["focus_theta"]], cap, p)
+                for c in cities}
+    res = {"by_group": by_group, "per_city_focus": per_city,
+           "focus_theta": p["focus_theta"], "cities": cities,
+           "resolution_day_only": p["resolution_day_only"],
            "n_resolved_markets": int(mk.shape[0])}
     _write(res)
     return res
@@ -90,51 +106,73 @@ def _metrics(entries: list[dict], p) -> dict:
     }
 
 
-def _write(res: dict) -> str:
-    p = load_config()["backtest_p1_market"]
-    lines = [
-        "# P1 variant — market-price-triggered resolution-drift backtest", "",
-        "No weather feed. Trigger: a bucket's YES price crosses **θ** on the resolution "
-        f"day ({'resolution-day only' if res['resolution_day_only'] else 'any day'}); enter at "
-        "that YES print (trade-stream proxy), hold to resolution. Causal — outcome used only "
-        "for PnL. Single-city/30-day window — indicative.", "",
-        "| θ | entries | hit rate | avg entry | avg edge/share | deployed$ | PnL(fee0) | ROI(fee0) | ROI(fee "
-        f"{p['taker_fee_stress']}) |",
-        "|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
-    ]
-    for theta, m in res["by_theta"].items():
+def _sweep_table(by_theta: dict, fee_stress) -> list[str]:
+    rows = ["| θ | entries | hit rate | avg entry | avg edge/share | deployed$ | PnL(fee0) "
+            f"| ROI(fee0) | ROI(fee {fee_stress}) |",
+            "|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+    for theta, m in by_theta.items():
         if m.get("n", 0) == 0:
-            lines.append(f"| {theta} | 0 | — | — | — | — | — | — | — |")
+            rows.append(f"| {theta} | 0 | — | — | — | — | — | — | — |")
             continue
-        lines.append(
+        rows.append(
             f"| {theta} | {m['n']} | {m['hit_rate']:.2f} | {m['avg_entry']:.3f} | "
             f"{m['avg_edge_share']:+.4f} | {m['deployed_usdc']:,.0f} | {m['pnl_fee0']:,.0f} | "
             f"{m['roi_fee0']:.3f} | {m['roi_feeStress']:.3f} |")
-    # interpretation
-    best = max((m for m in res["by_theta"].values() if m.get("n")),
-               key=lambda m: (m.get("roi_fee0") or -9), default=None)
-    lines += ["",
-              "## Read",
-              "- **Higher θ → higher hit rate but higher entry price** (thinner residual gap to "
-              "$1). The question is whether any θ stays **net positive after fees**.",
-              ]
-    if best:
-        sign = "POSITIVE" if (best.get("roi_fee0") or 0) > 0 else "NEGATIVE"
-        lines.append(
-            f"- Best θ by ROI(fee0) gives ROI **{best.get('roi_fee0')}** "
-            f"(hit {best.get('hit_rate')}, entry {best.get('avg_entry')}) — **{sign}** at zero "
-            f"fee; under the stress fee {p['taker_fee_stress']} ROI is {best.get('roi_feeStress')}.")
-    lines += [
-        "- If even the best θ is ~0/negative after fees, reacting to the book is **too late** — "
-        "the convergence is already priced. Then P1 only works with a signal *faster than the "
-        "market* (the resolution-drift snipers' actual edge), not by following price.",
+    return rows
+
+
+def _write(res: dict) -> str:
+    p = load_config()["backtest_p1_market"]
+    oos = res["by_group"].get("out_of_sample", {})
+    ins = res["by_group"].get("in_sample_NYC", {})
+    ft = res["focus_theta"]
+    lines = [
+        "# P1 variant — market-price-triggered resolution-drift backtest", "",
+        "No weather feed. Trigger: a bucket's YES price crosses **θ** on the resolution day; "
+        "enter at that YES print (trade-stream proxy), hold to resolution. Causal — outcome "
+        "used only for PnL. **NYC = in-sample; London/Paris/Chicago/Miami = OUT-OF-SAMPLE.**",
         "",
-        "## Caveats",
-        "- Trade-stream proxy (no historical book): assumes the print price is takeable with no "
+        "## OUT-OF-SAMPLE (London + Paris + Chicago + Miami) — the real test", "",
+        *_sweep_table(oos, p["taker_fee_stress"]),
+        "",
+        "## In-sample (NYC) — for comparison", "",
+        *_sweep_table(ins, p["taker_fee_stress"]),
+        "",
+        f"## Per-city @ θ={ft}", "",
+        f"| city | entries | hit rate | avg entry | ROI(fee0) | ROI(fee {p['taker_fee_stress']}) |",
+        "|---|--:|--:|--:|--:|--:|",
+    ]
+    for city, bt in res["per_city_focus"].items():
+        m = bt.get(ft, {})
+        if m.get("n", 0) == 0:
+            lines.append(f"| {city} | 0 | — | — | — | — |")
+            continue
+        lines.append(f"| {city} | {m['n']} | {m['hit_rate']:.2f} | {m['avg_entry']:.3f} | "
+                     f"{m['roi_fee0']:.3f} | {m['roi_feeStress']:.3f} |")
+
+    oos_best = max((m for m in oos.values() if m.get("n")),
+                   key=lambda m: (m.get("roi_fee0") or -9), default=None)
+    oos_ft = oos.get(ft, {})
+    lines += ["", "## Verdict"]
+    if oos_best and oos_ft.get("n"):
+        gen = "GENERALISES" if (oos_ft.get("roi_feeStress") or -9) > 0 else "DOES NOT generalise"
+        lines += [
+            f"- Out-of-sample @ θ={ft}: ROI **{oos_ft.get('roi_fee0')}** (fee0) / "
+            f"**{oos_ft.get('roi_feeStress')}** (fee {p['taker_fee_stress']}), hit "
+            f"{oos_ft.get('hit_rate')}, n={oos_ft.get('n')}.",
+            f"- Best out-of-sample θ by ROI(fee0): {oos_best.get('roi_fee0')} "
+            f"(hit {oos_best.get('hit_rate')}, entry {oos_best.get('avg_entry')}).",
+            f"- **The θ≈{ft} edge {gen} out-of-sample after a stressed fee.** An edge present in "
+            "every city (per-city table) is far more trustworthy than one driven by one market.",
+        ]
+    lines += [
+        "", "## Caveats",
+        "- Trade-stream proxy (no historical book): assumes the print is takeable with no "
         "queue/slippage and ignores our own market impact — **optimistic**.",
-        "- Single city / 30 days, in-sample; validate out-of-sample before sizing.",
-        "- Capacity = YES notional transacting at/after the crossing (per-entry cap "
-        f"${p['per_entry_cap_usdc']}).",
+        "- ~58-day window per city; still a backtest, not live. Per-entry capacity capped at "
+        f"${p['per_entry_cap_usdc']}.",
+        "- A faster *weather* signal (NWS live) would let you enter before full price "
+        "convergence, improving entry prices beyond what reacting to the book can achieve.",
     ]
     out = project_root() / "reports" / "backtest_p1_market.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
