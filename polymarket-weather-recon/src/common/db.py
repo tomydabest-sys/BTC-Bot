@@ -69,6 +69,32 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     complete      INTEGER,
     fetched_at    TEXT
 );
+
+-- Phase 8 forward live-book capture (the only way to observe maker quote/cancel
+-- churn; historical sources cannot recover it).
+CREATE TABLE IF NOT EXISTS book_snapshots (
+    snapshot_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id      TEXT,
+    condition_id  TEXT,
+    city          TEXT,
+    bucket_label  TEXT,
+    outcome       TEXT,
+    capture_ts    INTEGER,    -- our unix capture time (s)
+    server_ts     INTEGER,    -- book timestamp from API (ms)
+    best_bid      REAL, best_bid_size REAL,
+    best_ask      REAL, best_ask_size REAL,
+    mid           REAL, spread REAL,
+    n_bids        INTEGER, n_asks INTEGER,
+    bid_depth_usdc REAL, ask_depth_usdc REAL,
+    last_trade_price REAL, tick_size REAL,
+    book_hash     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_book_token_ts ON book_snapshots(token_id, capture_ts);
+
+CREATE TABLE IF NOT EXISTS book_levels (
+    snapshot_id INTEGER, side TEXT, level INTEGER, price REAL, size REAL
+);
+CREATE INDEX IF NOT EXISTS idx_levels_snap ON book_levels(snapshot_id);
 """
 
 

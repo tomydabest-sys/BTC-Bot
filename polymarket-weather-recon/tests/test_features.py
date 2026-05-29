@@ -69,6 +69,30 @@ def test_timing_features_detects_regular_machine():
     assert out["median_gap_s"] == 1.0
 
 
+def test_book_summary_best_levels_and_depth():
+    from src.ingest.clob_live_capture import _summarise_book
+    book = {
+        "bids": [{"price": "0.50", "size": "100"}, {"price": "0.49", "size": "200"}],
+        "asks": [{"price": "0.55", "size": "10"}, {"price": "0.52", "size": "20"}],
+        "tick_size": "0.01", "last_trade_price": "0.51", "timestamp": "1780056693005",
+        "hash": "abc",
+    }
+    s = _summarise_book(book)
+    assert s["best_bid"] == 0.50 and s["best_ask"] == 0.52     # max bid / min ask
+    assert s["best_bid_size"] == 100 and s["best_ask_size"] == 20
+    assert s["mid"] == 0.51
+    assert abs(s["bid_depth_usdc"] - (0.50 * 100 + 0.49 * 200)) < 1e-6
+    assert s["n_bids"] == 2 and s["n_asks"] == 2
+    assert s["_bids"][0][0] == 0.50 and s["_asks"][0][0] == 0.52  # sorted best-first
+
+
+def test_book_summary_empty_side():
+    from src.ingest.clob_live_capture import _summarise_book
+    s = _summarise_book({"bids": [], "asks": [{"price": "0.001", "size": "5"}]})
+    assert s["best_bid"] is None and s["mid"] is None and s["spread"] is None
+    assert s["best_ask"] == 0.001
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

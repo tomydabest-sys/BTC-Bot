@@ -25,10 +25,17 @@ Done on the bounded NYC-temperature/30-day window:
 
 Outputs in `reports/`: `weather_markets.csv`, `data_quality_phase2.md`,
 `wallet_classification.csv`, `phase4_summary.md`, `dossiers/`, `exploits.md`,
-`btc_bot_recommendations.md`, `insights.json`. FINDINGS.md §10.
-Run order: `run_phase1 → run_phase2 → run_phase3 → run_phase4 → run_phase5 → run_phase67`.
-**Next:** pick which proposals (P1–P5) to spec; optionally widen the allowlist /
-scale the sample. Nothing is implemented in BTC-Bot.
+`btc_bot_recommendations.md`, `insights.json`, plus specs `spec_p1_resolution_drift.md`
+and `spec_p2_maker_quoting.md`. FINDINGS.md §10.
+
+**Phase 8 (live-book capture) is built** — `scripts/run_phase8.py` is a
+standalone collector that snapshots top-of-book + depth for active weather
+buckets into `book_snapshots`/`book_levels` (the only way to observe maker
+quote/cancel churn for P2). Smoke-tested: 33 active tokens captured.
+
+Run order: `run_phase1 → run_phase2 → run_phase3 → run_phase4 → run_phase5 →
+run_phase67`; `run_phase8` runs independently (long-running). Nothing is
+implemented in BTC-Bot.
 
 Start here:
 - **`FINDINGS.md`** — verified facts about every data source (the important read).
