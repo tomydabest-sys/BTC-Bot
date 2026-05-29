@@ -1,0 +1,23 @@
+# Cached raw responses and large processed tables are NOT committed
+# (the brief: data/raw/ and large processed files gitignored).
+data/raw/**
+!data/raw/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+
+# generated dossiers/plots may be large; keep the dirs, ignore contents except
+# curated markdown reports committed explicitly.
+reports/dossiers/*
+!reports/dossiers/.gitkeep
+*.png
+*.parquet
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
