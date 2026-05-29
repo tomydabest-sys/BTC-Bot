@@ -132,6 +132,8 @@ class EngineConfig:
     strategy_weights: dict[str, float] = field(default_factory=dict)
     edge_thresholds_bps: dict[str, float] = field(default_factory=dict)
     confidence_minimums: dict[str, float] = field(default_factory=dict)
+    # Middle-band price gate for the ensemble (wallet-research finding).
+    price_band: dict[str, float] = field(default_factory=dict)
     target_cities: list[dict[str, Any]] = field(default_factory=list)
     bankroll_cap_usdc: Decimal | None = None
     first_24h_position_cap_usdc: Decimal = Decimal("5")
@@ -190,6 +192,7 @@ class EngineConfig:
             strategy_weights=dict(weights["weights"]),
             edge_thresholds_bps=dict(weights["edge_threshold_bps"]),
             confidence_minimums=dict(weights["confidence_minimum"]),
+            price_band=dict(weights.get("price_band", {})),
             target_cities=list(markets.get("target_cities", [])),
         )
 
@@ -216,6 +219,9 @@ class PolyWeatherEngine:
             edge_threshold_bps=config.edge_thresholds_bps.get("weather_ensemble", 800),
             confidence_min=config.confidence_minimums.get("weather_ensemble", 0.55),
             kelly_multiplier=float(config.risk.kelly_fraction_multiplier),
+            band_min=config.price_band.get("min", 0.15),
+            band_max=config.price_band.get("max", 0.85),
+            longshot_override_mult=config.price_band.get("longshot_override_mult", 3.0),
         )
         self.s_arb = NegativeRiskArbStrategy(
             min_gap_bps=config.edge_thresholds_bps.get("negative_risk_arb", 200),
@@ -386,6 +392,16 @@ class PolyWeatherEngine:
             return False
         return (time.time() - last) < self.config.bucket_cooldown_seconds
 
+    def _strategy_enabled(self, name: str) -> bool:
+        """A strategy with weight <= 0 is disabled (skipped, not just capped).
+
+        negative_risk_arb defaults to weight 0: it is a long-shot basket
+        sprayer that produced 100% of the operator's losses, and the
+        weather-wallet research shows the sub-15c tail bleeds. Bump its weight
+        in strategy_weights.yaml to re-enable.
+        """
+        return self.config.strategy_weights.get(name, 0.0) > 0.0
+
     def _event_arb_in_cooldown(self, event_id: str) -> bool:
         """True if arb already opened a leg on this event recently.
 
@@ -461,10 +477,10 @@ class PolyWeatherEngine:
         # gives the bot a realistic cadence instead of firing 30 trades at once.
         candidates: list[tuple[float, Any, float]] = []  # (edge_bps, signal, p_realised)
 
-        # Negative-risk arb on the basket. Skip entirely if arb already
-        # opened a leg on this event within the cooldown window — otherwise
-        # the engine would drain one basket leg per cycle (Bug A).
-        if not self._event_arb_in_cooldown(event.id):
+        # Negative-risk arb on the basket. Disabled by default (weight 0 — see
+        # _strategy_enabled). Also skip if arb already opened a leg on this
+        # event within the cooldown window (Bug A).
+        if self._strategy_enabled(self.s_arb.name) and not self._event_arb_in_cooldown(event.id):
             arb_view = EventBucketsView(
                 event_id=event.id,
                 station=station.icao,
@@ -526,15 +542,17 @@ class PolyWeatherEngine:
                 forecast=forecast,
             )
 
-            sig = self.s_ensemble.evaluate(view)
-            if sig is not None:
-                edge = float(sig.metadata.get("edge_bps", 0.0))
-                candidates.append((edge, sig, forecast.p_bucket))
+            if self._strategy_enabled(self.s_ensemble.name):
+                sig = self.s_ensemble.evaluate(view)
+                if sig is not None:
+                    edge = float(sig.metadata.get("edge_bps", 0.0))
+                    candidates.append((edge, sig, forecast.p_bucket))
 
-            sig_mr = self.s_meanrev.evaluate(view)
-            if sig_mr is not None:
-                edge = float(sig_mr.metadata.get("edge_bps", 0.0))
-                candidates.append((edge, sig_mr, forecast.p_bucket))
+            if self._strategy_enabled(self.s_meanrev.name):
+                sig_mr = self.s_meanrev.evaluate(view)
+                if sig_mr is not None:
+                    edge = float(sig_mr.metadata.get("edge_bps", 0.0))
+                    candidates.append((edge, sig_mr, forecast.p_bucket))
 
         # Order by best edge first; fire at most ``max_signals_per_event_per_cycle``
         # winners. Skip duplicates on the same bucket (e.g. ensemble + meanrev

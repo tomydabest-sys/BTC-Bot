@@ -15,6 +15,7 @@ per-event slot, isolating the cooldown behaviour under test.
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 
 import pytest
 
@@ -25,10 +26,24 @@ ARB_STRATEGY = "negative_risk_arb"
 
 
 class _NoSignal:
-    """Stand-in strategy that never produces a candidate."""
+    """Stand-in strategy that never produces a candidate.
+
+    Carries a ``name`` the engine won't find in strategy_weights, so the
+    weight gate disables it and its evaluate() is never even called.
+    """
+
+    name = "stub_disabled"
 
     def evaluate(self, *_args, **_kwargs):
         return None
+
+
+def _enable_arb(engine) -> None:
+    """negative_risk_arb ships disabled (weight 0); re-enable it for the
+    cooldown tests, which exercise the arb-specific event cooldown. Update both
+    the eval gate (engine config) and the per-strategy exposure cap (risk)."""
+    engine.config.strategy_weights["negative_risk_arb"] = 0.20
+    engine.risk.strategy_weights["negative_risk_arb"] = Decimal("0.20")
 
 
 def _arb_event() -> WeatherEvent:
@@ -79,6 +94,7 @@ def _station() -> ResolvedStation:
 @pytest.mark.asyncio
 async def test_arb_fires_once_then_event_cooldown_blocks_it(engine_factory):
     engine, _store = engine_factory(max_signals_per_cycle=5)
+    _enable_arb(engine)
     # Silence the competing strategies so arb owns the per-event slot.
     engine.s_ensemble = _NoSignal()
     engine.s_meanrev = _NoSignal()
@@ -103,6 +119,7 @@ async def test_arb_fires_once_then_event_cooldown_blocks_it(engine_factory):
 @pytest.mark.asyncio
 async def test_arb_resumes_after_event_cooldown_expires(engine_factory):
     engine, _store = engine_factory(max_signals_per_cycle=5)
+    _enable_arb(engine)
     engine.s_ensemble = _NoSignal()
     engine.s_meanrev = _NoSignal()
     engine.config.arb_event_cooldown_seconds = 3600.0
