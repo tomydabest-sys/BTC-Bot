@@ -1,0 +1,28 @@
+# Cached raw responses and large processed tables are NOT committed
+# (the brief: data/raw/ and large processed files gitignored).
+data/raw/**
+!data/raw/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+
+# generated dossiers/plots may be large; keep the dirs, ignore contents except
+# curated markdown reports committed explicitly.
+# dossier .md + plots ARE deliverables (committed). Only the bulky regenerable
+# per-wallet feature dump is excluded.
+reports/wallet_features.csv
+*.parquet
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# BTC-Bot's ROOT .gitignore ignores `config.yaml` (user-specific BTC-Bot config).
+# This project's config.yaml is essential + non-secret (config-driven design) and
+# MUST be committed, so re-include it here.
+!config.yaml
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

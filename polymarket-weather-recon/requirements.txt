@@ -1,0 +1,16 @@
+# Phases 0–2 (ingestion) need only requests + PyYAML.
+requests>=2.31
+PyYAML>=6.0
+
+# Phases 3–4 (features + detection) — installed and in use.
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.3     # includes HDBSCAN (no separate hdbscan build needed)
+tabulate>=0.9         # pandas .to_markdown in the Phase 4 report
+
+# --- enable per later phase ---
+# matplotlib>=3.7      # Phase 5 dossier plots
+# pyarrow>=14          # parquet exports
+# duckdb>=0.10         # optional analytics layer over sqlite/parquet
+# web3>=6.0            # Phase 2 on-chain decode (ONLY if a Polygon RPC is allowlisted)
+# httpx>=0.27          # optional async client for live capture (Phase 8)

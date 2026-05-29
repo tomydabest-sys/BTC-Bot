@@ -1,0 +1,21 @@
+{
+  "source": "polymarket-weather-recon, bounded NYC-temperature/30-day window",
+  "disclaimer": "behavioural inference from taker-side data; revalidate out-of-sample",
+  "calibration": {
+    "n_bots_ge_0p5": 191,
+    "n_bots_ge_0p7": 17,
+    "median_bot_active_hours": 20.0,
+    "median_bot_size_shares": 6.065,
+    "median_bot_breadth_markets": 48.0,
+    "median_bot_max_trades_per_sec": 4.0,
+    "median_bot_fill_win_rate": 0.7576,
+    "median_bot_roi_on_resolved": 0.005,
+    "strong_bot_median_breadth": 154.0,
+    "strong_bot_median_active_hours": 22.0
+  },
+  "constraints": {
+    "maker_taker_pairing": "unavailable (subgraph/on-chain blocked)",
+    "reference_granularity": "hourly (Open-Meteo); not sub-second",
+    "history_reach_days": 90
+  }
+}
