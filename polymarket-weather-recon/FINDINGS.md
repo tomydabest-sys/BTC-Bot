@@ -260,3 +260,44 @@ re-running skips completed markets via `ingest_log`.
 ($333k) was **0.76×** Gamma's reported event volume ($439k) — a sane band
 (Gamma counts roughly both legs), indicating no gross trade loss. This is the
 best completeness signal available without the (blocked) subgraph/on-chain.
+
+---
+
+## 11. Option-2 (weather-feed P1) — blockers found while testing
+
+Attempt to properly backtest the weather-feed-driven resolution-drift version hit
+two hard walls:
+
+**(a) No usable historical station feed for the trade window.**
+- NWS (`api.weather.gov`): reachable but ~2-day retention → live only.
+- NCEI (`ncei.noaa.gov`, ISD global-hourly): reachable but **archive lag of
+  months** — June 2025 returns data; March/April/May 2026 are all empty. Does NOT
+  cover our Apr–May 2026 markets.
+- IEM ASOS (`mesonet.agron.iastate.edu`), aviationweather.gov, Synoptic, Meteostat:
+  all **403 (blocked by allowlist)** — these are the low-latency archives that
+  *would* cover the window.
+- ⇒ The proper historical backtest of the weather version is **not possible**
+  without allowlisting a low-latency archive (recommended: `mesonet.agron.iastate.edu`),
+  or several weeks of forward NWS+price capture.
+
+**(b) Open-Meteo (the only reachable historical feed) is unfit as the resolver proxy.**
+Bucket-ID accuracy (does the daily-max land in the resolved bucket?), US cities:
+Miami 61% (bias ≈0), NYC 35%→59% bias-corrected (bias +1.36°F), Chicago 39% (bias
+**+6.48°F**). Bias varies wildly by city and does NOT transfer (NYC-fit correction
+gives Chicago/Miami only 33–39%). Best case ~60% — a *modeled* feed can't reliably
+pick a 2°F bucket.
+
+**(c) ⚠️ Units defect for non-US markets.** London & Paris temperature markets are
+denominated in **°C with single-degree buckets** (`9°C`, `11°C`), not °F ranges.
+The pipeline assumed °F everywhere (`parse_bucket_bounds` strips only `°F`; reference
+fetched in °F), so **all temperature-derived numbers for London/Paris are invalid**
+(reaction features, reference validation). US cities (NYC/Chicago/Miami) are °F and
+correct. **Price-based analyses are unaffected** (they never use temperature), so the
+out-of-sample price-backtest failure verdict stands. Fixing this needs per-market
+unit detection (°C/°F) + single-degree-bucket handling before any multi-region
+weather-signal work.
+
+**Strategic note:** the price-triggered version already failed out-of-sample,
+implying the price-lag window a weather feed would exploit is small/efficient
+across cities. Combined with (a)–(c), the realistic odds that the weather-feed
+version yields a deployable edge are low (~15–20%).
