@@ -60,6 +60,38 @@ the price converges. That is unproven (see §1a: needs a METAR archive to backte
 and high NWS-vs-resolver agreement to be confirmed) and should not be assumed to
 work. **P1 is not currently a validated, implementable strategy.**
 
+## 1c. ⚠️ Real-feed (IEM ASOS) test: residual gap exists, but NOT a robust edge
+Path (a) was finally tested with a real station archive (IEM ASOS, unblocked
+2026-05-30) — see `reports/backtest_p1_feed.md`, FINDINGS §12.
+
+- **Accuracy gate (hindsight): 99.6%** — IEM daily-max lands in the exactly-resolved
+  bucket (US 100%, London 98.2%, Paris 100%) vs Open-Meteo's ~35%. But IEM and the
+  Wunderground resolver read the **same airport METAR**, so this is "reading the
+  thermometer," not forecasting — necessary, not sufficient.
+- **Causal trading sim (NYC in-sample / others OOS, lock-hour swept):**
+
+| group | lock 12 ROI(2%) | lock 13 ROI(2%) | lock 15 ROI(2%) | lock 17 ROI(2%) |
+|---|--:|--:|--:|--:|
+| Out-of-sample | **+8.1%** | **+3.7%** | −1.5% | −0.9% |
+| In-sample NYC | +0.1% | +1.0% | −0.0% | −1.1% |
+
+Per-city @ lock 13 (post-fee): London +7.4%, Chicago +4.0%, Miami +3.2%, NYC +1.0%,
+**Paris −2.5%**.
+
+`avg_entry < feed_hit` **out-of-sample at every lock hour** — so the market does
+*not* fully price the feed; a residual convergence gap persists (this is the first
+P1 variant that isn't outright dead). **But the gap is not robust:** it is positive
+only at the earliest, most aggressive locks (12–13) and erodes to ~0/negative
+through the afternoon as the price converges, and it is negative for at least one
+out-of-sample city. The early-lock residual is precisely where the **optimistic
+trade-stream proxy** (no queue/slippage/impact, fast-sniper competition ignored) is
+least trustworthy.
+
+**Verdict: not deployable as-backtested.** The only honest next step for P1 is
+**forward paper validation** — measure whether those early-lock entry prices
+actually fill against live competition — *not* live sizing. Do not assume the
+proxy's fills are attainable.
+
 ## 2. Market selection (preconditions)
 - Weather **daily-temperature neg-risk events** (the ~11-bucket structure from
   Phase 1), one station per event (parsed from the Wunderground `resolutionSource`,

@@ -308,27 +308,52 @@ def _group_table(sweep: dict, group: str, lock_hours: list) -> list[str]:
 
 def _verdict(sim: dict) -> list[str]:
     fh = sim["focus_lock_hour"]
+    hours = sim["lock_hours"]
     oos = sim["by_lock_hour"][fh]["out_of_sample"]
-    # robustness: positive post-fee OOS ROI across ALL swept lock hours?
-    oos_all = [sim["by_lock_hour"][h]["out_of_sample"] for h in sim["lock_hours"]]
-    pos = [m for m in oos_all if m.get("n") and (m.get("roi_feeStress") or -9) > 0]
-    robust = len(pos) == len([m for m in oos_all if m.get("n")])
     lines = ["## Verdict", ""]
     if not oos.get("n"):
         lines.append("- No out-of-sample entries fired — cannot judge an edge.")
         return lines
-    entry_lt_hit = oos["avg_entry"] < oos["feed_hit"]
-    edge = entry_lt_hit and (oos.get("roi_feeStress") or -9) > 0 and robust
+
+    oos_all = {h: sim["by_lock_hour"][h]["out_of_sample"] for h in hours}
+    fired = {h: m for h, m in oos_all.items() if m.get("n")}
+    pos_hours = [h for h, m in fired.items() if (m.get("roi_feeStress") or -9) > 0]
+    entry_lt_hit_all = all(m["avg_entry"] < m["feed_hit"] for m in fired.values())
+    # per-city dispersion at the focus hour
+    pc = sim["by_lock_hour"][fh]["per_city"]
+    oos_cities = {c: m for c, m in pc.items() if c != "New York City" and m.get("n")}
+    pos_cities = [c for c, m in oos_cities.items() if (m.get("roi_feeStress") or -9) > 0]
+    robust = len(pos_hours) == len(fired) and len(pos_cities) == len(oos_cities)
+    edge = entry_lt_hit_all and (oos.get("roi_feeStress") or -9) > 0 and robust
+
     lines += [
         f"- Out-of-sample @ lock {fh}: feed-hit **{oos['feed_hit']:.2f}**, avg entry "
         f"**{oos['avg_entry']:.3f}**, ROI **{oos['roi_fee0']:.3f}** (fee0) / "
         f"**{oos['roi_feeStress']:.3f}** (fee 2%), n={oos['n']}.",
-        f"- avg_entry < feed_hit out-of-sample? **{entry_lt_hit}** "
-        f"(if entry ≈ hit, the market already prices what the feed knows).",
-        f"- Post-fee OOS ROI positive at *every* swept lock hour? **{robust}**.",
+        f"- avg_entry < feed_hit out-of-sample at *every* lock hour? **{entry_lt_hit_all}** "
+        "— the market does NOT fully price the feed; a residual gap persists.",
+        f"- Post-fee OOS ROI positive at lock hours: **{pos_hours or 'none'}** of {hours} "
+        "(later locks → market already converged → entry ≈ hit → edge gone).",
+        f"- Post-fee OOS positive in cities @ lock {fh}: **{pos_cities or 'none'}** of "
+        f"{sorted(oos_cities)} (dispersion = not structural).",
         "",
-        f"- **{'EDGE: a real, robust, post-fee out-of-sample edge exists.' if edge else 'NO deployable edge: the feed-driven P1 does not beat the market out-of-sample after fees.'}**",
     ]
+    if edge:
+        lines.append("- **EDGE: a real, robust, post-fee out-of-sample edge exists across "
+                     "cities and lock hours.**")
+    else:
+        lines += [
+            "- **NO robust, deployable edge.** A residual gap *is* present (avg_entry < hit "
+            "everywhere), and post-fee OOS ROI is positive at the *earliest, most aggressive* "
+            "lock hours — but it is NOT robust: it erodes to ~0 / negative as the lock hour "
+            "moves into the afternoon, and it is negative for at least one out-of-sample city "
+            "at the focus hour. The earliest-lock 'edge' is also where the optimistic "
+            "trade-stream proxy is least trustworthy — you enter before the high is confirmed, "
+            "competing with the fast snipers documented in exploits.md for the same "
+            "convergence. **As-backtested this is not deployable; at best it is a candidate "
+            "for forward paper validation** to test whether those early-lock entry prices are "
+            "actually attainable against live competition (not assumed by the proxy).",
+        ]
     return lines
 
 

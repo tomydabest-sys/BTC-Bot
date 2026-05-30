@@ -301,3 +301,55 @@ weather-signal work.
 implying the price-lag window a weather feed would exploit is small/efficient
 across cities. Combined with (a)–(c), the realistic odds that the weather-feed
 version yields a deployable edge are low (~15–20%).
+
+---
+
+## 12. Option-2 (weather-feed P1) — UNBLOCKED and tested with a real feed
+
+The §11 blockers were resolved on **2026-05-30**:
+
+**(a) IEM ASOS allowlisted** (`mesonet.agron.iastate.edu`, HTTP 200). Real
+intraday obs in °F for all five station feeds covering the Apr–May 2026 window:
+LGA, ORD, MIA (~hourly, :51), EGLC, LFPB, LFPG (~half-hourly, exact whole-°C
+conversions). Paris is split — **LFPG** reports through ~Apr 20, **LFPB**
+(Le Bourget) from ~Apr 16 on; each event stores its own station code, so the
+per-event join is correct (100% coverage of 281 resolved events). New ingester
+`src/ingest/iem_asos.py`, source-tagged `'iem'` in `reference_temp`,
+config-wired (`weather_reference.iem`).
+
+**(b) °C units defect fixed.** `src/common/normalize.py` gains `detect_unit()` +
+`temp_to_bucket()` (unit-aware: °F 2°F ranges for US, °C single-degree for
+London/Paris). Also fixed a latent `parse_bucket_bounds` bug — the live data uses
+`"or higher"` for the upper tail (never `"or above"`), which was silently parsed
+as a single value `(X, X)` instead of `(X, ∞)`.
+
+**(c) Accuracy gate (3c) — PASSED at 99.6%.** IEM daily-max over each event's
+local day lands in the exactly-resolved bucket: US 100% (NYC/Chicago/Miami),
+London 98.2%, Paris 100% — vs Open-Meteo's ~35%. This is expected, not
+remarkable: **IEM and the Wunderground resolver derive from the same airport
+METAR**, so the feed isn't *forecasting*, it's reading the same thermometer. High
+hindsight accuracy is necessary but NOT sufficient for an edge.
+
+**(d) Causal trading sim (3d) — NO robust, deployable edge** (`reports/backtest_p1_feed.md`).
+Causal lock (no peek at the final high) → enter the locked bucket's YES at the
+first print at/after lock (optimistic trade-stream proxy) → hold to resolution.
+NYC in-sample, others OUT-OF-SAMPLE, lock-hour swept 12–17:
+- `avg_entry < feed_hit` out-of-sample at **every** lock hour → the market does
+  NOT fully price the feed; a **residual gap persists** (unlike the price-trigger,
+  which was uniformly negative OOS — this is the first P1 variant that isn't
+  outright dead).
+- BUT it is **not robust**: post-fee OOS ROI is positive only at the earliest,
+  most aggressive locks (lock 12 +8.1%, lock 13 +3.7%) and erodes to ~0/negative
+  by lock 14–17 (later lock → market already converged → entry ≈ hit). At the
+  focus hour it is **negative for Paris** (−2.5%) and barely positive for NYC
+  (+1.0%); the OOS aggregate is carried by London.
+- The early-lock residual is exactly where the optimistic proxy is least
+  trustworthy (you enter before the high is confirmed, against fast snipers).
+
+**Verdict:** not deployable as-backtested. The honest outcome — a fragile,
+execution-sensitive, lock-timing-dependent residual rather than a structural edge
+— **lowers the realistic odds below the ~15–20% prior.** The only intellectually
+honest next step for P1 is **forward paper validation** (does the early-lock entry
+price actually fill against live competition?), not deployment. See §4 of the
+handoff for the remaining options (P2 maker quoting via Phase-8 capture; or write
+the money-saving "no deployable edge" overview).
