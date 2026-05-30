@@ -37,26 +37,28 @@ entries.** Two viable paths remain: (a) the actual station feed (NWS METAR /
 Wunderground), or — preferred and now backtested — (b) the **market price's own
 convergence** as the trigger (no weather feed at all).
 
-## 1b. ✅ Recommended implementation: MARKET-PRICE trigger (backtested positive)
-`reports/backtest_p1_market.md` tests entering a bucket's YES once its price
-crosses θ on the resolution day, holding to resolution (trade-stream execution
-proxy; causal; single-city/30-day, in-sample):
+## 1b. ❌ Market-price trigger: looked good in-sample, FAILED out-of-sample
+The market-price trigger (enter a bucket's YES once its price crosses θ on the
+resolution day, hold to resolution) was **net positive on NYC alone** but **does
+NOT generalise** when validated on other cities (`reports/backtest_p1_market.md`):
 
-| θ | hit rate | avg entry | ROI (fee 0) | ROI (fee 2%) |
-|--:|--:|--:|--:|--:|
-| 0.50 | 52% | 0.535 | −1.7% | −5.5% |
-| 0.70 | 77% | 0.741 | +7.5% | +4.8% |
-| **0.80** | **90%** | **0.828** | **+12.4%** | **+9.9%** |
-| 0.90 | 96% | 0.910 | +9.3% | +7.1% |
-| 0.95 | 100% | 0.955 | +4.7% | +2.6% |
+| group | θ=0.8 hit | θ=0.8 ROI (fee0) | θ=0.8 ROI (2% fee) |
+|---|--:|--:|--:|
+| NYC (in-sample, 60d) | 0.86 | **+6.6%** | +4.2% |
+| **Out-of-sample (LON+PAR+CHI+MIA)** | 0.80 | **−3.3%** | **−5.6%** |
 
-The market **underprices near-certain winners**: at θ=0.80 the bucket trades ~0.83
-but wins 90% of the time. Net positive across θ=0.7–0.95 even at a stressed 2%
-fee, peaking at **θ≈0.80 on the resolution day**. This needs **no weather feed**,
-sidestepping §1a entirely. Caveats: in-sample, single city, trade-stream proxy is
-optimistic on fills/impact, modest absolute capacity (~$1.5k deployed → ~$180/mo
-here). **This is the recommended P1 trigger; a faster weather signal (NWS) would
-be additive, letting you enter before the price has fully converged.**
+Per-city @ θ=0.8: NYC +6.6%, Miami +3.2%, Chicago −2.4%, London −6.6%, Paris −6.5%.
+And NYC itself fell from +12.4% (30d, n=30) to **+6.6%** (60d, n=66) as the sample
+grew. **Verdict: the apparent edge was an NYC-specific microstructure/liquidity
+artifact, not a structural mispricing. Do NOT implement the price-triggered
+version.** Reacting to the book is too late — by the time price reveals the winner,
+the convergence is already (correctly) priced in most cities.
+
+This leaves only path (a): a signal **faster and more accurate than the market** —
+i.e. a real station feed (NWS METAR) that identifies the winning bucket *before*
+the price converges. That is unproven (see §1a: needs a METAR archive to backtest
+and high NWS-vs-resolver agreement to be confirmed) and should not be assumed to
+work. **P1 is not currently a validated, implementable strategy.**
 
 ## 2. Market selection (preconditions)
 - Weather **daily-temperature neg-risk events** (the ~11-bucket structure from
