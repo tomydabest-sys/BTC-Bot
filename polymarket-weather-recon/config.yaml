@@ -100,6 +100,21 @@ weather_reference:
     base_url: "https://api.weather.gov"      # reachable; temps in degC; recent-observation retention is limited
     reachable: true
     user_agent: "polymarket-weather-recon (research; contact via repo)"
+  iem:
+    # Iowa Environmental Mesonet ASOS archive. UNBLOCKED 2026-05-30 (allowlist
+    # add: mesonet.agron.iastate.edu). Low-latency archive that DOES cover the
+    # Apr–May 2026 market window in °F, ~hourly (US) / ~half-hourly (EU). This is
+    # the real station feed the feed-driven P1 backtest needs (CSV, not JSON).
+    base_url: "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+    reachable: true
+    # Polymarket resolution-source station code -> IEM ASOS station id.
+    station_map:
+      KLGA: LGA
+      KORD: ORD
+      KMIA: MIA
+      EGLC: EGLC
+      LFPB: LFPB
+      LFPG: LFPG
   # Station -> coordinates for Open-Meteo (which needs lat/lon, not a code).
   # Codes are parsed from each market's Wunderground resolutionSource.
   stations:
@@ -272,3 +287,23 @@ backtest_p1_market:
   taker_fee_stress: 0.02
   per_entry_cap_usdc: 50
   focus_theta: 0.8                            # θ used for the per-city comparison table
+
+# Feed-driven P1 variant (Option-2): drive the trigger from a REAL station feed
+# (IEM ASOS), unit-aware so London/Paris °C buckets are handled. Two stages:
+#  (3c) accuracy gate — does the feed's daily-max land in the actually-resolved
+#       2°F/1°C bucket? If not clearly > gate_min_accuracy, the feed can't pick
+#       the bucket and P1 is dead before any trading sim runs.
+#  (3d) causal feed-driven backtest — lock the high with a causal rule (no peek
+#       at the final max), enter the locked bucket's YES at the first print
+#       at/after lock, hold to resolution. Fit on NYC; judge OUT-OF-SAMPLE.
+backtest_p1_feed:
+  source: iem                    # reference_temp source driving the trigger
+  gate_min_accuracy: 0.70        # 3c gate: feed must beat this to justify the sim
+  min_peak_hour_local: 13        # default causal lock hour (swept below)
+  lock_hours: [12, 13, 14, 15, 16, 17]   # sweep of min_peak_hour_local
+  decline_margin_f: 1.0          # temp must fall this far below running max to lock
+  decline_readings: 1            # for >= this many consecutive readings
+  taker_fee: 0.0
+  taker_fee_stress: 0.02
+  per_entry_cap_usdc: 50
+  focus_lock_hour: 13            # lock hour used for the per-city comparison table
