@@ -29,6 +29,7 @@ def test_reachability_flags_match_phase0_findings():
     assert r["onchain_polygon"] is False       # blocked by allowlist
     assert r["weather:open_meteo"] is True
     assert r["weather:nws"] is True
+    assert r["weather:iem"] is True            # unblocked 2026-05-30 (allowlist add)
 
 
 def test_price_convention():
